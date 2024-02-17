@@ -25,7 +25,4 @@ for your own projects. You don't need to do any attribution, I don't care :)
 
 # License
 
-This project is generally unlicensed. Feel free to use it for whatever you need. Commercial or Open-Source projects.
-You don't need to do attribution. You can change, modify, redistribute, publish and do all things to the code you want.
-
-Have fun :) 
+LGPLv3
