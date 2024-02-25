@@ -48,7 +48,7 @@ def threaded(max_workers: int = 20, timeout: int = 10, retries: int = 3):
         completed, successful_downloads = 0, 0
         logging.info(f"Length of Segments: {len(segments)}")
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_segment = {executor.submit(download_segment, url, timeout, retries): url for url in segments}
+            future_to_segment = {url: executor.submit(download_segment, url, timeout, retries) for url in segments}
 
             for future in as_completed(future_to_segment):
                 segment_url = future_to_segment[future]
@@ -65,7 +65,7 @@ def threaded(max_workers: int = 20, timeout: int = 10, retries: int = 3):
         with open(path, 'wb') as file:
             for segment_url in segments:
                 logging.info(f"{segment_url} / {future_to_segment}")
-                if any(str(segment_url).strip("'") == url for url in future_to_segment.values()):
+                if segment_url in future_to_segment:
                     future = future_to_segment[segment_url]
                     try:
                         _, data, success = future.result()
