@@ -46,9 +46,9 @@ def threaded(max_workers: int = 20, timeout: int = 10, retries: int = 3):
         """
         length = len(segments)
         completed, successful_downloads = 0, 0
-        logging.info(f"Length of Segments: {len(segments)}")
+
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_segment = {url: executor.submit(download_segment, url, timeout, retries) for url in segments}
+            future_to_segment = {executor.submit(download_segment, url, timeout, retries): url for url in segments}
 
             for future in as_completed(future_to_segment):
                 segment_url = future_to_segment[future]
@@ -64,16 +64,12 @@ def threaded(max_workers: int = 20, timeout: int = 10, retries: int = 3):
         # Writing only successful downloads to the file
         with open(path, 'wb') as file:
             for segment_url in segments:
-                logging.info(f"{segment_url} / {future_to_segment}")
                 if segment_url in future_to_segment:
                     future = future_to_segment[segment_url]
                     try:
                         _, data, success = future.result()
-                        logging.info("Checking if success")
                         if success:
                             file.write(data)
-                            logging.info(f"Writing Data: {data}")
-                        logging.info("No success")
                     except:
                         logging.warning(f"Segment: {segment_url} FAILED!")
     return wrapper
