@@ -41,7 +41,7 @@ def threaded(max_workers: int = 20, timeout: int = 10, retries: int = 3):
         """
         Download video segments in parallel, with retries for failures, and write to a file.
         """
-        segments = list(video.get_segments(quality))
+        segments = list(video.get_segments(quality=quality))
         length = len(segments)
         completed, successful_downloads = 0, 0
 
@@ -75,7 +75,7 @@ def threaded(max_workers: int = 20, timeout: int = 10, retries: int = 3):
 
 def default(video, quality, callback, path, start: int = 0) -> bool:
     buffer = b''
-    segments = list(video.get_segments(quality))
+    segments = list(video.get_segments(quality))[start:]
     length = len(segments)
 
     for i, url in enumerate(segments):
