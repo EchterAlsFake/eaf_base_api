@@ -64,14 +64,13 @@ def threaded(max_workers: int = 20, timeout: int = 10, retries: int = 3):
         # Writing only successful downloads to the file
         with open(path, 'wb') as file:
             for segment_url in segments:
-                if segment_url in future_to_segment:
-                    future = future_to_segment[segment_url]
-                    try:
-                        _, data, success = future.result()
-                        if success:
-                            file.write(data)
-                    except:
-                        logging.warning(f"Segment: {segment_url} FAILED!")
+                future = future_to_segment[segment_url]
+                try:
+                    _, data, success = future.result()
+                    if success:
+                        file.write(data)
+                except:
+                    logging.warning(f"Segment: {segment_url} FAILED!")
     return wrapper
 
 
