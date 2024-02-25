@@ -1,5 +1,7 @@
 # EAF Base API
 
+! Still in Development
+
 This Python package is a base api for all my Porn Site APIs. A lot of sites use the same methods, and
 there's a lot of code that I've rewritten again and again. This is why I created this base api, so that 
 I need to write less code and everything is easier to be maintainable. 
