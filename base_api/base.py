@@ -28,6 +28,7 @@ class Core:
             if i < retries - 1:  # Implement exponential backoff
                 time.sleep(2 ** i)
         logging.error(f"Failed to fetch {url} after {retries} attempts.")
+        logging.error("Returning None")
         return None
 
     @classmethod
@@ -36,15 +37,14 @@ class Core:
         if isinstance(quality, Quality):
             return quality
 
-        else:
-            if str(quality) == "best":
-                return Quality.BEST
+        elif str(quality) == "best":
+            return Quality.BEST
 
-            elif str(quality) == "half":
-                return Quality.HALF
+        elif str(quality) == "half":
+            return Quality.HALF
 
-            elif str(quality) == "worst":
-                return Quality.WORST
+        elif str(quality) == "worst":
+            return Quality.WORST
 
     def get_available_qualities(self, m3u8_base_url):
         """Returns the available qualities from the M3U8 base url"""
@@ -65,6 +65,7 @@ class Core:
     def get_m3u8_by_quality(self, quality, m3u8_base_url):
         """Returns the m3u8 url for the given quality"""
         quality = self.fix_quality(quality)
+        logging.info(f"Selected Quality: {quality}")
 
         self.get_available_qualities(m3u8_base_url)
         if quality == Quality.BEST:
@@ -105,4 +106,3 @@ class Core:
 
         elif downloader == FFMPEG or str(downloader) == "FFMPEG":
             FFMPEG(m3u8_base_url=m3u8_base_url, m3u8_quality_url=m3u8_quality_url, path=output_path, callback=callback)
-
