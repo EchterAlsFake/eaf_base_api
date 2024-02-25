@@ -62,7 +62,15 @@ def threaded(max_workers: int = 20, timeout: int = 10, retries: int = 3):
         # Writing only successful downloads to the file
         with open(path, 'wb') as file:
             for segment_url in segments:
-                print(list(future_to_segment.values()))
+                dont_ask = list(future_to_segment.values())
+                for dont_ask_ in dont_ask:
+                    if segment_url == dont_ask_:
+                        print("JUNGE DAS MACH KEIN SINN WTF")
+
+                    print(dont_ask_)
+
+                print(f"SEGMENT URL: {segment_url}")
+
                 if any(segment_url.strip().lower() == url.strip().lower() for url in future_to_segment.values()):
                     future = future_to_segment[segment_url]
                     try:
