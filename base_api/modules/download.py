@@ -1,14 +1,12 @@
 # Thanks to: https://github.com/EchterAlsFake/PHUB/blob/master/src/phub/modules/download.py
+# oh and of course ChatGPT lol
 
 import time
 import requests
-import logging
 from ffmpeg_progress_yield import FfmpegProgress
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable, List
 
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logging.getLogger("urllib3").setLevel(logging.WARNING)
 CallbackType = Callable[[int, int], None]
 
 """
@@ -17,7 +15,7 @@ the output path. This has good reasons, to make this library more adaptable into
 """
 
 
-def download_segment(url: str, timeout: int, retries: int = 5, backoff_factor: float = 0.3) -> tuple[str, bytes, bool]:
+def download_segment(url: str, timeout: int, retries: int = 3, backoff_factor: float = 0.3) -> tuple[str, bytes, bool]:
     """
     Attempt to download a single segment, retrying on failure.
     Returns a tuple of the URL, content (empty if failed after retries), and a success flag.
@@ -27,7 +25,6 @@ def download_segment(url: str, timeout: int, retries: int = 5, backoff_factor: f
             response = requests.get(url, timeout=timeout)
             response.raise_for_status()  # Raises stored HTTPError, if one occurred.
             return (url, response.content, True)  # Success
-
         except requests.RequestException as e:
             print(f"Retry {attempt + 1} for {url}: {e}")
             time.sleep(backoff_factor * (2 ** attempt))  # Exponential backoff
@@ -44,7 +41,7 @@ def threaded(max_workers: int = 20, timeout: int = 10, retries: int = 3):
         """
         Download video segments in parallel, with retries for failures, and write to a file.
         """
-        segments = video.get_segments(quality=quality)
+        segments = list(video.get_segments(quality=quality))
         length = len(segments)
         completed, successful_downloads = 0, 0
 
@@ -75,8 +72,10 @@ def threaded(max_workers: int = 20, timeout: int = 10, retries: int = 3):
                         pass  # This block could further handle or log missing data scenarios
     return wrapper
 
-def default(segments, callback, path, start: int = 0) -> bool:
+
+def default(video, quality, callback, path, start: int = 0) -> bool:
     buffer = b''
+    segments = list(video.get_segments(quality))[start:]
     length = len(segments)
 
     for i, url in enumerate(segments):
@@ -95,10 +94,9 @@ def default(segments, callback, path, start: int = 0) -> bool:
     return True
 
 
-def FFMPEG(m3u8_base_url, m3u8_quality_url, callback, path, start=0) -> bool:
-    """In case you implement that, make sure your API has these functions!"""
-    base_url = m3u8_base_url
-    new_segment = m3u8_quality_url
+def FFMPEG(video, quality, callback, path, start=0) -> bool:
+    base_url = video.m3u8_base_url
+    new_segment = video.get_m3u8_by_quality(quality)
     url_components = base_url.split('/')
     url_components[-1] = new_segment
     new_url = '/'.join(url_components)

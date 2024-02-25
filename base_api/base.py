@@ -80,30 +80,25 @@ class Core:
 
         return self.quality_url_map.get(selected_quality)
 
-    @classmethod
-    def download(cls, segments, downloader, output_path, callback=None, m3u8_base_url=None,
-                 m3u8_quality_url=None, max_workers=20, timeout=10):
+    def download(self, downloader, quality, output_path, callback=None):
         """
-        :param segments:
         :param callback:
         :param downloader:
+        :param quality:
         :param output_path:
-        :param m3u8_base_url:
-        :param m3u8_quality_url:
-        :param timeout:
-        :param max_workers:
         :return:
         """
+        quality = self.fix_quality(quality)
 
         if callback is None:
             callback = Callback.text_progress_bar
 
         if downloader == default or str(downloader) == "default":
-            default(segments=segments, path=output_path, callback=callback)
+            default(video=self, quality=quality, path=output_path, callback=callback)
 
         elif downloader == threaded or str(downloader) == "threaded":
-            threaded_download = threaded(max_workers=max_workers, timeout=timeout)
-            threaded_download(segments=segments, path=output_path, callback=callback)
+            threaded_download = threaded(max_workers=20, timeout=10)
+            threaded_download(video=self, quality=quality, path=output_path, callback=callback)
 
         elif downloader == FFMPEG or str(downloader) == "FFMPEG":
-            FFMPEG(m3u8_base_url=m3u8_base_url, m3u8_quality_url=m3u8_quality_url, path=output_path, callback=callback)
+            FFMPEG(video=self, quality=quality, path=output_path, callback=callback)
