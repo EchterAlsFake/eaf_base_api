@@ -34,6 +34,7 @@ class Core:
     @classmethod
     def fix_quality(cls, quality):
         """This method gives the user the opportunity to pass a string instead of the quality object"""
+        logging.info(f"Quality type is: {quality}")
         if isinstance(quality, Quality):
             return quality
 
