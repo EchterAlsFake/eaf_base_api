@@ -47,6 +47,7 @@ class Core:
                 return Quality.WORST
 
     def get_available_qualities(self, m3u8_base_url):
+        """Returns the available qualities from the M3U8 base url"""
         content = self.get_content(m3u8_base_url).decode("utf-8")
         lines = content.splitlines()
 
@@ -62,6 +63,7 @@ class Core:
         return self.available_qualities
 
     def get_m3u8_by_quality(self, quality, m3u8_base_url):
+        """Returns the m3u8 url for the given quality"""
         quality = self.fix_quality(quality)
 
         self.get_available_qualities(m3u8_base_url)
@@ -104,7 +106,3 @@ class Core:
         elif downloader == FFMPEG or str(downloader) == "FFMPEG":
             FFMPEG(m3u8_base_url=m3u8_base_url, m3u8_quality_url=m3u8_quality_url, path=output_path, callback=callback)
 
-
-
-
-content = Core().get_content(url="https://www.netflix.com/watch/80205345?trackId=155573558")
