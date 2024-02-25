@@ -65,7 +65,7 @@ def threaded(max_workers: int = 20, timeout: int = 10, retries: int = 3):
         with open(path, 'wb') as file:
             logging.info("WTF is this even executed????!!!!")
             for segment_url in segments:
-                logging.info("Why does this not work...")
+                logging.info(f"Why does this not work: {segment_url} / {future_to_segment}")
                 if segment_url in future_to_segment:
                     logging.info("Damn")
                     future = future_to_segment[segment_url]
