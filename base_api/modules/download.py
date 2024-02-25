@@ -47,10 +47,11 @@ def threaded(max_workers: int = 20, timeout: int = 10, retries: int = 3):
         completed, successful_downloads = 0, 0
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_segment = {executor.submit(download_segment, url, timeout, retries): url for url in segments}
+            # Map the last part of the URL (filename) to the future
+            future_to_hls_part = {executor.submit(download_segment, url, timeout, retries): os.path.basename(url) for url in segments}
 
-            for future in as_completed(future_to_segment):
-                segment_url = future_to_segment[future]
+            for future in as_completed(future_to_hls_part):
+                hls_part = future_to_hls_part[future]
                 try:
                     _, data, success = future.result()
                     completed += 1
@@ -63,14 +64,17 @@ def threaded(max_workers: int = 20, timeout: int = 10, retries: int = 3):
         # Writing only successful downloads to the file
         with open(path, 'wb') as file:
             for segment_url in segments:
-                if any(os.path.basename(segment_url) == os.path.basename(url) for url in future_to_segment.values()):
-                    future = future_to_segment[segment_url]
+                # Find the future object using the HLS part of the URL as the key
+                matched_futures = [future for future, hls_part in future_to_hls_part.items() if hls_part == os.path.basename(segment_url)]
+                if matched_futures:
+                    future = matched_futures[0]  # Assuming unique HLS parts, take the first match
                     try:
                         _, data, success = future.result()
                         if success:
                             file.write(data)
-                    except:
-                        pass  # This block could further handle or log missing data scenarios
+                    except Exception as e:
+                        pass  # Optionally handle or log the exception here
+
     return wrapper
 
 
