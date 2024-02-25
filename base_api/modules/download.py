@@ -37,10 +37,11 @@ def threaded(max_workers: int = 20, timeout: int = 10, retries: int = 3):
     """
     Creates a wrapper function for the actual download process, with retry logic.
     """
-    def wrapper(segments, callback, path):
+    def wrapper(video, quality, callback, path):
         """
         Download video segments in parallel, with retries for failures, and write to a file.
         """
+        segments = video.get_segments(quality)
         length = len(segments)
         completed, successful_downloads = 0, 0
 
@@ -72,8 +73,9 @@ def threaded(max_workers: int = 20, timeout: int = 10, retries: int = 3):
     return wrapper
 
 
-def default(segments, callback, path, start: int = 0) -> bool:
+def default(video, quality, callback, path, start: int = 0) -> bool:
     buffer = b''
+    segments = video.get_segments(quality)
     length = len(segments)
 
     for i, url in enumerate(segments):
