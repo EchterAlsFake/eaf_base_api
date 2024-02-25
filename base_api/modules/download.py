@@ -63,6 +63,7 @@ def threaded(max_workers: int = 20, timeout: int = 10, retries: int = 3):
         with open(path, 'wb') as file:
             for segment_url in segments:
                 print(future_to_segment.values())
+                print(url for url in future_to_segment.values())
                 if any(segment_url == url for url in future_to_segment.values()):
                     future = future_to_segment[segment_url]
                     try:
