@@ -80,7 +80,7 @@ class Core:
 
         return self.quality_url_map.get(selected_quality)
 
-    def download(self, video, downloader, quality, output_path, callback=None):
+    def download(self, segments, downloader, output_path, callback=None, video=None, quality=None):
         """
         :param callback:
         :param downloader:
@@ -94,11 +94,16 @@ class Core:
             callback = Callback.text_progress_bar
 
         if downloader == default or str(downloader) == "default":
-            default(video=video, quality=quality, path=output_path, callback=callback)
+            default(segments=segments, path=output_path, callback=callback)
 
         elif downloader == threaded or str(downloader) == "threaded":
             threaded_download = threaded(max_workers=20, timeout=10)
-            threaded_download(video=video, quality=quality, path=output_path, callback=callback)
+            threaded_download(segments=segments, path=output_path, callback=callback)
 
         elif downloader == FFMPEG or str(downloader) == "FFMPEG":
+            if video is None:
+                raise "Video argument is required for ffmpeg!"
+
+            if quality is None:
+                raise "Quality argument is required for ffmpeg"
             FFMPEG(video=video, quality=quality, path=output_path, callback=callback)
