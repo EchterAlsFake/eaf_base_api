@@ -68,9 +68,11 @@ def threaded(max_workers: int = 20, timeout: int = 10, retries: int = 3):
                     future = future_to_segment[segment_url]
                     try:
                         _, data, success = future.result()
+                        logging.info("Checking if success")
                         if success:
                             file.write(data)
                             logging.info(f"Writing Data: {data}")
+                        logging.info("No success")
                     except:
                         logging.warning(f"Segment: {segment_url} FAILED!")
     return wrapper
