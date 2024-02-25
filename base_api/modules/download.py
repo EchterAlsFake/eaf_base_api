@@ -41,7 +41,7 @@ def threaded(max_workers: int = 20, timeout: int = 10, retries: int = 3):
         """
         Download video segments in parallel, with retries for failures, and write to a file.
         """
-        segments = list(video.get_segments(quality=quality))
+        segments = video.get_segments(quality=quality)
         length = len(segments)
         completed, successful_downloads = 0, 0
 
@@ -62,7 +62,8 @@ def threaded(max_workers: int = 20, timeout: int = 10, retries: int = 3):
         # Writing only successful downloads to the file
         with open(path, 'wb') as file:
             for segment_url in segments:
-                if segment_url in future_to_segment:
+                print(future_to_segment.values())
+                if any(segment_url == url for url in future_to_segment.values()):
                     future = future_to_segment[segment_url]
                     try:
                         _, data, success = future.result()
@@ -75,7 +76,7 @@ def threaded(max_workers: int = 20, timeout: int = 10, retries: int = 3):
 
 def default(video, quality, callback, path, start: int = 0) -> bool:
     buffer = b''
-    segments = list(video.get_segments(quality))[start:]
+    segments = video.get_segments(quality)[start:]
     length = len(segments)
 
     for i, url in enumerate(segments):
