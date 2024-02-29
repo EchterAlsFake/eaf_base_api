@@ -6,8 +6,16 @@ from base_api.modules.quality import Quality
 from base_api.modules.progress_bars import Callback
 from base_api.modules.download import default, threaded, FFMPEG
 
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logging.getLogger("urllib3").setLevel(logging.WARNING)
+
+def setup_api(do_logging=False):
+    if do_logging:
+        logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        logging.getLogger("urllib3").setLevel(logging.WARNING)
+
+    else:
+        logging.disable(logging.CRITICAL)
+
+
 base_qualities = ["250p", "360p", "480p", "720p", "1080p", "1440p", "2160p"]
 
 
@@ -34,7 +42,6 @@ class Core:
     @classmethod
     def fix_quality(cls, quality):
         """This method gives the user the opportunity to pass a string instead of the quality object"""
-        logging.info(f"Quality type is: {quality}")
         if isinstance(quality, Quality):
             return quality
 
@@ -66,7 +73,6 @@ class Core:
     def get_m3u8_by_quality(self, quality, m3u8_base_url):
         """Returns the m3u8 url for the given quality"""
         quality = self.fix_quality(quality)
-        logging.info(f"Selected Quality: {quality}")
 
         self.get_available_qualities(m3u8_base_url)
         if quality == Quality.BEST:

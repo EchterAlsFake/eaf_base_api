@@ -1,6 +1,6 @@
 # Thanks to: https://github.com/EchterAlsFake/PHUB/blob/master/src/phub/modules/download.py
 # oh and of course ChatGPT lol
-
+import logging
 import time
 import requests
 import os
@@ -67,6 +67,7 @@ def threaded(max_workers: int = 20, timeout: int = 10, retries: int = 3):
                 # Find the future object using the HLS part of the URL as the key
                 matched_futures = [future for future, hls_part in future_to_hls_part.items() if hls_part == os.path.basename(segment_url)]
                 if matched_futures:
+                    logging.info("Got a match")
                     future = matched_futures[0]  # Assuming unique HLS parts, take the first match
                     try:
                         _, data, success = future.result()
