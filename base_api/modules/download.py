@@ -8,7 +8,6 @@ from ffmpeg_progress_yield import FfmpegProgress
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable, List
 
-from ..base import Core
 CallbackType = Callable[[int, int], None]
 
 """
@@ -17,13 +16,22 @@ the output path. This has good reasons, to make this library more adaptable into
 """
 
 
-def download_segment(url: str) -> tuple[str, bytes, bool]:
+def download_segment(url: str, timeout: int, retries: int = 3, backoff_factor: float = 0.3) -> tuple[str, bytes, bool]:
     """
     Attempt to download a single segment, retrying on failure.
     Returns a tuple of the URL, content (empty if failed after retries), and a success flag.
     """
-    response = Core().get_content(url)
-    return (url, response, True)  # Success
+    for attempt in range(retries):
+        try:
+            response = requests.get(url, timeout=timeout)
+            response.raise_for_status()  # Raises stored HTTPError, if one occurred.
+            return (url, response.content, True)  # Success
+        except requests.RequestException as e:
+            print(f"Retry {attempt + 1} for {url}: {e}")
+            time.sleep(backoff_factor * (2 ** attempt))  # Exponential backoff
+
+    # After all retries have failed
+    return (url, b'', False)  # Failed download
 
 
 def threaded(max_workers: int = 20, timeout: int = 10, retries: int = 3):
