@@ -5,6 +5,7 @@ import time
 from base_api.modules.quality import Quality
 from base_api.modules.progress_bars import Callback
 from base_api.modules.download import default, threaded, FFMPEG
+from base_api.modules.consts import MAX_RETRIES
 
 
 def setup_api(do_logging=False):
@@ -21,8 +22,8 @@ base_qualities = ["250p", "360p", "480p", "720p", "1080p", "1440p", "2160p"]
 
 class Core:
     @classmethod
-    def get_content(cls, url, headers=None, cookies=None, retries=4):
-        for i in range(retries):
+    def get_content(cls, url, headers=None, cookies=None):
+        for i in range(MAX_RETRIES):
             try:
                 logging.debug(f"Trying to fetch {url} / Attempt: [{i+1}]")
                 response = requests.get(url, headers=headers, cookies=cookies)
@@ -33,9 +34,9 @@ class Core:
                     logging.warning(f"Failed to fetch {url} with status code {response.status_code} on attempt [{i+1}]")
             except requests.exceptions.RequestException as e:
                 logging.error(f"Exception occurred when trying to fetch {url} on attempt [{i+1}]: {e}")
-            if i < retries - 1:  # Implement exponential backoff
+            if i < MAX_RETRIES - 1:  # Implement exponential backoff
                 time.sleep(2 ** i)
-        logging.error(f"Failed to fetch {url} after {retries} attempts.")
+        logging.error(f"Failed to fetch {url} after {MAX_RETRIES} attempts.")
         logging.error("Returning None")
         return None
 
