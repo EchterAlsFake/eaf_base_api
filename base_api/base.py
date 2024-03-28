@@ -1,6 +1,7 @@
 import requests
 import logging
 import time
+import string
 
 from base_api.modules.quality import Quality
 from base_api.modules.progress_bars import Callback
