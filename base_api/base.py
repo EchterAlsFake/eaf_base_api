@@ -1,12 +1,12 @@
 import requests
 import logging
 import time
-import string
 
 from base_api.modules.quality import Quality
 from base_api.modules.progress_bars import Callback
 from base_api.modules.download import default, threaded, FFMPEG
 from base_api.modules.consts import MAX_RETRIES
+from pathlib import Path
 
 
 def setup_api(do_logging=False):
@@ -112,11 +112,32 @@ class Core:
             FFMPEG(video=video, quality=quality, path=output_path, callback=callback)
 
     @classmethod
-    def strip_title(cls, title: str) -> str:
-        """
-        :param title:
-        :return: str: strips out non UTF-8 chars of the title
-        """
-        illegal_chars = '<>:"/\\|?*'
-        cleaned_title = ''.join([char for char in title if char in string.printable and char not in illegal_chars])
-        return cleaned_title
+    def correct_path(cls, path):
+        return Path(path)
+
+    @classmethod
+    def get_segments(cls, quality, m3u8_base_url):
+        quality = Core().fix_quality(quality)
+        base_url = m3u8_base_url
+        new_segment = Core().get_m3u8_by_quality(quality, m3u8_base_url=base_url)
+        # Split the base URL into components
+        url_components = base_url.split('/')
+
+        # Replace the last component with the new segment
+        url_components[-1] = new_segment
+
+        # Rejoin the components into the new full URL
+        new_url = '/'.join(url_components)
+        master_src = Core().get_content(url=new_url).decode("utf-8")
+
+        urls = [l for l in master_src.splitlines()
+                if l and not l.startswith('#')]
+
+        segments = []
+
+        for url in urls:
+            url_components[-1] = url
+            new_url = '/'.join(url_components)
+            segments.append(new_url)
+
+        return segments
