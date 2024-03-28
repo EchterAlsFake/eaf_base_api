@@ -1,6 +1,7 @@
 import requests
 import logging
 import time
+import string
 
 from base_api.modules.quality import Quality
 from base_api.modules.progress_bars import Callback
@@ -109,3 +110,13 @@ class Core:
 
         elif downloader == FFMPEG or str(downloader) == "FFMPEG":
             FFMPEG(video=video, quality=quality, path=output_path, callback=callback)
+
+    @classmethod
+    def strip_title(cls, title: str) -> str:
+        """
+        :param title:
+        :return: str: strips out non UTF-8 chars of the title
+        """
+        illegal_chars = '<>:"/\\|?*'
+        cleaned_title = ''.join([char for char in title if char in string.printable and char not in illegal_chars])
+        return cleaned_title
