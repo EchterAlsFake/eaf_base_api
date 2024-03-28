@@ -141,3 +141,13 @@ class Core:
             segments.append(new_url)
 
         return segments
+
+    @classmethod
+    def strip_title(cls, title: str) -> str:
+        """
+        :param title:
+        :return: str: strips out non UTF-8 chars of the title
+        """
+        illegal_chars = '<>:"/\\|?*'
+        cleaned_title = ''.join([char for char in title if char in string.printable and char not in illegal_chars])
+        return cleaned_title
