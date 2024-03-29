@@ -8,7 +8,12 @@ from ffmpeg_progress_yield import FfmpegProgress
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable, List
 from base_api.modules.progress_bars import Callback
-from consts import FFMPEG_PATH
+
+try:
+    from base_api.modules.consts import FFMPEG_PATH
+
+except (ModuleNotFoundError, ImportError):
+    from .consts import FFMPEG_PATH
 
 CallbackType = Callable[[int, int], None]
 
