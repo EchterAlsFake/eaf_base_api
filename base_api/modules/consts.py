@@ -1,1 +1,2 @@
 MAX_RETRIES = 4
+FFMPEG_PATH = "ffmpeg"

@@ -8,6 +8,7 @@ from ffmpeg_progress_yield import FfmpegProgress
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable, List
 from base_api.modules.progress_bars import Callback
+from consts import FFMPEG_PATH
 
 CallbackType = Callable[[int, int], None]
 
@@ -110,7 +111,7 @@ def FFMPEG(video, quality, callback, path, start=0) -> bool:
 
     # Build the command for FFMPEG as a list directly
     command = [
-        "ffmpeg",
+        FFMPEG_PATH,
         "-i", new_url,  # Input URL
         "-bsf:a", "aac_adtstoasc",
         "-y",  # Overwrite output files without asking
