@@ -24,11 +24,11 @@ base_qualities = ["250p", "360p", "480p", "720p", "1080p", "1440p", "2160p"]
 
 class Core:
     @classmethod
-    def get_content(cls, url, headers=None, cookies=None):
+    def get_content(cls, url, headers=None, cookies=None, stream=False):
         for i in range(MAX_RETRIES):
             try:
                 logging.debug(f"Trying to fetch {url} / Attempt: [{i+1}]")
-                response = requests.get(url, headers=headers, cookies=cookies)
+                response = requests.get(url, headers=headers, cookies=cookies, stream=stream)
                 if response.status_code == 200:
                     logging.info(f"Successfully fetched {url} on attempt [{i+1}]")
                     return response.content

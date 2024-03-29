@@ -7,6 +7,7 @@ import os
 from ffmpeg_progress_yield import FfmpegProgress
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable, List
+from base_api.modules.progress_bars import Callback
 
 CallbackType = Callable[[int, int], None]
 
@@ -127,3 +128,33 @@ def FFMPEG(video, quality, callback, path, start=0) -> bool:
             return True
 
     return False
+
+
+def legacy_download(stream, path, url, callback=None):
+    response = requests.get(url, stream=stream)
+    file_size = int(response.headers.get('content-length', 0))
+
+    if callback is None:
+        progress_bar = Callback()
+
+    downloaded_so_far = 0
+
+    if not os.path.exists(path):
+        with open(path, 'wb') as file:
+            for chunk in response.iter_content(chunk_size=1024):
+                file.write(chunk)
+                downloaded_so_far += len(chunk)
+
+                if callback:
+                    callback(downloaded_so_far, file_size)
+
+                else:
+                    progress_bar.text_progress_bar(downloaded=downloaded_so_far, total=file_size)
+
+        if not callback:
+            del progress_bar
+
+        return True
+
+    else:
+        raise FileExistsError("The file already exists.")
