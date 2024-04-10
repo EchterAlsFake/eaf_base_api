@@ -2,6 +2,7 @@ import requests
 import logging
 import time
 import string
+import os
 
 from base_api.modules.quality import Quality
 from base_api.modules.progress_bars import Callback
@@ -152,3 +153,17 @@ class Core:
         illegal_chars = '<>:"/\\|?*'
         cleaned_title = ''.join([char for char in title if char in string.printable and char not in illegal_chars])
         return cleaned_title
+
+    @classmethod
+    def return_path(cls, video, args):
+        path = args.output
+        if args.use_title:
+            if not str(path).endswith(os.sep):
+                path += os.sep
+
+            path += video.title + ".mp4"
+
+        else:
+            path = args.output
+
+        return path
