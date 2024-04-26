@@ -7,7 +7,7 @@ import os
 from base_api.modules.quality import Quality
 from base_api.modules.progress_bars import Callback
 from base_api.modules.download import default, threaded, FFMPEG
-from base_api.modules.consts import MAX_RETRIES
+from base_api.modules.consts import MAX_RETRIES, REQUEST_DELAY
 from pathlib import Path
 
 
@@ -24,10 +24,23 @@ base_qualities = ["250p", "360p", "480p", "720p", "1080p", "1440p", "2160p"]
 
 
 class Core:
-    @classmethod
-    def get_content(cls, url, headers=None, cookies=None, stream=False):
+    def __init__(self, delay=REQUEST_DELAY):
+        self.delay = delay
+        self.start_delay = False
+        self.last_request_time = None
+
+    def get_content(self, url, headers=None, cookies=None, stream=False):
         for i in range(MAX_RETRIES):
             try:
+
+                # Delay mechanism
+                if self.last_request_time:
+                    elapsed_time = time.time() - self.last_request_time
+                    if elapsed_time < self.delay:
+                        time.sleep(self.delay - elapsed_time)
+
+                self.last_request_time = time.time()  # Update the time of the last request
+
                 logging.debug(f"Trying to fetch {url} / Attempt: [{i+1}]")
                 response = requests.get(url, headers=headers, cookies=cookies, stream=stream)
                 if response.status_code == 200:

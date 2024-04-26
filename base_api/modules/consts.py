@@ -1,2 +1,3 @@
 MAX_RETRIES = 4
+REQUEST_DELAY = 0
 FFMPEG_PATH = "ffmpeg"
