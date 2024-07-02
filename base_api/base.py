@@ -77,7 +77,7 @@ class Core:
 
         for line in lines:
             for quality in base_qualities:
-                if f"{seperator}{quality}" in line:
+                if f"{seperator}{quality}" in line and not str(line).startswith("#"):
                     quality_url_map[quality] = line
 
         self.quality_url_map = quality_url_map
