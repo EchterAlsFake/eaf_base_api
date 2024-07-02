@@ -128,7 +128,7 @@ class Core:
         return Path(path)
 
     @classmethod
-    def get_segments(cls, quality, m3u8_base_url, base_qualities, seperator):
+    def get_segments(cls, quality, m3u8_base_url, base_qualities, seperator, source=1):
         quality = Core().fix_quality(quality)
         base_url = m3u8_base_url
         new_segment = Core().get_m3u8_by_quality(quality, m3u8_base_url=base_url, base_qualities=base_qualities,
@@ -141,6 +141,10 @@ class Core:
 
         # Rejoin the components into the new full URL
         new_url = '/'.join(url_components)
+
+        if source == "spankbang":
+            new_url = new_url.split(".mp4.urlset/")[1]  # Please just don't ask, I'm a terrible programmer fr
+
         master_src = Core().get_content(url=new_url).decode("utf-8")
 
         urls = [l for l in master_src.splitlines()
