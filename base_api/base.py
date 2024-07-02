@@ -128,10 +128,10 @@ class Core:
         return Path(path)
 
     @classmethod
-    def get_segments(cls, quality, m3u8_base_url):
+    def get_segments(cls, quality, m3u8_base_url, base_qualities):
         quality = Core().fix_quality(quality)
         base_url = m3u8_base_url
-        new_segment = Core().get_m3u8_by_quality(quality, m3u8_base_url=base_url)
+        new_segment = Core().get_m3u8_by_quality(quality, m3u8_base_url=base_url, base_qualities=base_qualities)
         # Split the base URL into components
         url_components = base_url.split('/')
 
