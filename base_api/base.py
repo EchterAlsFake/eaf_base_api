@@ -20,9 +20,6 @@ def setup_api(do_logging=False):
         logging.disable(logging.CRITICAL)
 
 
-base_qualities = ["250p", "360p", "480p", "720p", "1080p", "1440p", "2160p"]
-
-
 class Core:
     def __init__(self, delay=REQUEST_DELAY):
         self.delay = delay
@@ -71,7 +68,7 @@ class Core:
         elif str(quality) == "worst":
             return Quality.WORST
 
-    def get_available_qualities(self, m3u8_base_url):
+    def get_available_qualities(self, m3u8_base_url, base_qualities, seperator):
         """Returns the available qualities from the M3U8 base url"""
         content = self.get_content(m3u8_base_url).decode("utf-8")
         lines = content.splitlines()
@@ -80,14 +77,14 @@ class Core:
 
         for line in lines:
             for quality in base_qualities:
-                if f"hls-{quality}" in line:
+                if f"{seperator}{quality}" in line:
                     quality_url_map[quality] = line
 
         self.quality_url_map = quality_url_map
         self.available_qualities = list(quality_url_map.keys())
         return self.available_qualities
 
-    def get_m3u8_by_quality(self, quality, m3u8_base_url):
+    def get_m3u8_by_quality(self, quality, m3u8_base_url, base_qualities):
         """Returns the m3u8 url for the given quality"""
         quality = self.fix_quality(quality)
 
