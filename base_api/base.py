@@ -84,11 +84,11 @@ class Core:
         self.available_qualities = list(quality_url_map.keys())
         return self.available_qualities
 
-    def get_m3u8_by_quality(self, quality, m3u8_base_url, base_qualities):
+    def get_m3u8_by_quality(self, quality, m3u8_base_url, base_qualities, seperator):
         """Returns the m3u8 url for the given quality"""
         quality = self.fix_quality(quality)
 
-        self.get_available_qualities(m3u8_base_url)
+        self.get_available_qualities(m3u8_base_url, base_qualities, seperator=seperator)
         if quality == Quality.BEST:
             selected_quality = max(self.available_qualities, key=lambda q: base_qualities.index(q))
         elif quality == Quality.WORST:
@@ -128,10 +128,11 @@ class Core:
         return Path(path)
 
     @classmethod
-    def get_segments(cls, quality, m3u8_base_url, base_qualities):
+    def get_segments(cls, quality, m3u8_base_url, base_qualities, seperator):
         quality = Core().fix_quality(quality)
         base_url = m3u8_base_url
-        new_segment = Core().get_m3u8_by_quality(quality, m3u8_base_url=base_url, base_qualities=base_qualities)
+        new_segment = Core().get_m3u8_by_quality(quality, m3u8_base_url=base_url, base_qualities=base_qualities,
+                                                 seperator=seperator)
         # Split the base URL into components
         url_components = base_url.split('/')
 
