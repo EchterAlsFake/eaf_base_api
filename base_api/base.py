@@ -8,8 +8,6 @@ from base_api.modules.quality import Quality
 from base_api.modules.progress_bars import Callback
 from base_api.modules.download import default, threaded, FFMPEG
 from base_api.modules.consts import MAX_RETRIES, REQUEST_DELAY
-from pathlib import Path
-
 
 def setup_api(do_logging=False):
     if do_logging:
@@ -29,7 +27,6 @@ class Core:
     def get_content(self, url, headers=None, cookies=None, stream=False):
         for i in range(MAX_RETRIES):
             try:
-
                 # Delay mechanism
                 if self.last_request_time:
                     elapsed_time = time.time() - self.last_request_time
@@ -43,12 +40,16 @@ class Core:
                 if response.status_code == 200:
                     logging.info(f"Successfully fetched {url} on attempt [{i+1}]")
                     return response.content
+
                 else:
                     logging.warning(f"Failed to fetch {url} with status code {response.status_code} on attempt [{i+1}]")
+
             except requests.exceptions.RequestException as e:
                 logging.error(f"Exception occurred when trying to fetch {url} on attempt [{i+1}]: {e}")
+
             if i < MAX_RETRIES - 1:  # Implement exponential backoff
                 time.sleep(2 ** i)
+
         logging.error(f"Failed to fetch {url} after {MAX_RETRIES} attempts.")
         logging.error("Returning None")
         return None
@@ -122,10 +123,6 @@ class Core:
 
         elif downloader == FFMPEG or str(downloader) == "FFMPEG":
             FFMPEG(video=video, quality=quality, path=path, callback=callback)
-
-    @classmethod
-    def correct_path(cls, path):
-        return Path(path)
 
     @classmethod
     def get_segments(cls, quality, m3u8_base_url, base_qualities, seperator, source=1):
