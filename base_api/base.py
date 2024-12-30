@@ -1,160 +1,81 @@
-import requests
-import logging
+import m3u8
 import time
+import random
 import string
-import os
+import logging
+import requests
+import traceback
 
-from base_api.modules.quality import Quality
-from base_api.modules.progress_bars import Callback
-from base_api.modules.download import default, threaded, FFMPEG
-from base_api.modules.consts import MAX_RETRIES, REQUEST_DELAY
+from modules import consts
+from urllib.parse import urljoin
+from modules.download import default, threaded, FFMPEG
+from modules.progress_bars import Callback
+"""
+from modules import download
+from modules import progress_bars
+"""
+logging.basicConfig(format='%(name)s %(levelname)s %(asctime)s %(message)s', datefmt='%I:%M:%S %p')
+logger = logging.getLogger("BASE API")
+logger.setLevel(logging.DEBUG)
 
-def setup_api(do_logging=False):
-    if do_logging:
-        logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-        logging.getLogger("urllib3").setLevel(logging.WARNING)
-
-    else:
-        logging.disable(logging.CRITICAL)
 
 
-class Core:
-    def __init__(self, delay=REQUEST_DELAY):
-        self.delay = delay
-        self.start_delay = False
-        self.last_request_time = None
+class BaseCore:
+    def __init__(self):
+        self.last_request_time = time.time()
+        self.headers = {
+            "User-Agent": random.choice(consts.USER_AGENTS),
+        }
+        self.total_requests = 0 # Tracks how many requests have been made
+        self.session = requests.Session()
+        self.session.headers.update(self.headers)
 
-    def get_content(self, url, headers=None, cookies=None, stream=False):
-        for i in range(MAX_RETRIES):
+    def update_user_agent(self):
+        self.headers.update({"User-Agent": random.choice(consts.USER_AGENTS)})
+
+    def enforce_delay(self):
+        delay = consts.REQUEST_DELAY
+        if delay > 0:
+            time_since_last_request = time.time() - self.last_request_time
+            logger.debug(f"Time since last request: {time_since_last_request:.2f} seconds.")
+            if time_since_last_request < delay:
+                sleep_time = delay - time_since_last_request
+                logger.debug(f"Enforcing delay of {sleep_time:.2f} seconds.")
+                time.sleep(sleep_time)
+
+    def get_content(self, url, get_bytes=False, stream=False, timeout=consts.TIMEOUT):
+        for attempt in range(1, consts.MAX_RETRIES):
+            if self.total_requests % 3 == 0:
+                self.update_user_agent()
+
             try:
-                # Delay mechanism
-                if self.last_request_time:
-                    elapsed_time = time.time() - self.last_request_time
-                    if elapsed_time < self.delay:
-                        time.sleep(self.delay - elapsed_time)
-
-                self.last_request_time = time.time()  # Update the time of the last request
-
-                logging.debug(f"Trying to fetch {url} / Attempt: [{i+1}]")
-                response = requests.get(url, headers=headers, cookies=cookies, stream=stream)
-                if response.status_code == 200:
-                    logging.info(f"Successfully fetched {url} on attempt [{i+1}]")
-                    return response.content
+                self.enforce_delay()
+                if consts.USE_PROXIES:
+                    verify = False
+                    url = url.replace("https://", "http://")
 
                 else:
-                    logging.warning(f"Failed to fetch {url} with status code {response.status_code} on attempt [{i+1}]")
+                    verify = True
 
-            except requests.exceptions.RequestException as e:
-                logging.error(f"Exception occurred when trying to fetch {url} on attempt [{i+1}]: {e}")
+                response = self.session.get(url, stream=stream, proxies=consts.PROXIES, verify=verify)
+                self.total_requests += 1
 
-            if i < MAX_RETRIES - 1:  # Implement exponential backoff
-                time.sleep(2 ** i)
+            except Exception:
+                error = traceback.format_exc()
+                logger.error(f"Could not fetch: {url} ->: {error}")
+                continue
 
-        logging.error(f"Failed to fetch {url} after {MAX_RETRIES} attempts.")
-        logging.error("Returning None")
-        return None
+            logger.debug(f"[{attempt}|{consts.MAX_RETRIES}] Fetch ->: {url}")
 
-    @classmethod
-    def fix_quality(cls, quality):
-        """This method gives the user the opportunity to pass a string instead of the quality object"""
-        if isinstance(quality, Quality):
-            return quality
+            if response.status_code == 200:
+                logger.debug(f"[{attempt}|{consts.MAX_RETRIES}] Fetch ->: 200 | Success")
+                if get_bytes is False:
+                    return response.content.decode("utf-8")
 
-        elif str(quality) == "best":
-            return Quality.BEST
+                return response.content
 
-        elif str(quality) == "half":
-            return Quality.HALF
-
-        elif str(quality) == "worst":
-            return Quality.WORST
-
-    def get_available_qualities(self, m3u8_base_url, base_qualities, seperator):
-        """Returns the available qualities from the M3U8 base url"""
-        content = self.get_content(m3u8_base_url).decode("utf-8")
-        lines = content.splitlines()
-
-        quality_url_map = {}
-
-        for line in lines:
-            for quality in base_qualities:
-                if f"{seperator}{quality}" in line and not str(line).startswith("#"):
-                    quality_url_map[quality] = line
-
-        self.quality_url_map = quality_url_map
-        self.available_qualities = list(quality_url_map.keys())
-        return self.available_qualities
-
-    def get_m3u8_by_quality(self, quality, m3u8_base_url, base_qualities, seperator):
-        """Returns the m3u8 url for the given quality"""
-        quality = self.fix_quality(quality)
-
-        self.get_available_qualities(m3u8_base_url, base_qualities, seperator=seperator)
-        if quality == Quality.BEST:
-            selected_quality = max(self.available_qualities, key=lambda q: base_qualities.index(q))
-        elif quality == Quality.WORST:
-            selected_quality = min(self.available_qualities, key=lambda q: base_qualities.index(q))
-        elif quality == Quality.HALF:
-            sorted_qualities = sorted(self.available_qualities, key=lambda q: base_qualities.index(q))
-            middle_index = len(sorted_qualities) // 2
-            selected_quality = sorted_qualities[middle_index]
-
-        return self.quality_url_map.get(selected_quality)
-
-    def download(self, video, quality, downloader, path, callback=None):
-        """
-        :param callback:
-        :param downloader:
-        :param quality:
-        :param path:
-        :return:
-        """
-        quality = self.fix_quality(quality)
-
-        if callback is None:
-            callback = Callback.text_progress_bar
-
-        if downloader == default or str(downloader) == "default":
-            default(video=video, quality=quality, path=path, callback=callback)
-
-        elif downloader == threaded or str(downloader) == "threaded":
-            threaded_download = threaded(max_workers=20, timeout=10)
-            threaded_download(video=video, quality=quality, path=path, callback=callback)
-
-        elif downloader == FFMPEG or str(downloader) == "FFMPEG":
-            FFMPEG(video=video, quality=quality, path=path, callback=callback)
-
-    @classmethod
-    def get_segments(cls, quality, m3u8_base_url, base_qualities, seperator, source=1):
-        quality = Core().fix_quality(quality)
-        base_url = m3u8_base_url
-        new_segment = Core().get_m3u8_by_quality(quality, m3u8_base_url=base_url, base_qualities=base_qualities,
-                                                 seperator=seperator)
-        # Split the base URL into components
-        url_components = base_url.split('/')
-
-        # Replace the last component with the new segment
-        url_components[-1] = new_segment
-
-        # Rejoin the components into the new full URL
-        new_url = '/'.join(url_components)
-
-        if source == "spankbang":
-            new_url = new_url.split(".mp4.urlset/")[1]  # Please just don't ask, I'm a terrible programmer fr
-
-        master_src = Core().get_content(url=new_url).decode("utf-8")
-
-        urls = [l for l in master_src.splitlines()
-                if l and not l.startswith('#')]
-
-        segments = []
-
-        for url in urls:
-            url_components[-1] = url
-            new_url = '/'.join(url_components)
-            segments.append(new_url)
-
-        return segments
+            else:
+                logger.error(f"Received unexpected status code -->: {response.status_code}")
 
     @classmethod
     def strip_title(cls, title: str) -> str:
@@ -166,16 +87,71 @@ class Core:
         cleaned_title = ''.join([char for char in title if char in string.printable and char not in illegal_chars])
         return cleaned_title
 
-    @classmethod
-    def return_path(cls, video, args):
-        path = args.output
-        if args.use_title:
-            if not str(path).endswith(os.sep):
-                path += os.sep
+    def get_m3u8_by_quality(self, m3u8_url: str, quality: str):
+        playlist_content = self.get_content(url=m3u8_url)
+        playlist = m3u8.loads(playlist_content)
+        logger.debug(f"Resolved m3u8 playlist: {m3u8_url}")
 
-            path += video.title + ".mp4"
+        if not playlist.is_variant:
+            raise ValueError("Provided URL is not a master playlist.")
+
+        # Extract available qualities and URLs
+        qualities = {
+            (variant.stream_info.resolution or "unknown"): variant.uri
+            for variant in playlist.playlists
+        }
+
+        # Sort qualities by resolution (width x height)
+        sorted_qualities = sorted(
+            qualities.items(),
+            key=lambda x: (x[0][0] * x[0][1]) if x[0] != "unknown" else 0
+        )
+
+        # Select based on quality preference
+        if quality == "best":
+            url_tmp = sorted_qualities[-1][1]  # Highest resolution URL
+
+        elif quality == "worst":
+            url_tmp = sorted_qualities[0][1]  # Lowest resolution URL
+
+        elif quality == "half":
+            url_tmp = sorted_qualities[len(sorted_qualities) // 2][1]  # Mid-quality URL
 
         else:
-            path = args.output
+            raise ValueError("Invalid quality provided.")
 
-        return path
+        full_url = urljoin(m3u8_url, url_tmp)
+        return full_url
+
+    def get_segments(self, m3u8_url_master, quality):
+        m3u8_url = self.get_m3u8_by_quality(m3u8_url=m3u8_url_master, quality=quality)
+        logger.debug(f"Trying to fetch segment from m3u8 ->: {m3u8_url}")
+        content = self.get_content(url=m3u8_url)
+        segments = m3u8.loads(content).segments
+        logger.debug(f"Fetched {len(segments)} segments from m3u8 URL")
+        return segments
+
+    def download(self, video, quality, downloader, path, callback=None):
+        """
+        :param callback:
+        :param downloader:
+        :param quality:
+        :param path:
+        :return:
+        """
+
+        if callback is None:
+            callback = Callback.text_progress_bar
+
+        if downloader == "default":
+            default(video=video, quality=quality, path=path, callback=callback)
+
+        elif downloader == "threaded":
+            threaded_download = threaded(max_workers=20, timeout=10)
+            threaded_download(video=video, quality=quality, path=path, callback=callback)
+
+        elif downloader == "FFMPEG":
+            FFMPEG(video=video, quality=quality, path=path, callback=callback)
+
+
+core = BaseCore()

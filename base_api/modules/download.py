@@ -1,19 +1,20 @@
 # Thanks to: https://github.com/EchterAlsFake/PHUB/blob/master/src/phub/modules/download.py
 # oh and of course ChatGPT lol
-import logging
-import time
-import requests
 import os
+import logging
+
+from typing import Callable, List
 from ffmpeg_progress_yield import FfmpegProgress
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Callable, List
-from base_api.modules.progress_bars import Callback
 
 try:
+    from base_api.base import BaseCore
     from base_api.modules.consts import FFMPEG_PATH
-
+    from base_api.modules.progress_bars import Callback
 except (ModuleNotFoundError, ImportError):
+    from ..base import BaseCore
     from .consts import FFMPEG_PATH
+    from ..modules.progress_bars import Callback
 
 CallbackType = Callable[[int, int], None]
 
@@ -23,25 +24,18 @@ the output path. This has good reasons, to make this library more adaptable into
 """
 
 
-def download_segment(url: str, timeout: int, retries: int = 3, backoff_factor: float = 0.3) -> tuple[str, bytes, bool]:
+def download_segment(url: str, timeout: int) -> tuple[str, bytes, bool]:
     """
     Attempt to download a single segment, retrying on failure.
     Returns a tuple of the URL, content (empty if failed after retries), and a success flag.
     """
-    for attempt in range(retries):
-        try:
-            response = requests.get(url, timeout=timeout)
-            response.raise_for_status()  # Raises stored HTTPError, if one occurred.
-            return (url, response.content, True)  # Success
-        except requests.RequestException as e:
-            print(f"Retry {attempt + 1} for {url}: {e}")
-            time.sleep(backoff_factor * (2 ** attempt))  # Exponential backoff
 
-    # After all retries have failed
-    return (url, b'', False)  # Failed download
+    response = BaseCore().get_content(url, timeout=timeout, get_bytes=True)
+    response.raise_for_status()  # Raises stored HTTPError, if one occurred.
+    return (url, response, True)  # Success
 
 
-def threaded(max_workers: int = 20, timeout: int = 10, retries: int = 3):
+def threaded(max_workers: int = 20, timeout: int = 10):
     """
     Creates a wrapper function for the actual download process, with retry logic.
     """
@@ -55,7 +49,7 @@ def threaded(max_workers: int = 20, timeout: int = 10, retries: int = 3):
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             # Map the last part of the URL (filename) to the future
-            future_to_hls_part = {executor.submit(download_segment, url, timeout, retries): os.path.basename(url) for url in segments}
+            future_to_hls_part = {executor.submit(download_segment, url, timeout): os.path.basename(url) for url in segments}
 
             for future in as_completed(future_to_hls_part):
                 hls_part = future_to_hls_part[future]
@@ -94,7 +88,7 @@ def default(video, quality, callback, path, start: int = 0) -> bool:
     for i, url in enumerate(segments):
         for _ in range(5):
 
-            segment = requests.get(url)
+            segment = BaseCore().get_content(url, get_bytes=True)
 
             if segment.ok:
                 buffer += segment.content
@@ -107,7 +101,7 @@ def default(video, quality, callback, path, start: int = 0) -> bool:
     return True
 
 
-def FFMPEG(video, quality, callback, path, start=0) -> bool:
+def FFMPEG(video, quality, callback, path) -> bool:
     base_url = video.m3u8_base_url
     new_segment = video.get_m3u8_by_quality(quality)
     url_components = base_url.split('/')
@@ -137,7 +131,7 @@ def FFMPEG(video, quality, callback, path, start=0) -> bool:
 
 
 def legacy_download(stream, path, url, callback=None):
-    response = requests.get(url, stream=stream)
+    response = BaseCore().get_content(url, stream=stream, get_bytes=True)
     file_size = int(response.headers.get('content-length', 0))
 
     if callback is None:
