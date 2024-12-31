@@ -8,11 +8,17 @@ import requests
 import traceback
 
 from typing import Union
-from modules import consts
 from urllib.parse import urljoin
-from modules.progress_bars import Callback
 from ffmpeg_progress_yield import FfmpegProgress
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+try:
+    from modules import consts
+    from modules.progress_bars import Callback
+
+except (ModuleNotFoundError, ImportError):
+    from .modules import consts
+    from .modules.progress_bars import Callback
 
 logging.basicConfig(format='%(name)s %(levelname)s %(asctime)s %(message)s', datefmt='%I:%M:%S %p')
 logger = logging.getLogger("BASE API")
