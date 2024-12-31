@@ -8,6 +8,7 @@ import requests
 import traceback
 
 from typing import Union
+from functools import lru_cache
 from urllib.parse import urljoin
 from ffmpeg_progress_yield import FfmpegProgress
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -51,6 +52,7 @@ class BaseCore:
                 logger.debug(f"Enforcing delay of {sleep_time:.2f} seconds.")
                 time.sleep(sleep_time)
 
+    @lru_cache(maxsize=250) # Might take som RAM lmao
     def fetch(self, url: str, get_bytes: bool = False, stream: bool = False, timeout: int =consts.TIMEOUT,
               get_response: bool = False) -> Union[bytes, str, requests.Response]:
         """
@@ -104,6 +106,7 @@ class BaseCore:
         cleaned_title = ''.join([char for char in title if char in string.printable and char not in illegal_chars])
         return cleaned_title
 
+    @lru_cache(maxsize=250)
     def get_m3u8_by_quality(self, m3u8_url: str, quality: str) -> str:
         """Fetches the m3u8 URL for a given quality by extracting all possible sub-m3u8 URLs from the primary
         m3u8 playlist"""
@@ -142,6 +145,7 @@ class BaseCore:
         full_url = urljoin(m3u8_url, url_tmp) # Merges the primary with the new URL to get the full URL path
         return full_url
 
+    @lru_cache(maxsize=250)
     def get_segments(self, m3u8_url_master: str, quality: str) -> list:
         """Gets all video segments from a given quality and the primary m3u8 URL"""
         m3u8_url = self.get_m3u8_by_quality(m3u8_url=m3u8_url_master, quality=quality)
