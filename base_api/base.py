@@ -32,16 +32,13 @@ class BaseCore:
     """
     def __init__(self):
         self.last_request_time = time.time()
-        self.headers = {
-            "User-Agent": random.choice(consts.USER_AGENTS),
-        }
         self.total_requests = 0 # Tracks how many requests have been made
         self.session = requests.Session()
-        self.session.headers.update(self.headers)
+        self.session.headers.update(consts.HEADERS)
 
     def update_user_agent(self):
         """Updates the User-Agent"""
-        self.headers.update({"User-Agent": random.choice(consts.USER_AGENTS)})
+        self.session.headers.update({"User-Agent": random.choice(consts.USER_AGENTS)})
 
     def enforce_delay(self):
         """Enforces the specified delay in consts.REQUEST_DELAY"""
@@ -61,7 +58,7 @@ class BaseCore:
         and custom timeout.
         """
         for attempt in range(1, consts.MAX_RETRIES):
-            if self.total_requests % 3 == 0:
+            if self.total_requests % 3 == 0: # Change user agent after 3 requests to prevent bot detection
                 self.update_user_agent()
 
             try:
