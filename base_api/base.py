@@ -114,6 +114,10 @@ class BaseCore:
 
                 if response.status_code != 200:
                     logger.error(f"Unexpected status code {response.status_code} for URL: {url}")
+
+                    if response.status_code == 404:
+                        return response # Needed for xvideos. Means that video is unavailable lol
+
                     continue
 
                 if get_response:
