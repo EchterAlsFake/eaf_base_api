@@ -11,7 +11,7 @@ fetching with retry attempts and proxy support.
 
 # Using Proxies / Caching
 There's a small documentation for this project.
-<br>Please have a look at it: https://github.com/EchterAlsFake/API_Docs/Porn_APIs/eaf_base_api.md
+<br>Please have a look at it: https://github.com/EchterAlsFake/API_Docs/blob/master/Porn_APIs/eaf_base_api.md
 
 
 # Can I use this for myself?
