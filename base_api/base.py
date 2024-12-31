@@ -6,6 +6,7 @@ import string
 import logging
 import requests
 import traceback
+import threading
 
 from typing import Union
 from functools import lru_cache
@@ -25,6 +26,38 @@ logging.basicConfig(format='%(name)s %(levelname)s %(asctime)s %(message)s', dat
 logger = logging.getLogger("BASE API")
 logger.setLevel(logging.DEBUG)
 
+def disable_logging():
+    logger.setLevel(logging.CRITICAL)
+
+
+class Cache:
+    """
+    Caches content from network requests
+    """
+
+    def __init__(self):
+        self.cache_dictionary = {}
+        self.lock = threading.Lock()
+
+    def handle_cache(self, url):
+        if url is None:
+            return
+
+        with self.lock:
+            content = self.cache_dictionary.get(url, None)
+            return content
+
+    def save_cache(self, url, content):
+        with self.lock:
+            if len(self.cache_dictionary.keys()) >= consts.MAX_CACHE_ITEMS:
+                first_key = next(iter(self.cache_dictionary))
+                # Delete the first item
+                del self.cache_dictionary[first_key]
+                logger.info(f"Deleting: {first_key} from cache, due to caching limits...")
+
+            self.cache_dictionary[url] = content
+
+cache = Cache()
 
 
 class BaseCore:
@@ -52,28 +85,37 @@ class BaseCore:
                 logger.debug(f"Enforcing delay of {sleep_time:.2f} seconds.")
                 time.sleep(sleep_time)
 
-    @lru_cache(maxsize=250) # Might take som RAM lmao
-    def fetch(self, url: str, get_bytes: bool = False, stream: bool = False, timeout: int =consts.TIMEOUT,
-              get_response: bool = False) -> Union[bytes, str, requests.Response]:
+    def fetch(self, url: str, get_bytes: bool = False, stream: bool = False, timeout: int = consts.TIMEOUT,
+              get_response: bool = False, save_cache: bool = True) -> Union[bytes, str, requests.Response]:
         """
         Fetches content in UTF-8 Text, Bytes or as a stream using multiple request attempts, support for proxies
         and custom timeout.
         """
+        content = cache.handle_cache(url)
+        if content is not None:
+            logger.info(f"Fetched content for: {url} from cache!")
+            return content
+
         for attempt in range(1, consts.MAX_RETRIES):
-            if self.total_requests % 3 == 0: # Change user agent after 3 requests to prevent bot detection
+            if self.total_requests % 3 == 0:  # Change user agent after 3 requests to prevent bot detection
                 self.update_user_agent()
 
             try:
                 self.enforce_delay()
                 if consts.USE_PROXIES:
-                    verify = False # Disable SSL verification
-                    url = url.replace("https://", "http://") # Replace https to http to support HTTP proxies
+                    verify = False  # Disable SSL verification
+                    url = url.replace("https://", "http://")  # Replace https to http to support HTTP proxies
 
                 else:
                     verify = True
 
                 response = self.session.get(url, stream=stream, proxies=consts.PROXIES, verify=verify,
                                             timeout=timeout)
+
+                if response.status_code != 200:
+                    logger.error(f"Unexpected status code {response.status_code} for URL: {url}")
+                    continue
+
                 if get_response:
                     return response
 
@@ -82,19 +124,20 @@ class BaseCore:
             except Exception:
                 error = traceback.format_exc()
                 logger.error(f"Could not fetch: {url} ->: {error}")
-                continue # Next attempt
+                continue  # Next attempt
 
             logger.debug(f"[{attempt}|{consts.MAX_RETRIES}] Fetch ->: {url}")
 
-            if response.status_code == 200:
-                logger.debug(f"[{attempt}|{consts.MAX_RETRIES}] Fetch ->: 200 | Success")
-                if get_bytes is False:
-                    return response.content.decode("utf-8")
+            logger.debug(f"[{attempt}|{consts.MAX_RETRIES}] Fetch ->: 200 | Success")
+            if get_bytes is False:
+                content = response.content.decode("utf-8")
+                if save_cache:
+                    logger.debug(f"Trying to save content of: {url} in local cache...")
+                    cache.save_cache(url, content)
 
-                return response.content
+                return content
 
-            else:
-                logger.error(f"Received unexpected status code -->: {response.status_code}")
+            return response.content
 
     @classmethod
     def strip_title(cls, title: str) -> str:

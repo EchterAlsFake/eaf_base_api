@@ -1,5 +1,6 @@
 import random
 
+MAX_CACHE_ITEMS = 200 # Lower this value if you are on a low-ram system (<=4 GB)
 MAX_RETRIES = 4
 REQUEST_DELAY = 0
 TIMEOUT = 20 # Maximal request timeout
