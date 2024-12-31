@@ -313,3 +313,15 @@ class BaseCore:
 
         else:
             raise FileExistsError("The file already exists.")
+
+    @classmethod
+    def return_path(cls, video, args) -> str:
+        path = args.output
+        if args.use_title:
+            if not str(path).endswith(os.sep):
+                path += os.sep
+            path += video.title + ".mp4"
+        else:
+            path = args.output
+
+        return path
