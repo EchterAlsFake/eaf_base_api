@@ -2,7 +2,6 @@ MAX_RETRIES = 4
 REQUEST_DELAY = 0
 TIMEOUT = 20 # Maximal request timeout
 FFMPEG_PATH = "ffmpeg"
-USE_TOR = False
 USE_PROXIES = False
 PROXIES = {}
 USER_AGENTS = ["Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
