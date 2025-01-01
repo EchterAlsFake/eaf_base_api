@@ -86,7 +86,8 @@ class BaseCore:
                 time.sleep(sleep_time)
 
     def fetch(self, url: str, get_bytes: bool = False, stream: bool = False, timeout: int = consts.TIMEOUT,
-              get_response: bool = False, save_cache: bool = True) -> Union[bytes, str, requests.Response]:
+              get_response: bool = False, save_cache: bool = True,
+              allow_redirects: bool = True) -> Union[bytes, str, requests.Response]:
         """
         Fetches content in UTF-8 Text, Bytes or as a stream using multiple request attempts, support for proxies
         and custom timeout.
@@ -110,7 +111,7 @@ class BaseCore:
                     verify = True
 
                 response = self.session.get(url, stream=stream, proxies=consts.PROXIES, verify=verify,
-                                            timeout=timeout)
+                                            timeout=timeout, allow_redirects=allow_redirects)
 
                 if response.status_code != 200:
                     logger.error(f"Unexpected status code {response.status_code} for URL: {url}")
