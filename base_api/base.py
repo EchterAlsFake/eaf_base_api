@@ -116,6 +116,7 @@ class BaseCore:
                     logger.error(f"Unexpected status code {response.status_code} for URL: {url}")
 
                     if response.status_code == 404:
+                        logger.error("Website returned 404. Not an issue for xivdeos, but for all other sites")
                         return response # Needed for xvideos. Means that video is unavailable lol
 
                     continue
@@ -142,6 +143,8 @@ class BaseCore:
                 return content
 
             return response.content
+
+        raise ConnectionError(f"Could not fetch content for: {url}")
 
     @classmethod
     def strip_title(cls, title: str) -> str:
