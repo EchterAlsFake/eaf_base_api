@@ -240,9 +240,9 @@ class BaseCore:
         Returns a tuple of the URL, content (empty if failed after retries), and a success flag.
         """
 
-        response = BaseCore().fetch(url, timeout=timeout, get_bytes=True)
+        response = BaseCore().fetch(url, timeout=timeout, get_response=True)
         response.raise_for_status()
-        return url, response, True  # Success
+        return url, response.content, True  # Success
 
     def threaded(self, max_workers: int = 20, timeout: int = 10):
         """
