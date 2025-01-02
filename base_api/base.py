@@ -115,9 +115,7 @@ class BaseCore:
                 self.enforce_delay()
 
                 # Configure proxy settings
-                verify = not consts.USE_PROXIES
-                if consts.USE_PROXIES:
-                    url = url.replace("https://", "http://")
+                verify = consts.USE_PROXIES
 
                 # Perform the request
                 response = self.session.get(
