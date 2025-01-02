@@ -364,35 +364,46 @@ class BaseCore:
         return False
 
     def legacy_download(self, stream: bool, path: str, url: str, callback=None) -> bool:
-        response = self.fetch(url, stream=stream, get_bytes=True, get_response=True)
-        if response is None:
-            logger.error(f"Failed to fetch content from URL: {url}")
+        """
+        Download a file using streaming, with support for progress updates.
+        """
+        try:
+            with self.session.stream("GET", url, timeout=30) as response:  # Use a reasonable timeout
+                response.raise_for_status()
+
+                file_size = int(response.headers.get('content-length', 0))
+
+                if callback is None:
+                    progress_bar = Callback()
+
+                downloaded_so_far = 0
+
+                # Open file for writing
+                with open(path, 'wb') as file:
+                    for chunk in response.iter_bytes(chunk_size=1024):
+                        if not chunk:
+                            break  # End of stream
+
+                        file.write(chunk)
+                        downloaded_so_far += len(chunk)
+
+                        # Update progress
+                        if callback:
+                            callback(downloaded_so_far, file_size)
+                        else:
+                            progress_bar.text_progress_bar(downloaded=downloaded_so_far, total=file_size)
+
+                if not callback:
+                    del progress_bar
+
+                return True
+
+        except httpx.RequestError as e:
+            logger.error(f"Request failed for URL {url}: {e}")
             return False
-
-        file_size = int(response.headers.get('content-length', 0))
-
-        if callback is None:
-            progress_bar = Callback()
-
-        downloaded_so_far = 0
-
-        if not os.path.exists(path):
-            with open(path, 'wb') as file:
-                for chunk in response.iter_bytes(chunk_size=1024):
-                    file.write(chunk)
-                    downloaded_so_far += len(chunk)
-
-                    if callback:
-                        callback(downloaded_so_far, file_size)
-                    else:
-                        progress_bar.text_progress_bar(downloaded=downloaded_so_far, total=file_size)
-
-            if not callback:
-                del progress_bar
-
-            return True
-        else:
-            raise FileExistsError("The file already exists.")
+        except Exception as e:
+            logger.error(f"Unexpected error during download: {e}")
+            return False
 
     @classmethod
     def return_path(cls, video, args) -> str:
