@@ -4,9 +4,9 @@ import time
 import random
 import string
 import logging
-import requests
 import traceback
 import threading
+import httpx
 
 from typing import Union
 from functools import lru_cache
@@ -67,12 +67,24 @@ class BaseCore:
     def __init__(self):
         self.last_request_time = time.time()
         self.total_requests = 0 # Tracks how many requests have been made
-        self.session = requests.Session()
-        self.session.headers.update(consts.HEADERS)
+        self.initialize_session()
+
 
     def update_user_agent(self):
         """Updates the User-Agent"""
         self.session.headers.update({"User-Agent": random.choice(consts.USER_AGENTS)})
+
+    def initialize_session(self):
+        verify = True
+
+        if consts.PROXY is not None:
+            verify = False
+
+        self.session = httpx.Client(proxy=consts.PROXY,
+                              headers=consts.HEADERS,
+                              verify=verify,
+                              timeout=consts.TIMEOUT
+                              )
 
     def enforce_delay(self):
         """Enforces the specified delay in consts.REQUEST_DELAY"""
@@ -95,7 +107,7 @@ class BaseCore:
             save_cache: bool = True,
             cookies: dict = None,
             allow_redirects: bool = True,
-    ) -> Union[bytes, str, requests.Response, None]:
+    ) -> Union[bytes, str, httpx.Response, None]:
         """
         Fetches content in UTF-8 Text, Bytes, or as a stream using multiple request attempts,
         support for proxies and custom timeout.
@@ -114,59 +126,49 @@ class BaseCore:
 
                 self.enforce_delay()
 
-                # Configure proxy settings
-                verify = consts.USE_PROXIES
+                # Perform the request with stream handling
+                with self.session.stream("GET", url, timeout=timeout, cookies=cookies,
+                                         follow_redirects=allow_redirects) as response:
+                    self.total_requests += 1
 
-                # Perform the request
-                response = self.session.get(
-                    url,
-                    stream=stream,
-                    proxies=consts.PROXIES,
-                    verify=verify,
-                    timeout=timeout,
-                    allow_redirects=allow_redirects,
-                    cookies=cookies,
-                )
-                self.total_requests += 1
+                    # Log and handle non-200 status codes
+                    if response.status_code != 200:
+                        logger.warning(
+                            f"Attempt {attempt}: Unexpected status code {response.status_code} for URL: {url}")
 
-                # Log and handle non-200 status codes
-                if response.status_code != 200:
-                    logger.warning(f"Attempt {attempt}: Unexpected status code {response.status_code} for URL: {url}")
+                        if response.status_code == 404:
+                            logger.error("Resource not found (404). This may indicate the content is unavailable.")
+                            return None  # Return None for unavailable resources
 
-                    if response.status_code == 404:
-                        logger.error("Resource not found (404). This may indicate the content is unavailable.")
-                        return None  # Return None for unavailable resources
+                        continue  # Retry for other non-200 status codes
 
-                    continue  # Retry for other non-200 status codes
+                    logger.debug(f"Attempt {attempt}: Successfully fetched URL: {url}")
 
-                logger.debug(f"Attempt {attempt}: Successfully fetched URL: {url}")
+                    # Return response if requested
+                    if get_response:
+                        return response
 
-                # Return response if requested
-                if get_response:
-                    return response
+                    # Process and return content
+                    if get_bytes:
+                        content = b"".join([chunk for chunk in response.iter_bytes()])
+                    else:
+                        content = "".join([chunk.decode("utf-8") for chunk in response.iter_bytes()])
+                        if save_cache:
+                            logger.debug(f"Saving content of {url} to local cache.")
+                            cache.save_cache(url, content)
 
-                # Process and return content
-                if get_bytes:
-                    content = response.content
-                else:
-                    content = response.content.decode("utf-8")
-                    if save_cache:
-                        logger.debug(f"Saving content of {url} to local cache.")
-                        cache.save_cache(url, content)
+                    return content
 
-                return content
-
-            except requests.exceptions.RequestException as e:
+            except httpx.RequestError as e:
                 logger.error(f"Attempt {attempt}: Request error for URL {url}: {e}")
 
-            except Exception :
+            except Exception:
                 logger.error(f"Attempt {attempt}: Unexpected error for URL {url}: {traceback.format_exc()}")
 
             logger.info(f"Retrying ({attempt}/{consts.MAX_RETRIES}) for URL: {url}")
 
         logger.error(f"Failed to fetch URL {url} after {consts.MAX_RETRIES} attempts.")
         return None  # Return None if all attempts fail
-
 
     @classmethod
     def strip_title(cls, title: str) -> str:
@@ -363,6 +365,10 @@ class BaseCore:
 
     def legacy_download(self, stream: bool, path: str, url: str, callback=None) -> bool:
         response = self.fetch(url, stream=stream, get_bytes=True, get_response=True)
+        if response is None:
+            logger.error(f"Failed to fetch content from URL: {url}")
+            return False
+
         file_size = int(response.headers.get('content-length', 0))
 
         if callback is None:
@@ -372,13 +378,12 @@ class BaseCore:
 
         if not os.path.exists(path):
             with open(path, 'wb') as file:
-                for chunk in response.iter_content(chunk_size=1024):
+                for chunk in response.iter_bytes(chunk_size=1024):
                     file.write(chunk)
                     downloaded_so_far += len(chunk)
 
                     if callback:
                         callback(downloaded_so_far, file_size)
-
                     else:
                         progress_bar.text_progress_bar(downloaded=downloaded_so_far, total=file_size)
 
@@ -386,7 +391,6 @@ class BaseCore:
                 del progress_bar
 
             return True
-
         else:
             raise FileExistsError("The file already exists.")
 

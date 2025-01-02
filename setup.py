@@ -2,10 +2,9 @@ from setuptools import setup, find_packages
 
 setup(
     name="eaf_base_api",
-    version="2.0",
+    version="2.1",
     packages=find_packages(),
-    install_requires=[
-        "requests", "ffmpeg-progress-yield", "m3u8"
+    install_requires=["ffmpeg-progress-yield", "m3u8"
     ],
     entry_points={
         'console_scripts': [
