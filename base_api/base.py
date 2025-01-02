@@ -67,6 +67,7 @@ class BaseCore:
     def __init__(self):
         self.last_request_time = time.time()
         self.total_requests = 0 # Tracks how many requests have been made
+        self.session = None
         self.initialize_session()
 
 
@@ -101,7 +102,6 @@ class BaseCore:
             self,
             url: str,
             get_bytes: bool = False,
-            stream: bool = False,
             timeout: int = consts.TIMEOUT,
             get_response: bool = False,
             save_cache: bool = True,
@@ -348,7 +348,7 @@ class BaseCore:
             "-i", new_url,  # Input URL
             "-bsf:a", "aac_adtstoasc",
             "-y",  # Overwrite output files without asking
-            "-c", "copy",  # Copy streams without reencoding
+            "-c", "copy",  # Copy streams without re-encoding
             path  # Output file path
         ]
 
@@ -363,7 +363,7 @@ class BaseCore:
 
         return False
 
-    def legacy_download(self, stream: bool, path: str, url: str, callback=None) -> bool:
+    def legacy_download(self, path: str, url: str, callback=None) -> bool:
         """
         Download a file using streaming, with support for progress updates.
         """
