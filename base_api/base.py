@@ -266,7 +266,8 @@ class BaseCore:
 
         response = BaseCore().fetch(url, timeout=timeout, get_response=True)
         response.raise_for_status()
-        return url, response.content, True  # Success
+        content = b"".join(response.iter_bytes())
+        return url, content, True  # Success
 
     def threaded(self, max_workers: int = 20, timeout: int = 10):
         """
@@ -282,10 +283,10 @@ class BaseCore:
             completed, successful_downloads = 0, 0
 
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                # Map the last part of the URL (filename) to the future
-                future_to_hls_part = {executor.submit(self.download_segment, url, timeout): os.path.basename(url) for
-                                      url in
-                                      segments}
+                future_to_hls_part = {
+                    executor.submit(self.download_segment, url, timeout): os.path.basename(url)
+                    for url in segments
+                }
 
                 for future in as_completed(future_to_hls_part):
                     hls_part = future_to_hls_part[future]
@@ -294,26 +295,25 @@ class BaseCore:
                         completed += 1
                         if success:
                             successful_downloads += 1
-                        callback(completed, length)  # Update callback regardless of success to reflect progress
+                        callback(completed, length)  # Update progress callback
                     except Exception as e:
-                        raise e
+                        logger.error(f"Error processing segment {hls_part}: {e}")
 
-            # Writing only successful downloads to the file
+            # Write only successful segments to the output file
             with open(path, 'wb') as file:
                 for segment_url in segments:
-                    # Find the future object using the HLS part of the URL as the key
-                    matched_futures = [future for future, hls_part in future_to_hls_part.items() if
-                                       hls_part == os.path.basename(segment_url)]
+                    matched_futures = [
+                        future for future, hls_part in future_to_hls_part.items()
+                        if hls_part == os.path.basename(segment_url)
+                    ]
                     if matched_futures:
-                        logging.info("Got a match")
-                        future = matched_futures[0]  # Assuming unique HLS parts, take the first match
+                        future = matched_futures[0]
                         try:
                             _, data, success = future.result()
                             if success:
                                 file.write(data)
-                        except Exception:
-                            error = traceback.format_exc()
-                            logger.error(f"Exception while downloading segment: {error}")
+                        except Exception as e:
+                            logger.error(f"Exception writing segment {segment_url}: {e}")
 
         return wrapper
 
