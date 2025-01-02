@@ -4,7 +4,7 @@ setup(
     name="eaf_base_api",
     version="2.1",
     packages=find_packages(),
-    install_requires=["ffmpeg-progress-yield", "m3u8"
+    install_requires=["ffmpeg-progress-yield", "m3u8", "httpx"
     ],
     entry_points={
         'console_scripts': [
