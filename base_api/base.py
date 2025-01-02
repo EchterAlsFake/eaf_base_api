@@ -85,67 +85,90 @@ class BaseCore:
                 logger.debug(f"Enforcing delay of {sleep_time:.2f} seconds.")
                 time.sleep(sleep_time)
 
-    def fetch(self, url: str, get_bytes: bool = False, stream: bool = False, timeout: int = consts.TIMEOUT,
-              get_response: bool = False, save_cache: bool = True, cookies: dict = None,
-              allow_redirects: bool = True) -> Union[bytes, str, requests.Response]:
+    def fetch(
+            self,
+            url: str,
+            get_bytes: bool = False,
+            stream: bool = False,
+            timeout: int = consts.TIMEOUT,
+            get_response: bool = False,
+            save_cache: bool = True,
+            cookies: dict = None,
+            allow_redirects: bool = True,
+    ) -> Union[bytes, str, requests.Response, None]:
         """
-        Fetches content in UTF-8 Text, Bytes or as a stream using multiple request attempts, support for proxies
-        and custom timeout.
+        Fetches content in UTF-8 Text, Bytes, or as a stream using multiple request attempts,
+        support for proxies and custom timeout.
         """
+        # Check cache first
         content = cache.handle_cache(url)
         if content is not None:
             logger.info(f"Fetched content for: {url} from cache!")
             return content
 
-        for attempt in range(1, consts.MAX_RETRIES):
-            if self.total_requests % 3 == 0:  # Change user agent after 3 requests to prevent bot detection
-                self.update_user_agent()
-
+        for attempt in range(1, consts.MAX_RETRIES + 1):
             try:
+                # Update user agent periodically
+                if self.total_requests % 3 == 0:
+                    self.update_user_agent()
+
                 self.enforce_delay()
+
+                # Configure proxy settings
+                verify = not consts.USE_PROXIES
                 if consts.USE_PROXIES:
-                    verify = False  # Disable SSL verification
-                    url = url.replace("https://", "http://")  # Replace https to http to support HTTP proxies
+                    url = url.replace("https://", "http://")
 
-                else:
-                    verify = True
+                # Perform the request
+                response = self.session.get(
+                    url,
+                    stream=stream,
+                    proxies=consts.PROXIES,
+                    verify=verify,
+                    timeout=timeout,
+                    allow_redirects=allow_redirects,
+                    cookies=cookies,
+                )
+                self.total_requests += 1
 
-                response = self.session.get(url, stream=stream, proxies=consts.PROXIES, verify=verify,
-                                            timeout=timeout, allow_redirects=allow_redirects, cookies=cookies)
-
+                # Log and handle non-200 status codes
                 if response.status_code != 200:
-                    logger.error(f"Unexpected status code {response.status_code} for URL: {url}")
+                    logger.warning(f"Attempt {attempt}: Unexpected status code {response.status_code} for URL: {url}")
 
                     if response.status_code == 404:
-                        logger.error("Website returned 404. Not an issue for xivdeos, but for all other sites")
-                        return response # Needed for xvideos. Means that video is unavailable lol
+                        logger.error("Resource not found (404). This may indicate the content is unavailable.")
+                        return None  # Return None for unavailable resources
 
-                    continue
+                    continue  # Retry for other non-200 status codes
 
+                logger.debug(f"Attempt {attempt}: Successfully fetched URL: {url}")
+
+                # Return response if requested
                 if get_response:
                     return response
 
-                self.total_requests += 1
-
-            except Exception:
-                error = traceback.format_exc()
-                logger.error(f"Could not fetch: {url} ->: {error}")
-                continue  # Next attempt
-
-            logger.debug(f"[{attempt}|{consts.MAX_RETRIES}] Fetch ->: {url}")
-
-            logger.debug(f"[{attempt}|{consts.MAX_RETRIES}] Fetch ->: 200 | Success")
-            if get_bytes is False:
-                content = response.content.decode("utf-8")
-                if save_cache:
-                    logger.debug(f"Trying to save content of: {url} in local cache...")
-                    cache.save_cache(url, content)
+                # Process and return content
+                if get_bytes:
+                    content = response.content
+                else:
+                    content = response.content.decode("utf-8")
+                    if save_cache:
+                        logger.debug(f"Saving content of {url} to local cache.")
+                        cache.save_cache(url, content)
 
                 return content
 
-            return response.content
+            except requests.exceptions.RequestException as e:
+                logger.error(f"Attempt {attempt}: Request error for URL {url}: {e}")
 
-        raise ConnectionError(f"Could not fetch content for: {url}")
+            except Exception :
+                logger.error(f"Attempt {attempt}: Unexpected error for URL {url}: {traceback.format_exc()}")
+
+            logger.info(f"Retrying ({attempt}/{consts.MAX_RETRIES}) for URL: {url}")
+
+        logger.error(f"Failed to fetch URL {url} after {consts.MAX_RETRIES} attempts.")
+        return None  # Return None if all attempts fail
+
 
     @classmethod
     def strip_title(cls, title: str) -> str:
