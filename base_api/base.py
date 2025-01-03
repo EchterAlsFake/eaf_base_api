@@ -4,8 +4,10 @@ import m3u8
 import httpx
 import random
 import string
+import asyncio
 import logging
 import traceback
+import time
 import threading
 
 from typing import Union
@@ -64,41 +66,27 @@ class BaseCore:
     """
     The base class which has all necessary functions for other API packages
     """
+
     def __init__(self):
         self.last_request_time = time.time()
-        self.total_requests = 0 # Tracks how many requests have been made
-        self.session = None
-        self.initialize_session()
+        self.total_requests = 0
+        self.user_agent = random.choice(consts.USER_AGENTS)
+        self.session = httpx.AsyncClient(
+            proxy=consts.PROXY if consts.PROXY else None,
+            verify=not consts.PROXY,
+            headers=consts.HEADERS
+        )
 
-
-    def update_user_agent(self):
-        """Updates the User-Agent"""
-        self.session.headers.update({"User-Agent": random.choice(consts.USER_AGENTS)})
-
-    def initialize_session(self):
-        verify = True
-
-        if consts.PROXY is not None:
-            verify = False
-
-        self.session = httpx.Client(proxy=consts.PROXY,
-                              headers=consts.HEADERS,
-                              verify=verify,
-                              timeout=consts.TIMEOUT
-                              )
-
-    def enforce_delay(self):
-        """Enforces the specified delay in consts.REQUEST_DELAY"""
+    async def enforce_delay(self):
         delay = consts.REQUEST_DELAY
         if delay > 0:
             time_since_last_request = time.time() - self.last_request_time
-            logger.debug(f"Time since last request: {time_since_last_request:.2f} seconds.")
             if time_since_last_request < delay:
                 sleep_time = delay - time_since_last_request
                 logger.debug(f"Enforcing delay of {sleep_time:.2f} seconds.")
-                time.sleep(sleep_time)
+                await asyncio.sleep(sleep_time)
 
-    def fetch(
+    async def fetch(
             self,
             url: str,
             get_bytes: bool = False,
@@ -108,11 +96,7 @@ class BaseCore:
             cookies: dict = None,
             allow_redirects: bool = True,
     ) -> Union[bytes, str, httpx.Response, None]:
-        """
-        Fetches content in UTF-8 Text, Bytes, or as a stream using multiple request attempts,
-        support for proxies and custom timeout.
-        """
-        # Check cache first
+        # Check cache
         content = cache.handle_cache(url)
         if content is not None:
             logger.info(f"Fetched content for: {url} from cache!")
@@ -120,55 +104,51 @@ class BaseCore:
 
         for attempt in range(1, consts.MAX_RETRIES + 1):
             try:
-                # Update user agent periodically
                 if self.total_requests % 3 == 0:
-                    self.update_user_agent()
+                    self.user_agent = random.choice(consts.USER_AGENTS)
 
-                self.enforce_delay()
+                await self.enforce_delay()
 
-                # Perform the request with stream handling
-                with self.session.stream("GET", url, timeout=timeout, cookies=cookies,
-                                         follow_redirects=allow_redirects) as response:
-                    self.total_requests += 1
+                response = await self.session.get(
+                    url,
+                    timeout=timeout,
+                    cookies=cookies,
+                    follow_redirects=allow_redirects
+                )
+                self.total_requests += 1
 
-                    # Log and handle non-200 status codes
-                    if response.status_code != 200:
-                        logger.warning(
-                            f"Attempt {attempt}: Unexpected status code {response.status_code} for URL: {url}")
+                if response.status_code != 200:
+                    logger.warning(
+                        f"Attempt {attempt}: Unexpected status code {response.status_code} for URL: {url}"
+                    )
+                    if response.status_code == 404:
+                        logger.error("Resource not found (404). This may indicate the content is unavailable.")
+                        return None
+                    continue
 
-                        if response.status_code == 404:
-                            logger.error("Resource not found (404). This may indicate the content is unavailable.")
-                            return None  # Return None for unavailable resources
+                logger.debug(f"Attempt {attempt}: Successfully fetched URL: {url}")
 
-                        continue  # Retry for other non-200 status codes
+                if get_response:
+                    return response
 
-                    logger.debug(f"Attempt {attempt}: Successfully fetched URL: {url}")
-
-                    # Return response if requested
-                    if get_response:
-                        return response
-
-                    # Process and return content
-                    if get_bytes:
-                        content = b"".join([chunk for chunk in response.iter_bytes()])
-                    else:
-                        content = "".join([chunk.decode("utf-8") for chunk in response.iter_bytes()])
-                        if save_cache:
-                            logger.debug(f"Saving content of {url} to local cache.")
-                            cache.save_cache(url, content)
-
-                    return content
+                content = await response.aread() if get_bytes else response.text
+                if save_cache:
+                    cache.save_cache(url, content)
+                return content
 
             except httpx.RequestError as e:
                 logger.error(f"Attempt {attempt}: Request error for URL {url}: {e}")
 
-            except Exception:
+            except Exception as e:
                 logger.error(f"Attempt {attempt}: Unexpected error for URL {url}: {traceback.format_exc()}")
 
             logger.info(f"Retrying ({attempt}/{consts.MAX_RETRIES}) for URL: {url}")
 
         logger.error(f"Failed to fetch URL {url} after {consts.MAX_RETRIES} attempts.")
-        return None  # Return None if all attempts fail
+        return None
+
+    async def close(self):
+        await self.session.aclose()
 
     @classmethod
     def strip_title(cls, title: str) -> str:
@@ -181,10 +161,10 @@ class BaseCore:
         return cleaned_title
 
     @lru_cache(maxsize=250)
-    def get_m3u8_by_quality(self, m3u8_url: str, quality: str) -> str:
+    async def get_m3u8_by_quality(self, m3u8_url: str, quality: str) -> str:
         """Fetches the m3u8 URL for a given quality by extracting all possible sub-m3u8 URLs from the primary
         m3u8 playlist"""
-        playlist_content = self.fetch(url=m3u8_url)
+        playlist_content = await self.fetch(url=m3u8_url)
         playlist = m3u8.loads(playlist_content)
         logger.debug(f"Resolved m3u8 playlist: {m3u8_url}")
 
@@ -220,11 +200,11 @@ class BaseCore:
         return full_url
 
     @lru_cache(maxsize=250)
-    def get_segments(self, m3u8_url_master: str, quality: str) -> list:
+    async def get_segments(self, m3u8_url_master: str, quality: str) -> list:
         """Gets all video segments from a given quality and the primary m3u8 URL"""
-        m3u8_url = self.get_m3u8_by_quality(m3u8_url=m3u8_url_master, quality=quality)
+        m3u8_url = await self.get_m3u8_by_quality(m3u8_url=m3u8_url_master, quality=quality)
         logger.debug(f"Trying to fetch segment from m3u8 ->: {m3u8_url}")
-        content = self.fetch(url=m3u8_url)
+        content = await self.fetch(url=m3u8_url)
         segments_ = m3u8.loads(content).segments
         segments = []
 
@@ -251,75 +231,86 @@ class BaseCore:
             self.default(video=video, quality=quality, path=path, callback=callback)
 
         elif downloader == "threaded":
-            threaded_download = self.threaded(max_workers=20, timeout=10)
-            threaded_download(self, video=video, quality=quality, path=path, callback=callback)
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+
+            if loop and loop.is_running():
+                # Wenn eine Event-Loop läuft, erstelle eine neue Aufgabe
+                asyncio.create_task(self.threaded(video=video, path=path, callback=callback, quality=quality))
+            else:
+                # Andernfalls starte eine neue Event-Loop
+                asyncio.run(self.threaded(video=video, path=path, callback=callback, quality=quality))
+
 
         elif downloader == "FFMPEG":
             self.FFMPEG(video=video, quality=quality, path=path, callback=callback)
 
-    @classmethod
-    def download_segment(cls, url: str, timeout: int) -> tuple[str, bytes, bool]:
+    async def download_segment(self, url: str) -> tuple[str, bytes, bool]:
         """
-        Attempt to download a single segment, retrying on failure.
-        Returns a tuple of the URL, content (empty if failed after retries), and a success flag.
+        Attempt to download a single segment.
+        Returns a tuple of the URL, content (empty if failed), and a success flag.
         """
+        try:
+            response = await self.fetch(url=url, get_response=True)
+            response.raise_for_status()
+            content = await response.aread()
+            return url, content, True  # Success
 
-        response = BaseCore().fetch(url, timeout=timeout, get_response=True)
-        response.raise_for_status()
-        content = b"".join(response.iter_bytes())
-        return url, content, True  # Success
+        except Exception as e:
+            logger.error(f"Failed to download segment {url}: {e}")
+            return url, b'', False  # Failure
 
-    def threaded(self, max_workers: int = 20, timeout: int = 10):
+    async def threaded(self, video, quality: str, callback, path: str, max_concurrent_downloads: int = 20):
         """
-        Creates a wrapper function for the actual download process, with retry logic.
+        Download video segments asynchronously in parallel, write them to a file, and handle retries.
+        The `callback` function is called after each segment is processed.
         """
+        segments = await self.get_segments(quality=quality, m3u8_url_master=video.m3u8_base_url)
+        total_segments = len(segments)
+        completed = 0
+        successful_downloads = 0
 
-        def wrapper(self, video, quality: str, callback, path: str):
-            """
-            Download video segments in parallel, with retries for failures, and write to a file.
-            """
-            segments = self.get_segments(quality=quality, m3u8_url_master=video.m3u8_base_url)
-            length = len(segments)
-            completed, successful_downloads = 0, 0
+        semaphore = asyncio.Semaphore(max_concurrent_downloads)
+        segment_data_list = [None] * total_segments  # To store segment data in order
 
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                future_to_hls_part = {
-                    executor.submit(self.download_segment, url, timeout): os.path.basename(url)
-                    for url in segments
-                }
+        async def process_segment(index, url):
+            nonlocal completed, successful_downloads
+            async with semaphore:
+                url, data, success = await self.download_segment(url)
+                completed += 1
 
-                for future in as_completed(future_to_hls_part):
-                    hls_part = future_to_hls_part[future]
-                    try:
-                        _, data, success = future.result()
-                        completed += 1
-                        if success:
-                            successful_downloads += 1
-                        callback(completed, length)  # Update progress callback
-                    except Exception as e:
-                        logger.error(f"Error processing segment {hls_part}: {e}")
+                if success:
+                    successful_downloads += 1
+                    segment_data_list[index] = data  # Store data at the correct index
+                else:
+                    segment_data_list[index] = b''  # Empty data for failed downloads
 
-            # Write only successful segments to the output file
-            with open(path, 'wb') as file:
-                for segment_url in segments:
-                    matched_futures = [
-                        future for future, hls_part in future_to_hls_part.items()
-                        if hls_part == os.path.basename(segment_url)
-                    ]
-                    if matched_futures:
-                        future = matched_futures[0]
-                        try:
-                            _, data, success = future.result()
-                            if success:
-                                file.write(data)
-                        except Exception as e:
-                            logger.error(f"Exception writing segment {segment_url}: {e}")
+                # Call the callback function with progress
+                if callback:
+                    callback(completed, total_segments)
 
-        return wrapper
+        # Create tasks for all segments
+        tasks = [
+            asyncio.create_task(process_segment(idx, segment_url))
+            for idx, segment_url in enumerate(segments)
+        ]
 
-    def default(self, video, quality, callback, path, start: int = 0) -> bool:
+        # Wait for all tasks to complete
+        await asyncio.gather(*tasks)
+
+        # Write segments to the file in order
+        with open(path, 'wb') as file:
+            for data in segment_data_list:
+                file.write(data or b'')
+
+        logger.info(f"Downloaded {successful_downloads}/{total_segments} segments successfully.")
+        return successful_downloads, total_segments
+
+    async def default(self, video, quality, callback, path, start: int = 0) -> bool:
         buffer = b''
-        segments = self.get_segments(quality=quality, m3u8_url_master=video.m3u8_base_url)[start:]
+        segments = await self.get_segments(quality=quality, m3u8_url_master=video.m3u8_base_url)[start:]
         length = len(segments)
 
         for i, url in enumerate(segments):
