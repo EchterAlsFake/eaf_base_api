@@ -223,7 +223,6 @@ class BaseCore:
         :param path:
         :return:
         """
-        print(f"Running, selected: {downloader}")
 
         if callback is None:
             callback = Callback.text_progress_bar
@@ -235,7 +234,7 @@ class BaseCore:
             await self.threaded(video=video, quality=quality, path=path, callback=callback)
 
         elif downloader == "FFMPEG":
-            self.FFMPEG(video=video, quality=quality, path=path, callback=callback)
+            await self.FFMPEG(video=video, quality=quality, path=path, callback=callback)
 
     async def download_segment(self, url: str) -> tuple[str, bytes, bool]:
         """
@@ -316,7 +315,7 @@ class BaseCore:
 
         return True
 
-    def FFMPEG(self, video, quality: str, callback, path: str) -> bool:
+    async def FFMPEG(self, video, quality: str, callback, path: str) -> bool:
         base_url = video.m3u8_base_url
         new_segment = self.get_m3u8_by_quality(quality=quality, m3u8_url=base_url)
         url_components = base_url.split('/')
@@ -344,12 +343,12 @@ class BaseCore:
 
         return False
 
-    def legacy_download(self, path: str, url: str, callback=None) -> bool:
+    async def legacy_download(self, path: str, url: str, callback=None) -> bool:
         """
         Download a file using streaming, with support for progress updates.
         """
         try:
-            with self.session.stream("GET", url, timeout=30) as response:  # Use a reasonable timeout
+            async with self.session.stream("GET", url, timeout=30) as response:  # Use a reasonable timeout
                 response.raise_for_status()
 
                 file_size = int(response.headers.get('content-length', 0))
@@ -361,7 +360,7 @@ class BaseCore:
 
                 # Open file for writing
                 with open(path, 'wb') as file:
-                    for chunk in response.iter_bytes(chunk_size=1024):
+                    async for chunk in response.aiter_bytes(chunk_size=1024):
                         if not chunk:
                             break  # End of stream
 
