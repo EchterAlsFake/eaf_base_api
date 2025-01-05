@@ -416,3 +416,7 @@ class BaseCore:
             path = args.output
 
         return path
+
+    @classmethod
+    def truncate(cls, string_lol) -> str:
+        return string_lol[:200]
