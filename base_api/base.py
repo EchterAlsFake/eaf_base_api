@@ -214,7 +214,7 @@ class BaseCore:
         logger.debug(f"Fetched {len(segments)} segments from m3u8 URL")
         return segments
 
-    def download(self, video, quality: str, downloader: str, path: str, callback=None) -> None:
+    async def download(self, video, quality: str, downloader: str, path: str, callback=None) -> None:
         """
         :param video:
         :param callback:
@@ -223,26 +223,16 @@ class BaseCore:
         :param path:
         :return:
         """
+        print(f"Running, selected: {downloader}")
 
         if callback is None:
             callback = Callback.text_progress_bar
 
         if downloader == "default":
-            self.default(video=video, quality=quality, path=path, callback=callback)
+            await self.default(video=video, quality=quality, path=path, callback=callback)
 
         elif downloader == "threaded":
-            try:
-                loop = asyncio.get_running_loop()
-            except RuntimeError:
-                loop = None
-
-            if loop and loop.is_running():
-                # Wenn eine Event-Loop läuft, erstelle eine neue Aufgabe
-                asyncio.create_task(self.threaded(video=video, path=path, callback=callback, quality=quality))
-            else:
-                # Andernfalls starte eine neue Event-Loop
-                asyncio.run(self.threaded(video=video, path=path, callback=callback, quality=quality))
-
+            await self.threaded(video=video, quality=quality, path=path, callback=callback)
 
         elif downloader == "FFMPEG":
             self.FFMPEG(video=video, quality=quality, path=path, callback=callback)
