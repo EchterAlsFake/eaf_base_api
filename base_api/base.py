@@ -417,6 +417,10 @@ class BaseCore:
 
         return path
 
+    @classmethod
+    def truncate(cls, string_lol) -> str:
+        return string_lol[:200]
+
     @staticmethod
     def str_to_bool(value):
         """
