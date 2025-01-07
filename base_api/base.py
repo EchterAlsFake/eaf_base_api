@@ -400,3 +400,14 @@ class BaseCore:
     @classmethod
     def truncate(cls, string_lol) -> str:
         return string_lol[:200]
+
+    @staticmethod
+    def str_to_bool(value):
+        """
+        This function is needed for the ArgumentParser for the CLI version of my APIs. It basically maps the
+        booleans for the --no-title option to valid Python boolean values.
+        """
+        if value.lower() in ("true", "1", "yes"):
+            return True
+        elif value.lower() in ("false", "0", "no"):
+            return False
