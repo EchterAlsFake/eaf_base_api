@@ -14,6 +14,8 @@ from urllib.parse import urljoin
 from ffmpeg_progress_yield import FfmpegProgress
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+from twine.utils import get_config
+
 try:
     from modules import consts
     from modules.progress_bars import Callback
@@ -264,9 +266,7 @@ class BaseCore:
         Returns a tuple of the URL, content (empty if failed after retries), and a success flag.
         """
 
-        response = BaseCore().fetch(url, timeout=timeout, get_response=True)
-        response.raise_for_status()
-        content = b"".join(response.iter_bytes())
+        content = BaseCore().fetch(url, timeout=timeout, get_bytes=True)
         return url, content, True  # Success
 
     def threaded(self, max_workers: int = 20, timeout: int = 10):
