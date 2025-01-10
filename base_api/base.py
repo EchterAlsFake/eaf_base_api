@@ -14,8 +14,6 @@ from urllib.parse import urljoin
 from ffmpeg_progress_yield import FfmpegProgress
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from twine.utils import get_config
-
 try:
     from modules import consts
     from modules.progress_bars import Callback
