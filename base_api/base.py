@@ -124,6 +124,11 @@ class BaseCore:
                     if response.status_code == 404:
                         logger.error("Resource not found (404). This may indicate the content is unavailable.")
                         return None
+
+                    if response.status_code == 301:
+                        logger.warning("Resource moved to another URl. Forwarding Response...")
+                        return response
+
                     continue
 
                 logger.debug(f"Attempt {attempt}: Successfully fetched URL: {url}")

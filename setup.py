@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="eaf_base_api-async",
-    version="2.2.1",
+    version="2.2.2",
     packages=find_packages(),
     install_requires=["ffmpeg-progress-yield", "m3u8", "httpx"],
     entry_points={
