@@ -103,6 +103,9 @@ class BaseCore:
             return content
 
         for attempt in range(1, consts.MAX_RETRIES + 1):
+            if attempt != 1:
+                time.sleep(1.5) # Sleeping for 1.5 seconds to minimize site overload when doing a lot of requests
+
             try:
                 if self.total_requests % 3 == 0:
                     self.user_agent = random.choice(consts.USER_AGENTS)
