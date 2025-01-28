@@ -84,8 +84,8 @@ class BaseCore:
         self.session = httpx.Client(proxy=consts.PROXY,
                               headers=consts.HEADERS,
                               verify=verify,
-                              timeout=consts.TIMEOUT
-                              )
+                              timeout=consts.TIMEOUT,
+                              follow_redirects=True)
 
     def enforce_delay(self):
         """Enforces the specified delay in consts.REQUEST_DELAY"""
@@ -119,6 +119,9 @@ class BaseCore:
             return content
 
         for attempt in range(1, consts.MAX_RETRIES + 1):
+            if attempt != 1:
+                time.sleep(1.5) # Sleeping for 1.5 seconds to minimize site overload when doing a lot of requests
+
             try:
                 # Update user agent periodically
                 if self.total_requests % 3 == 0:
@@ -368,7 +371,6 @@ class BaseCore:
         try:
             with self.session.stream("GET", url, timeout=30) as response:  # Use a reasonable timeout
                 response.raise_for_status()
-
                 file_size = int(response.headers.get('content-length', 0))
 
                 if callback is None:
