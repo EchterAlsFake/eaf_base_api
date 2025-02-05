@@ -152,11 +152,20 @@ class BaseCore:
                         return response
 
                     # Process and return content
+                    # Collecting all chunks before processing because some sites cause issues with real-time decoding
+                    raw_content = b"".join(response.iter_bytes())
+
                     if get_bytes:
-                        content = b"".join([chunk for chunk in response.iter_bytes()])
+                        content = raw_content
+
                     else:
-                        content = "".join([chunk.decode("utf-8") for chunk in response.iter_bytes()])
-                        if save_cache:
+                        try:
+                            content = raw_content.decode("utf-8")
+
+                        except UnicodeDecodeError:
+                            content = raw_content.decode("latin1") # Fallback, hope that works somehow idk
+
+                        if save_cache and not get_bytes:
                             logger.debug(f"Saving content of {url} to local cache.")
                             cache.save_cache(url, content)
 
