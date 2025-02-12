@@ -188,9 +188,11 @@ class BaseCore:
         :param title:
         :return: str: strips out non UTF-8 chars of the title
         """
-        illegal_chars = '<>:"/\\|?*'
-        cleaned_title = ''.join([char for char in title if char in string.printable and char not in illegal_chars])
-        return cleaned_title
+        illegal_chars = ['<', '>', ':', '"', '/', '\\', '|', '?', '*']
+        for char in illegal_chars:
+            title = title.replace(char, "")
+
+        return title
 
     @lru_cache(maxsize=250)
     def get_m3u8_by_quality(self, m3u8_url: str, quality: str) -> str:
