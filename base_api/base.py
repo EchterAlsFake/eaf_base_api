@@ -3,7 +3,6 @@ import time
 import m3u8
 import httpx
 import random
-import string
 import logging
 import traceback
 import threading
@@ -22,13 +21,53 @@ except (ModuleNotFoundError, ImportError):
     from .modules import consts
     from .modules.progress_bars import Callback
 
-logging.basicConfig(format='%(name)s %(levelname)s %(asctime)s %(message)s', datefmt='%I:%M:%S %p')
-logger = logging.getLogger("BASE API")
-logger.setLevel(logging.DEBUG)
+loggers = {}
 
-def disable_logging():
-    logger.setLevel(logging.CRITICAL)
+# Default formatter
+formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
+
+def is_android():
+    """Detects if the script is running on an Android device."""
+    return "ANDROID_ROOT" in os.environ and "ANDROID_DATA" in os.environ
+
+def get_log_file_path(filename="app.log"):
+    """Returns a valid log file path that works on Android and other OS."""
+    if is_android():
+        return os.path.join(os.environ["HOME"], filename)  # Internal app storage
+    return filename  # Default for Linux, Windows, Mac
+
+def setup_logger(name, log_file=None, level=logging.CRITICAL):
+    """Creates or updates a logger for a specific module."""
+    if name in loggers:
+        logger = loggers[name]
+        logger.setLevel(level)
+
+        file_handler_exists = any(isinstance(h, logging.FileHandler) for h in logger.handlers)
+        if log_file and not file_handler_exists:
+            log_file = get_log_file_path(log_file)
+            fh = logging.FileHandler(log_file)
+            fh.setFormatter(formatter)
+            logger.addHandler(fh)
+
+        return logger
+
+    logger = logging.getLogger(name)
+    logger.setLevel(level)
+
+    if not any(isinstance(h, logging.StreamHandler) for h in logger.handlers):
+        ch = logging.StreamHandler()
+        ch.setFormatter(formatter)
+        logger.addHandler(ch)
+
+    if log_file:
+        log_file = get_log_file_path(log_file)
+        fh = logging.FileHandler(log_file)
+        fh.setFormatter(formatter)
+        logger.addHandler(fh)
+
+    loggers[name] = logger
+    return logger
 
 class Cache:
     """
@@ -38,6 +77,13 @@ class Cache:
     def __init__(self):
         self.cache_dictionary = {}
         self.lock = threading.Lock()
+        self.logger = setup_logger("BASE API - [Cache]", level=logging.CRITICAL)
+
+    def enable_logging(self, log_file=None, level=logging.DEBUG):
+        """
+        Enables logging dynamically for this module.
+        """
+        self.logger = setup_logger(name="BASE API - [Cache]", log_file=log_file, level=level)
 
     def handle_cache(self, url):
         if url is None:
@@ -53,12 +99,9 @@ class Cache:
                 first_key = next(iter(self.cache_dictionary))
                 # Delete the first item
                 del self.cache_dictionary[first_key]
-                logger.info(f"Deleting: {first_key} from cache, due to caching limits...")
+                self.logger.info(f"Deleting: {first_key} from cache, due to caching limits...")
 
             self.cache_dictionary[url] = content
-
-cache = Cache()
-
 
 class BaseCore:
     """
@@ -68,8 +111,17 @@ class BaseCore:
         self.last_request_time = time.time()
         self.total_requests = 0 # Tracks how many requests have been made
         self.session = None
+        self.cache = Cache()
         self.initialize_session()
+        self.logger = setup_logger("BASE API - [BaseCore]", log_file=False, level=logging.ERROR)
 
+    def enable_logging(self, log_file=None, level=logging.DEBUG):
+        """
+        Enables logging dynamically for this module.
+        """
+        print("Custom logger applied")
+        self.logger = setup_logger(name="BASE API - [BaseCore]", log_file=log_file, level=level)
+        self.cache.logger = setup_logger(name="BASE API - [Cache]", log_file=log_file, level=level)
 
     def update_user_agent(self):
         """Updates the User-Agent"""
@@ -92,10 +144,10 @@ class BaseCore:
         delay = consts.REQUEST_DELAY
         if delay > 0:
             time_since_last_request = time.time() - self.last_request_time
-            logger.debug(f"Time since last request: {time_since_last_request:.2f} seconds.")
+            self.logger.debug(f"Time since last request: {time_since_last_request:.2f} seconds.")
             if time_since_last_request < delay:
                 sleep_time = delay - time_since_last_request
-                logger.debug(f"Enforcing delay of {sleep_time:.2f} seconds.")
+                self.logger.debug(f"Enforcing delay of {sleep_time:.2f} seconds.")
                 time.sleep(sleep_time)
 
     def fetch(
@@ -113,9 +165,9 @@ class BaseCore:
         support for proxies and custom timeout.
         """
         # Check cache first
-        content = cache.handle_cache(url)
+        content = self.cache.handle_cache(url)
         if content is not None:
-            logger.info(f"Fetched content for: {url} from cache!")
+            self.logger.info(f"Fetched content for: {url} from cache!")
             return content
 
         for attempt in range(1, consts.MAX_RETRIES + 1):
@@ -136,16 +188,16 @@ class BaseCore:
 
                     # Log and handle non-200 status codes
                     if response.status_code != 200:
-                        logger.warning(
+                        self.logger.warning(
                             f"Attempt {attempt}: Unexpected status code {response.status_code} for URL: {url}")
 
                         if response.status_code == 404:
-                            logger.error("Resource not found (404). This may indicate the content is unavailable.")
+                            self.logger.error("Resource not found (404). This may indicate the content is unavailable.")
                             return None  # Return None for unavailable resources
 
                         continue  # Retry for other non-200 status codes
 
-                    logger.debug(f"Attempt {attempt}: Successfully fetched URL: {url}")
+                    self.logger.debug(f"Attempt {attempt}: Successfully fetched URL: {url}")
 
                     # Return response if requested
                     if get_response:
@@ -166,20 +218,20 @@ class BaseCore:
                             content = raw_content.decode("latin1") # Fallback, hope that works somehow idk
 
                         if save_cache and not get_bytes:
-                            logger.debug(f"Saving content of {url} to local cache.")
-                            cache.save_cache(url, content)
+                            self.logger.debug(f"Saving content of {url} to local cache.")
+                            self.cache.save_cache(url, content)
 
                     return content
 
             except httpx.RequestError as e:
-                logger.error(f"Attempt {attempt}: Request error for URL {url}: {e}")
+                self.logger.error(f"Attempt {attempt}: Request error for URL {url}: {e}")
 
             except Exception:
-                logger.error(f"Attempt {attempt}: Unexpected error for URL {url}: {traceback.format_exc()}")
+                self.logger.error(f"Attempt {attempt}: Unexpected error for URL {url}: {traceback.format_exc()}")
 
-            logger.info(f"Retrying ({attempt}/{consts.MAX_RETRIES}) for URL: {url}")
+            self.logger.info(f"Retrying ({attempt}/{consts.MAX_RETRIES}) for URL: {url}")
 
-        logger.error(f"Failed to fetch URL {url} after {consts.MAX_RETRIES} attempts.")
+        self.logger.error(f"Failed to fetch URL {url} after {consts.MAX_RETRIES} attempts.")
         return None  # Return None if all attempts fail
 
     @classmethod
@@ -200,7 +252,7 @@ class BaseCore:
         m3u8 playlist"""
         playlist_content = self.fetch(url=m3u8_url)
         playlist = m3u8.loads(playlist_content)
-        logger.debug(f"Resolved m3u8 playlist: {m3u8_url}")
+        self.logger.debug(f"Resolved m3u8 playlist: {m3u8_url}")
 
         if not playlist.is_variant:
             raise ValueError("Provided URL is not a master playlist.")
@@ -237,7 +289,7 @@ class BaseCore:
     def get_segments(self, m3u8_url_master: str, quality: str) -> list:
         """Gets all video segments from a given quality and the primary m3u8 URL"""
         m3u8_url = self.get_m3u8_by_quality(m3u8_url=m3u8_url_master, quality=quality)
-        logger.debug(f"Trying to fetch segment from m3u8 ->: {m3u8_url}")
+        self.logger.debug(f"Trying to fetch segment from m3u8 ->: {m3u8_url}")
         content = self.fetch(url=m3u8_url)
         segments_ = m3u8.loads(content).segments
         segments = []
@@ -245,7 +297,7 @@ class BaseCore:
         for segment in segments_:
             segments.append(urljoin(m3u8_url, segment.uri)) # Get the full URL path to segment
 
-        logger.debug(f"Fetched {len(segments)} segments from m3u8 URL")
+        self.logger.debug(f"Fetched {len(segments)} segments from m3u8 URL")
         return segments
 
     def download(self, video, quality: str, downloader: str, path: str, callback=None) -> None:
@@ -309,7 +361,7 @@ class BaseCore:
                             successful_downloads += 1
                         callback(completed, length)  # Update progress callback
                     except Exception as e:
-                        logger.error(f"Error processing segment {hls_part}: {e}")
+                        self.logger.error(f"Error processing segment {hls_part}: {e}")
 
             # Write only successful segments to the output file
             with open(path, 'wb') as file:
@@ -325,7 +377,7 @@ class BaseCore:
                             if success:
                                 file.write(data)
                         except Exception as e:
-                            logger.error(f"Exception writing segment {segment_url}: {e}")
+                            self.logger.error(f"Exception writing segment {segment_url}: {e}")
 
         return wrapper
 
@@ -410,10 +462,10 @@ class BaseCore:
                 return True
 
         except httpx.RequestError as e:
-            logger.error(f"Request failed for URL {url}: {e}")
+            self.logger.error(f"Request failed for URL {url}: {e}")
             return False
         except Exception as e:
-            logger.error(f"Unexpected error during download: {e}")
+            self.logger.error(f"Unexpected error during download: {e}")
             return False
 
     @classmethod
@@ -442,3 +494,13 @@ class BaseCore:
             return True
         elif value.lower() in ("false", "0", "no"):
             return False
+
+
+if __name__ == "__main__":
+    core = BaseCore()
+    core.enable_logging(log_file="base_core.log", level=logging.DEBUG)
+    core.fetch("https://pornhub.com")
+    print("fetched")
+
+    core.fetch("https://pornhub.com")
+    print("fetched")
