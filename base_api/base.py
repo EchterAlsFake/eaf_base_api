@@ -119,7 +119,6 @@ class BaseCore:
         """
         Enables logging dynamically for this module.
         """
-        print("Custom logger applied")
         self.logger = setup_logger(name="BASE API - [BaseCore]", log_file=log_file, level=level)
         self.cache.logger = setup_logger(name="BASE API - [Cache]", log_file=log_file, level=level)
 
@@ -176,7 +175,7 @@ class BaseCore:
 
             try:
                 # Update user agent periodically
-                if self.total_requests % 3 == 0:
+                if self.total_requests % 5 == 0:
                     self.update_user_agent()
 
                 self.enforce_delay()
@@ -194,6 +193,10 @@ class BaseCore:
                         if response.status_code == 404:
                             self.logger.error("Resource not found (404). This may indicate the content is unavailable.")
                             return None  # Return None for unavailable resources
+
+                        elif response.status_code == 403 and attempt >= 2:
+                            self.logger.error(f"The website rejected access after {attempt} tries. Aborting!")
+                            return None # Return None for forbidden resources
 
                         continue  # Retry for other non-200 status codes
 
@@ -494,13 +497,3 @@ class BaseCore:
             return True
         elif value.lower() in ("false", "0", "no"):
             return False
-
-
-if __name__ == "__main__":
-    core = BaseCore()
-    core.enable_logging(log_file="base_core.log", level=logging.DEBUG)
-    core.fetch("https://pornhub.com")
-    print("fetched")
-
-    core.fetch("https://pornhub.com")
-    print("fetched")
