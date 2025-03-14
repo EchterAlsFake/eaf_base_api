@@ -1,4 +1,5 @@
 import os
+import sys
 import time
 import m3u8
 import httpx
@@ -37,6 +38,24 @@ def get_log_file_path(filename="app.log"):
         return os.path.join(os.environ["HOME"], filename)  # Internal app storage
     return filename  # Default for Linux, Windows, Mac
 
+
+# Define ANSI color codes for different log levels
+LOG_COLORS = {
+    'DEBUG': "\033[37m",   # White
+    'INFO': "\033[34m",    # Blue
+    'WARNING': "\033[33m", # Yellow
+    'ERROR': "\033[31m",   # Red
+    'CRITICAL': "\033[41m"  # Red background
+}
+RESET_COLOR = "\033[0m"
+
+class ColoredFormatter(logging.Formatter):
+    def format(self, record):
+        log_message = super().format(record)
+        color = LOG_COLORS.get(record.levelname, RESET_COLOR)
+        return f"{color}{log_message}{RESET_COLOR}"
+
+
 def setup_logger(name, log_file=None, level=logging.CRITICAL):
     """Creates or updates a logger for a specific module."""
     if name in loggers:
@@ -46,8 +65,8 @@ def setup_logger(name, log_file=None, level=logging.CRITICAL):
         file_handler_exists = any(isinstance(h, logging.FileHandler) for h in logger.handlers)
         if log_file and not file_handler_exists:
             log_file = get_log_file_path(log_file)
-            fh = logging.FileHandler(log_file)
-            fh.setFormatter(formatter)
+            fh = logging.FileHandler(log_file, mode='a')
+            fh.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
             logger.addHandler(fh)
 
         return logger
@@ -57,13 +76,20 @@ def setup_logger(name, log_file=None, level=logging.CRITICAL):
 
     if not any(isinstance(h, logging.StreamHandler) for h in logger.handlers):
         ch = logging.StreamHandler()
-        ch.setFormatter(formatter)
+        ch.setFormatter(ColoredFormatter("%(asctime)s - %(levelname)s - %(message)s"))
         logger.addHandler(ch)
 
+    # Ensure the log file is overwritten only on the first program start
     if log_file:
         log_file = get_log_file_path(log_file)
-        fh = logging.FileHandler(log_file)
-        fh.setFormatter(formatter)
+        if not hasattr(sys, '_first_run'):
+            sys._first_run = True
+            file_mode = 'w'
+        else:
+            file_mode = 'a'
+
+        fh = logging.FileHandler(log_file, mode=file_mode)
+        fh.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
         logger.addHandler(fh)
 
     loggers[name] = logger
