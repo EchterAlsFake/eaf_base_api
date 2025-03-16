@@ -2,6 +2,8 @@ import os
 import sys
 import time
 import m3u8
+import http.client
+import json
 import httpx
 import random
 import logging
@@ -56,18 +58,51 @@ class ColoredFormatter(logging.Formatter):
         return f"{color}{log_message}{RESET_COLOR}"
 
 
-def setup_logger(name, log_file=None, level=logging.CRITICAL):
+def send_log_message(ip, port, message):
+    """Sends a log message to a remote server via HTTP."""
+    try:
+        conn = http.client.HTTPConnection(ip, port, timeout=2)
+        headers = {'Content-Type': 'application/json'}
+        data = json.dumps({"message": message})
+        conn.request("POST", "/log", body=data, headers=headers)
+        conn.getresponse()  # Read response to ensure completion
+        conn.close()
+    except Exception as e:
+        print(f"Failed to send log to {ip}:{port} - {e}", file=sys.stderr)
+
+
+class HTTPLogHandler(logging.Handler):
+    """Custom log handler that sends logs to a remote HTTP server."""
+
+    def __init__(self, ip, port):
+        super().__init__()
+        self.ip = ip
+        self.port = port
+
+    def emit(self, record):
+        log_entry = self.format(record)
+        send_log_message(self.ip, self.port, log_entry)
+
+
+def setup_logger(name, log_file=None, level=logging.CRITICAL, http_ip=None, http_port=None):
     """Creates or updates a logger for a specific module."""
     if name in loggers:
         logger = loggers[name]
         logger.setLevel(level)
 
         file_handler_exists = any(isinstance(h, logging.FileHandler) for h in logger.handlers)
+        http_handler_exists = any(isinstance(h, HTTPLogHandler) for h in logger.handlers)
+
         if log_file and not file_handler_exists:
             log_file = get_log_file_path(log_file)
             fh = logging.FileHandler(log_file, mode='a')
             fh.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
             logger.addHandler(fh)
+
+        if http_ip and http_port and not http_handler_exists:
+            http_handler = HTTPLogHandler(http_ip, http_port)
+            http_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+            logger.addHandler(http_handler)
 
         return logger
 
@@ -76,10 +111,9 @@ def setup_logger(name, log_file=None, level=logging.CRITICAL):
 
     if not any(isinstance(h, logging.StreamHandler) for h in logger.handlers):
         ch = logging.StreamHandler()
-        ch.setFormatter(ColoredFormatter("%(asctime)s - %(levelname)s - %(message)s"))
+        ch.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
         logger.addHandler(ch)
 
-    # Ensure the log file is overwritten only on the first program start
     if log_file:
         log_file = get_log_file_path(log_file)
         if not hasattr(sys, '_first_run'):
@@ -87,10 +121,14 @@ def setup_logger(name, log_file=None, level=logging.CRITICAL):
             file_mode = 'w'
         else:
             file_mode = 'a'
-
         fh = logging.FileHandler(log_file, mode=file_mode)
         fh.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
         logger.addHandler(fh)
+
+    if http_ip and http_port:
+        http_handler = HTTPLogHandler(http_ip, http_port)
+        http_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+        logger.addHandler(http_handler)
 
     loggers[name] = logger
     return logger
