@@ -1,3 +1,4 @@
+import re
 import os
 import sys
 import time
@@ -175,6 +176,7 @@ class BaseCore:
         self.last_request_time = time.time()
         self.total_requests = 0 # Tracks how many requests have been made
         self.session = None
+        self.kill_switch = False
         self.cache = Cache()
         self.initialize_session()
         self.logger = setup_logger("BASE API - [BaseCore]", log_file=False, level=logging.ERROR)
@@ -190,17 +192,51 @@ class BaseCore:
         """Updates the User-Agent"""
         self.session.headers.update({"User-Agent": random.choice(consts.USER_AGENTS)})
 
-    def initialize_session(self):
-        verify = True
+    def enable_kill_switch(self):
+        """This is a function that will check and verify if your proxy is working before every request.
+        As soon as there's a mismatch in the actual response IP and the proxy IP, the program will exit."""
+        self.kill_switch = True
 
-        if consts.PROXY is not None:
-            verify = False
+    def check_kill_switch(self):
+        proxy_ip = consts.PROXY
+        pattern = re.compile(
+            r'^(?P<scheme>http|socks5)://'
+            r'(?:(?:\w+:\w+)@)?'  # optional user:pass@
+            r'(?P<host>[a-zA-Z0-9.-]+)'
+            r':(?P<port>\d{1,5})$'
+        )
 
-        self.session = httpx.Client(proxy=consts.PROXY,
-                              headers=consts.HEADERS,
-                              verify=verify,
-                              timeout=consts.TIMEOUT,
-                              follow_redirects=True)
+        match = pattern.match(proxy_ip
+    )
+        if match:
+            self.logger.info(f"Proxy has valid scheme: {match.group('scheme')} ")
+
+        else:
+            self.logger.critical("Proxy is INVALID! Exiting.")
+
+        self.logger.info("Checking if proxy is working...")
+        self.logger.info("Doing request to httpbin.org to get your real IP to compare it with another request with activated proxy")
+
+        your_ip = httpx.Client().get("https://httpbin.org/ip").json()["origin"]
+        self.logger.info(f"Your IP is: {your_ip}")
+
+        self.logger.info("Doing request with Proxy on...")
+        proxy_ip_ = self.fetch("https://httpbin.org/ip", bypass_kill_switch=True, get_response=True).json()["origin"]
+        self.logger.info(f"Proxy IP is: {proxy_ip_}")
+
+        if your_ip == proxy_ip_:
+            self.logger.critical("IP is the same on both requests... Proxy is not working, exiting!")
+            raise "CRITICAL PROXY ERROR, CHECK LOGS!"
+
+
+    def initialize_session(self, verify=True): # Disable SSL verification only if you really need it....
+        self.session = httpx.Client(
+            proxy=consts.PROXY,
+            headers=consts.HEADERS,
+            timeout=consts.TIMEOUT,
+            follow_redirects=True,
+            verify=verify
+        )
 
     def enforce_delay(self):
         """Enforces the specified delay in consts.REQUEST_DELAY"""
@@ -222,6 +258,7 @@ class BaseCore:
             save_cache: bool = True,
             cookies: dict = None,
             allow_redirects: bool = True,
+            bypass_kill_switch: bool = False # prevents infinite loop
     ) -> Union[bytes, str, httpx.Response, None]:
         """
         Fetches content in UTF-8 Text, Bytes, or as a stream using multiple request attempts,
@@ -243,6 +280,9 @@ class BaseCore:
                     self.update_user_agent()
 
                 self.enforce_delay()
+
+                if self.kill_switch and not bypass_kill_switch:
+                    self.check_kill_switch()
 
                 # Perform the request with stream handling
                 response = self.session.get(url, timeout=timeout, cookies=cookies,

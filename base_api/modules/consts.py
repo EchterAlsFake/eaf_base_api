@@ -5,7 +5,7 @@ MAX_RETRIES = 4
 REQUEST_DELAY = 0
 TIMEOUT = 20 # Maximal request timeout
 FFMPEG_PATH = "ffmpeg"
-PROXY = None
+PROXY = None # Can be any http, https or socks5 proxy. Please see: https://www.python-httpx.org/advanced/proxies/
 USER_AGENTS = ["Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.1",
            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.3",
