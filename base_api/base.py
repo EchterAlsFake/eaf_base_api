@@ -229,7 +229,7 @@ class BaseCore:
         """
         # Check cache first
         content = self.cache.handle_cache(url)
-        if content is not None:
+        if content:
             self.logger.info(f"Fetched content for: {url} from cache!")
             return content
 
@@ -239,56 +239,56 @@ class BaseCore:
 
             try:
                 # Update user agent periodically
-                if self.total_requests % 5 == 0:
+                if self.total_requests % 30 == 0: # Changing all 30 attempts
                     self.update_user_agent()
 
                 self.enforce_delay()
 
                 # Perform the request with stream handling
-                with self.session.stream("GET", url, timeout=timeout, cookies=cookies,
-                                         follow_redirects=allow_redirects) as response:
-                    self.total_requests += 1
+                response = self.session.get(url, timeout=timeout, cookies=cookies,
+                                         follow_redirects=allow_redirects)
+                self.total_requests += 1
 
-                    # Log and handle non-200 status codes
-                    if response.status_code != 200:
-                        self.logger.warning(
-                            f"Attempt {attempt}: Unexpected status code {response.status_code} for URL: {url}")
+                # Log and handle non-200 status codes
+                if response.status_code != 200:
+                    self.logger.warning(
+                        f"Attempt {attempt}: Unexpected status code {response.status_code} for URL: {url}")
 
-                        if response.status_code == 404:
-                            self.logger.error("Resource not found (404). This may indicate the content is unavailable.")
-                            return None  # Return None for unavailable resources
+                    if response.status_code == 404:
+                        self.logger.error("Resource not found (404). This may indicate the content is unavailable.")
+                        return None  # Return None for unavailable resources
 
-                        elif response.status_code == 403 and attempt >= 2:
-                            self.logger.error(f"The website rejected access after {attempt} tries. Aborting!")
-                            return None # Return None for forbidden resources
+                    elif response.status_code == 403 and attempt >= 2:
+                        self.logger.error(f"The website rejected access after {attempt} tries. Aborting!")
+                        return None # Return None for forbidden resources
 
-                        continue  # Retry for other non-200 status codes
+                    continue  # Retry for other non-200 status codes
 
-                    self.logger.debug(f"Attempt {attempt}: Successfully fetched URL: {url}")
+                self.logger.debug(f"Attempt {attempt}: Successfully fetched URL: {url}")
 
-                    # Return response if requested
-                    if get_response:
-                        return response
+                # Return response if requested
+                if get_response:
+                    return response
 
-                    # Process and return content
-                    # Collecting all chunks before processing because some sites cause issues with real-time decoding
-                    raw_content = b"".join(response.iter_bytes())
+                # Process and return content
+                # Collecting all chunks before processing because some sites cause issues with real-time decoding
+                raw_content = response.content
 
-                    if get_bytes:
-                        content = raw_content
+                if get_bytes:
+                    content = raw_content
 
-                    else:
-                        try:
-                            content = raw_content.decode("utf-8")
+                else:
+                    try:
+                        content = raw_content.decode("utf-8")
 
-                        except UnicodeDecodeError:
-                            content = raw_content.decode("latin1") # Fallback, hope that works somehow idk
+                    except UnicodeDecodeError:
+                        content = raw_content.decode("latin1") # Fallback, hope that works somehow idk
 
-                        if save_cache and not get_bytes:
-                            self.logger.debug(f"Saving content of {url} to local cache.")
-                            self.cache.save_cache(url, content)
+                    if save_cache and not get_bytes:
+                        self.logger.debug(f"Saving content of {url} to local cache.")
+                        self.cache.save_cache(url, content)
 
-                    return content
+                return content
 
             except httpx.RequestError as e:
                 self.logger.error(f"Attempt {attempt}: Request error for URL {url}: {e}")
@@ -390,14 +390,13 @@ class BaseCore:
         elif downloader == "FFMPEG":
             self.FFMPEG(video=video, quality=quality, path=path, callback=callback)
 
-    @classmethod
-    def download_segment(cls, url: str, timeout: int) -> tuple[str, bytes, bool]:
+    def download_segment(self, url: str, timeout: int) -> tuple[str, bytes, bool]:
         """
         Attempt to download a single segment, retrying on failure.
         Returns a tuple of the URL, content (empty if failed after retries), and a success flag.
         """
 
-        content = BaseCore().fetch(url, timeout=timeout, get_bytes=True)
+        content = self.fetch(url, timeout=timeout, get_bytes=True)
         return url, content, True  # Success
 
     def threaded(self, max_workers: int = 20, timeout: int = 10):
