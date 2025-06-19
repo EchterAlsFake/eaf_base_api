@@ -5,7 +5,6 @@ import time
 import m3u8
 import json
 import httpx
-import random
 import logging
 import traceback
 import threading
@@ -143,6 +142,7 @@ class Cache:
         self.cache_dictionary = {}
         self.lock = threading.Lock()
         self.logger = setup_logger("BASE API - [Cache]", level=logging.CRITICAL)
+        self.config = config
 
     def enable_logging(self, log_file=None, level=logging.DEBUG):
         """
@@ -160,7 +160,7 @@ class Cache:
 
     def save_cache(self, url, content):
         with self.lock:
-            if len(self.cache_dictionary.keys()) >= config.config.MAX_CACHE_ITEMS:
+            if len(self.cache_dictionary.keys()) >= self.config.max_cache_items:
                 first_key = next(iter(self.cache_dictionary))
                 # Delete the first item
                 del self.cache_dictionary[first_key]
@@ -200,7 +200,7 @@ class BaseCore:
         self.kill_switch = True
 
     def check_kill_switch(self):
-        proxy_ip = self.config.PROXY
+        proxy_ip = self.config.proxy
         pattern = re.compile(
             r'^(?P<scheme>http|socks5)://'
             r'(?:(?:\w+:\w+)@)?'  # optional user:pass@
@@ -233,16 +233,16 @@ class BaseCore:
 
     def initialize_session(self, verify=True): # Disable SSL verification only if you really need it....
         self.session = httpx.Client(
-            proxy=self.config.PROXY,
-            headers=self.config.HEADERS,
-            timeout=self.config.TIMEOUT,
+            proxy=self.config.proxy,
+            headers=self.config.headers,
+            timeout=self.config.timeout,
             follow_redirects=True,
             verify=verify
         )
 
     def enforce_delay(self):
         """Enforces the specified delay in consts.REQUEST_DELAY"""
-        delay = self.config.REQUEST_DELAY
+        delay = self.config.request_delay
         if delay > 0:
             time_since_last_request = time.time() - self.last_request_time
             self.logger.debug(f"Time since last request: {time_since_last_request:.2f} seconds.")
@@ -276,7 +276,7 @@ class BaseCore:
             self.logger.info(f"Fetched content for: {url} from cache!")
             return content
 
-        for attempt in range(1, self.config.MAX_RETRIES + 1):
+        for attempt in range(1, self.config.max_retries + 1):
             if attempt != 1:
                 time.sleep(1.5) # Sleeping for 1.5 seconds to minimize site overload when doing a lot of requests
 
@@ -342,9 +342,9 @@ class BaseCore:
             except Exception:
                 self.logger.error(f"Attempt {attempt}: Unexpected error for URL {url}: {traceback.format_exc()}")
 
-            self.logger.info(f"Retrying ({attempt}/{self.config.MAX_RETRIES}) for URL: {url}")
+            self.logger.info(f"Retrying ({attempt}/{self.config.max_retries}) for URL: {url}")
 
-        self.logger.error(f"Failed to fetch URL {url} after {self.config.MAX_RETRIES} attempts.")
+        self.logger.error(f"Failed to fetch URL {url} after {self.config.max_retries} attempts.")
         return None  # Return None if all attempts fail
 
     @classmethod
