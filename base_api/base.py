@@ -3,13 +3,13 @@ import os
 import sys
 import time
 import m3u8
-import http.client
 import json
 import httpx
 import random
 import logging
 import traceback
 import threading
+import http.client
 
 from typing import Union
 from functools import lru_cache
@@ -18,11 +18,11 @@ from ffmpeg_progress_yield import FfmpegProgress
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
-    from modules import consts
+    from modules import config
     from modules.progress_bars import Callback
 
 except (ModuleNotFoundError, ImportError):
-    from .modules import consts
+    from .modules import config
     from .modules.progress_bars import Callback
 
 loggers = {}
@@ -139,7 +139,7 @@ class Cache:
     Caches content from network requests
     """
 
-    def __init__(self):
+    def __init__(self, config):
         self.cache_dictionary = {}
         self.lock = threading.Lock()
         self.logger = setup_logger("BASE API - [Cache]", level=logging.CRITICAL)
@@ -160,7 +160,7 @@ class Cache:
 
     def save_cache(self, url, content):
         with self.lock:
-            if len(self.cache_dictionary.keys()) >= consts.MAX_CACHE_ITEMS:
+            if len(self.cache_dictionary.keys()) >= config.config.MAX_CACHE_ITEMS:
                 first_key = next(iter(self.cache_dictionary))
                 # Delete the first item
                 del self.cache_dictionary[first_key]
@@ -172,12 +172,13 @@ class BaseCore:
     """
     The base class which has all necessary functions for other API packages
     """
-    def __init__(self):
+    def __init__(self, config=config.config):
         self.last_request_time = time.time()
         self.total_requests = 0 # Tracks how many requests have been made
         self.session = None
         self.kill_switch = False
-        self.cache = Cache()
+        self.config = config
+        self.cache = Cache(self.config)
         self.initialize_session()
         self.logger = setup_logger("BASE API - [BaseCore]", log_file=False, level=logging.ERROR)
 
@@ -190,7 +191,8 @@ class BaseCore:
 
     def update_user_agent(self):
         """Updates the User-Agent"""
-        self.session.headers.update({"User-Agent": random.choice(consts.USER_AGENTS)})
+        self.config.rotate_user_agent()
+        self.session.headers.update({"User-Agent": self.config.headers["User-Agent"]})
 
     def enable_kill_switch(self):
         """This is a function that will check and verify if your proxy is working before every request.
@@ -198,7 +200,7 @@ class BaseCore:
         self.kill_switch = True
 
     def check_kill_switch(self):
-        proxy_ip = consts.PROXY
+        proxy_ip = self.config.PROXY
         pattern = re.compile(
             r'^(?P<scheme>http|socks5)://'
             r'(?:(?:\w+:\w+)@)?'  # optional user:pass@
@@ -231,16 +233,16 @@ class BaseCore:
 
     def initialize_session(self, verify=True): # Disable SSL verification only if you really need it....
         self.session = httpx.Client(
-            proxy=consts.PROXY,
-            headers=consts.HEADERS,
-            timeout=consts.TIMEOUT,
+            proxy=self.config.PROXY,
+            headers=self.config.HEADERS,
+            timeout=self.config.TIMEOUT,
             follow_redirects=True,
             verify=verify
         )
 
     def enforce_delay(self):
         """Enforces the specified delay in consts.REQUEST_DELAY"""
-        delay = consts.REQUEST_DELAY
+        delay = self.config.REQUEST_DELAY
         if delay > 0:
             time_since_last_request = time.time() - self.last_request_time
             self.logger.debug(f"Time since last request: {time_since_last_request:.2f} seconds.")
@@ -253,7 +255,7 @@ class BaseCore:
             self,
             url: str,
             get_bytes: bool = False,
-            timeout: int = consts.TIMEOUT,
+            timeout: int = None,
             get_response: bool = False,
             save_cache: bool = True,
             cookies: dict = None,
@@ -265,12 +267,16 @@ class BaseCore:
         support for proxies and custom timeout.
         """
         # Check cache first
+
+        if timeout is None:
+            timeout = self.config.timeout # pls don't ask thanks
+
         content = self.cache.handle_cache(url)
         if content:
             self.logger.info(f"Fetched content for: {url} from cache!")
             return content
 
-        for attempt in range(1, consts.MAX_RETRIES + 1):
+        for attempt in range(1, self.config.MAX_RETRIES + 1):
             if attempt != 1:
                 time.sleep(1.5) # Sleeping for 1.5 seconds to minimize site overload when doing a lot of requests
 
@@ -336,9 +342,9 @@ class BaseCore:
             except Exception:
                 self.logger.error(f"Attempt {attempt}: Unexpected error for URL {url}: {traceback.format_exc()}")
 
-            self.logger.info(f"Retrying ({attempt}/{consts.MAX_RETRIES}) for URL: {url}")
+            self.logger.info(f"Retrying ({attempt}/{self.config.MAX_RETRIES}) for URL: {url}")
 
-        self.logger.error(f"Failed to fetch URL {url} after {consts.MAX_RETRIES} attempts.")
+        self.logger.error(f"Failed to fetch URL {url} after {self.config.MAX_RETRIES} attempts.")
         return None  # Return None if all attempts fail
 
     @classmethod
@@ -514,7 +520,7 @@ class BaseCore:
 
         # Build the command for FFMPEG as a list directly
         command = [
-            consts.FFMPEG_PATH,
+            self.config.FFMPEG_PATH,
             "-i", new_url,  # Input URL
             "-bsf:a", "aac_adtstoasc",
             "-y",  # Overwrite output files without asking
