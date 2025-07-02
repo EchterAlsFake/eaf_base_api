@@ -17,11 +17,11 @@ from ffmpeg_progress_yield import FfmpegProgress
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
-    from modules import config
+    from modules.config import config
     from modules.progress_bars import Callback
 
 except (ModuleNotFoundError, ImportError):
-    from .modules import config
+    from .modules.config import config
     from .modules.progress_bars import Callback
 
 loggers = {}
@@ -61,7 +61,7 @@ class ColoredFormatter(logging.Formatter):
 def send_log_message(ip, port, message):
     """Sends a log message to a remote server via HTTP."""
     try:
-        conn = http.client.HTTPConnection(ip, port, timeout=2)
+        conn = http.client.HTTPConnection(ip, port, timeout=5)
         headers = {'Content-Type': 'application/json'}
         data = json.dumps({"message": message})
         conn.request("POST", "/log", body=data, headers=headers)
@@ -144,11 +144,11 @@ class Cache:
         self.logger = setup_logger("BASE API - [Cache]", level=logging.CRITICAL)
         self.config = config
 
-    def enable_logging(self, log_file=None, level=logging.DEBUG):
+    def enable_logging(self, log_file=None, level=logging.DEBUG, log_ip=None, log_port=None):
         """
         Enables logging dynamically for this module.
         """
-        self.logger = setup_logger(name="BASE API - [Cache]", log_file=log_file, level=level)
+        self.logger = setup_logger(name="BASE API - [Cache]", log_file=log_file, level=level, http_ip=log_ip, http_port=log_port)
 
     def handle_cache(self, url):
         if url is None:
@@ -172,7 +172,7 @@ class BaseCore:
     """
     The base class which has all necessary functions for other API packages
     """
-    def __init__(self, config=config.config):
+    def __init__(self, config=config):
         self.last_request_time = time.time()
         self.total_requests = 0 # Tracks how many requests have been made
         self.session = None
@@ -182,12 +182,12 @@ class BaseCore:
         self.initialize_session()
         self.logger = setup_logger("BASE API - [BaseCore]", log_file=False, level=logging.ERROR)
 
-    def enable_logging(self, log_file=None, level=logging.DEBUG):
+    def enable_logging(self, log_file=None, level=logging.DEBUG, log_ip=None, log_port=None):
         """
         Enables logging dynamically for this module.
         """
-        self.logger = setup_logger(name="BASE API - [BaseCore]", log_file=log_file, level=level)
-        self.cache.logger = setup_logger(name="BASE API - [Cache]", log_file=log_file, level=level)
+        self.logger = setup_logger(name="BASE API - [BaseCore]", log_file=log_file, level=level, http_ip=log_ip, http_port=log_port)
+        self.cache.logger = setup_logger(name="BASE API - [Cache]", log_file=log_file, level=level, http_ip=log_ip, http_port=log_port)
 
     def update_user_agent(self):
         """Updates the User-Agent"""
