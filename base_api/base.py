@@ -59,14 +59,11 @@ class ColoredFormatter(logging.Formatter):
 
 
 def send_log_message(ip, port, message):
-    """Sends a log message to a remote server via HTTP."""
+    """Sends a log message to a remote server via HTTP or HTTPS."""
     try:
-        conn = http.client.HTTPConnection(ip, port, timeout=5)
-        headers = {'Content-Type': 'application/json'}
-        data = json.dumps({"message": message})
-        conn.request("POST", "/log", body=data, headers=headers)
-        conn.getresponse()  # Read response to ensure completion
-        conn.close()
+        url = f"https://{ip}:{port}/feedback"
+        with httpx.Client(timeout=5) as client:
+            client.post(url, json={"message": message})
     except Exception as e:
         print(f"Failed to send log to {ip}:{port} - {e}", file=sys.stderr)
 
