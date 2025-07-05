@@ -3,12 +3,10 @@ import os
 import sys
 import time
 import m3u8
-import json
 import httpx
 import logging
 import traceback
 import threading
-import http.client
 
 from typing import Union
 from functools import lru_cache
@@ -17,10 +15,12 @@ from ffmpeg_progress_yield import FfmpegProgress
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
+    from modules.errors import *
     from modules.config import config
     from modules.progress_bars import Callback
 
 except (ModuleNotFoundError, ImportError):
+    from .modules.errors import *
     from .modules.config import config
     from .modules.progress_bars import Callback
 
@@ -149,7 +149,7 @@ class Cache:
 
     def handle_cache(self, url):
         if url is None:
-            return
+            return None
 
         with self.lock:
             content = self.cache_dictionary.get(url, None)
@@ -212,6 +212,7 @@ class BaseCore:
 
         else:
             self.logger.critical("Proxy is INVALID! Exiting.")
+            raise InvalidProxy("The Proxy is invalid, all requests will be aborted, please check your configuration!")
 
         self.logger.info("Checking if proxy is working...")
         self.logger.info("Doing request to httpbin.org to get your real IP to compare it with another request with activated proxy")
@@ -225,7 +226,7 @@ class BaseCore:
 
         if your_ip == proxy_ip_:
             self.logger.critical("IP is the same on both requests... Proxy is not working, exiting!")
-            raise "CRITICAL PROXY ERROR, CHECK LOGS!"
+            raise KillSwitch("CRITICAL PROXY ERROR, CHECK LOGS!")
 
 
     def initialize_session(self, verify=True): # Disable SSL verification only if you really need it....
@@ -273,9 +274,9 @@ class BaseCore:
             self.logger.info(f"Fetched content for: {url} from cache!")
             return content
 
-        for attempt in range(1, self.config.max_retries + 1):
+        for attempt in range(1, self.config.max_retries + 1): # +1 because I feel like it
             if attempt != 1:
-                time.sleep(1.5) # Sleeping for 1.5 seconds to minimize site overload when doing a lot of requests
+                time.sleep(1.5 * attempt) # Sleeping for 1.5 seconds to minimize site overload when doing a lot of requests
 
             try:
                 # Update user agent periodically
@@ -289,7 +290,7 @@ class BaseCore:
 
                 # Perform the request with stream handling
                 response = self.session.get(url, timeout=timeout, cookies=cookies,
-                                         follow_redirects=allow_redirects)
+                                     follow_redirects=allow_redirects)
                 self.total_requests += 1
 
                 # Log and handle non-200 status codes
@@ -305,6 +306,7 @@ class BaseCore:
                         self.logger.error(f"The website rejected access after {attempt} tries. Aborting!")
                         return None # Return None for forbidden resources
 
+                    self.logger.info(f"Retrying ({attempt}/{self.config.max_retries}) for URL: {url}")
                     continue  # Retry for other non-200 status codes
 
                 self.logger.debug(f"Attempt {attempt}: Successfully fetched URL: {url}")
@@ -325,6 +327,7 @@ class BaseCore:
                         content = raw_content.decode("utf-8")
 
                     except UnicodeDecodeError:
+                        self.logger.warning(f"Content could not be decoded as utf-8 ({url}), decoding in 'latin1' instead!")
                         content = raw_content.decode("latin1") # Fallback, hope that works somehow idk
 
                     if save_cache and not get_bytes:
@@ -333,28 +336,65 @@ class BaseCore:
 
                 return content
 
+            except httpx.CloseError:
+                self.logger.error(f"Attempt {attempt}: The connection has been unexpectedly closed by: {url}. Retrying...")
+                continue
+
             except httpx.RequestError as e:
                 self.logger.error(f"Attempt {attempt}: Request error for URL {url}: {e}")
+                self.logger.info(f"Retrying ({attempt}/{self.config.max_retries}) for URL: {url}")
+                continue # Continuing even failed requests, because they may succeed on another try (maybe idk)
+
+            except (httpx.TimeoutException, httpx.ConnectTimeout) as e:
+                self.logger.error(f"Attempt {attempt}: Timeout error for URL {url}: {e}. Please increase your timeout in "
+                                  f"the configuration options to prevent that, or get a stable internet connection ;)")
+                self.logger.info(f"Retrying ({attempt}/{self.config.max_retries}) for URL: {url}")
+                continue
+
+            except httpx.CookieConflict as e:
+                self.logger.error(f"Some cookies are conflicting. Connection aborted! Please report this error immediately -->: {e}")
+                sys.exit(1)
+
+            except httpx.ProxyError as e:
+                self.logger.error(f"Proxy Error, please switch to another Proxy, it seems to be bad -->: {e}")
+                raise KillSwitch("Proxy error when trying a request, Aborting!")
 
             except Exception:
                 self.logger.error(f"Attempt {attempt}: Unexpected error for URL {url}: {traceback.format_exc()}")
-
-            self.logger.info(f"Retrying ({attempt}/{self.config.max_retries}) for URL: {url}")
+                raise UnknownError(f"Unexpected error for URL {url}: {traceback.format_exc()}")
 
         self.logger.error(f"Failed to fetch URL {url} after {self.config.max_retries} attempts.")
         return None  # Return None if all attempts fail
 
     @classmethod
-    def strip_title(cls, title: str) -> str:
+    def strip_title(cls, title: str, max_length: int = 255) -> str:
         """
-        :param title:
-        :return: str: strips out non UTF-8 chars of the title
+        Sanitize a filename to be safe across Windows, macOS, Linux, and Android.
+        Replaces or strips illegal characters and trims to a safe length.
         """
-        illegal_chars = ['<', '>', ':', '"', '/', '\\', '|', '?', '*']
-        for char in illegal_chars:
-            title = title.replace(char, "")
 
-        return title
+        # Reserved characters on Windows + `/` for Unix/macOS
+        illegal_chars = r'[<>:"/\\|?*\x00-\x1F]'
+        sanitized = re.sub(illegal_chars, "_", title)
+
+        # Strip invisible zero-width characters
+        sanitized = re.sub(r'[\u200B-\u200D\uFEFF]', '', sanitized)
+
+        # Strip trailing periods or spaces (Windows)
+        sanitized = sanitized.rstrip(" .")
+
+        # Prevent reserved Windows filenames
+        reserved_names = {
+            "CON", "PRN", "AUX", "NUL",
+            *(f"COM{i}" for i in range(1, 10)),
+            *(f"LPT{i}" for i in range(1, 10)),
+        }
+        name_only = sanitized.split('.')[0].upper()
+        if name_only in reserved_names:
+            sanitized = f"_{sanitized}"
+
+        # Trim to max length
+        return sanitized[:max_length]
 
     @lru_cache(maxsize=250)
     def get_m3u8_by_quality(self, m3u8_url: str, quality: str) -> str:
@@ -471,6 +511,7 @@ class BaseCore:
                         callback(completed, length)  # Update progress callback
                     except Exception as e:
                         self.logger.error(f"Error processing segment {hls_part}: {e}")
+                        raise SegmentError(f"Error processing segment {hls_part}: {e}")
 
             # Write only successful segments to the output file
             with open(path, 'wb') as file:
@@ -570,12 +611,14 @@ class BaseCore:
 
                 return True
 
-        except httpx.RequestError as e:
-            self.logger.error(f"Request failed for URL {url}: {e}")
-            return False
-        except Exception as e:
-            self.logger.error(f"Unexpected error during download: {e}")
-            return False
+        except httpx.StreamClosed:
+            self.logger.error(f"Stream for: {url} was closed. This should not happen...")
+            raise NetworkingError(f"Stream for: {url} was closed, if this happens again, please report it!")
+
+        except Exception:
+            error = traceback.format_exc()
+            self.logger.error(f"Unknown (network) error for: {url}. Please report this! -->: {error}")
+            raise NetworkingError(f"Unknown error for: {url}. Please report this! -->: {error}")
 
     @classmethod
     def return_path(cls, video, args) -> str:
