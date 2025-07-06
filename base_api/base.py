@@ -299,7 +299,7 @@ class BaseCore:
                         f"Attempt {attempt}: Unexpected status code {response.status_code} for URL: {url}")
 
                     if response.status_code == 404:
-                        self.logger.error("Resource not found (404). This may indicate the content is unavailable.")
+                        self.logger.error(f"URL: {url} Resource not found (404). This may indicate the content is unavailable.")
                         return None  # Return None for unavailable resources
 
                     elif response.status_code == 403 and attempt >= 2:
