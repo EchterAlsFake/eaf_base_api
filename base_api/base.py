@@ -238,6 +238,9 @@ class BaseCore:
             verify=verify
         )
 
+    def update_headers(self, headers: dict):
+        self.session.headers.update(headers)
+
     def enforce_delay(self):
         """Enforces the specified delay in consts.REQUEST_DELAY"""
         delay = self.config.request_delay
@@ -258,7 +261,9 @@ class BaseCore:
             save_cache: bool = True,
             cookies: dict = None,
             allow_redirects: bool = True,
-            bypass_kill_switch: bool = False # prevents infinite loop
+            bypass_kill_switch: bool = False, # prevents infinite loop
+            data: dict = None,
+            method: str = "GET",
     ) -> Union[bytes, str, httpx.Response, None]:
         """
         Fetches content in UTF-8 Text, Bytes, or as a stream using multiple request attempts,
@@ -289,8 +294,8 @@ class BaseCore:
                     self.check_kill_switch()
 
                 # Perform the request with stream handling
-                response = self.session.get(url, timeout=timeout, cookies=cookies,
-                                     follow_redirects=allow_redirects)
+                response = self.session.request(method=method, url=url, timeout=timeout, cookies=cookies,
+                                     follow_redirects=allow_redirects, data=data)
                 self.total_requests += 1
 
                 # Log and handle non-200 status codes
@@ -400,9 +405,14 @@ class BaseCore:
     def get_m3u8_by_quality(self, m3u8_url: str, quality: str) -> str:
         """Fetches the m3u8 URL for a given quality by extracting all possible sub-m3u8 URLs from the primary
         m3u8 playlist"""
-        playlist_content = self.fetch(url=m3u8_url)
-        playlist = m3u8.loads(playlist_content)
-        self.logger.debug(f"Resolved m3u8 playlist: {m3u8_url}")
+        if "#" in m3u8_url:
+            playlist = m3u8.loads(m3u8_url)
+            self.logger.debug("Resolved custom m3u8")
+
+        else:
+            playlist_content = self.fetch(url=m3u8_url)
+            playlist = m3u8.loads(playlist_content)
+            self.logger.debug(f"Resolved m3u8 playlist: {m3u8_url}")
 
         if not playlist.is_variant:
             raise ValueError("Provided URL is not a master playlist.")
@@ -441,12 +451,17 @@ class BaseCore:
         m3u8_url = self.get_m3u8_by_quality(m3u8_url=m3u8_url_master, quality=quality)
         self.logger.debug(f"Trying to fetch segment from m3u8 ->: {m3u8_url}")
         content = self.fetch(url=m3u8_url)
-        segments_ = m3u8.loads(content).segments
-        segments = []
 
-        for segment in segments_:
-            segments.append(urljoin(m3u8_url, segment.uri)) # Get the full URL path to segment
+        m3u8_processed = m3u8.loads(content)
 
+        if m3u8_processed.is_variant:
+            self.logger.warning("The M3U8 Playlist is not a media playlist. Trying to resolve to the first m3u8...")
+            new_m3u8 = urljoin(m3u8_url, m3u8_processed.playlists[0].uri)
+            self.logger.info(f"Resolved to new URL: {new_m3u8}")
+            content = self.fetch(url=new_m3u8)
+            m3u8_processed = m3u8.loads(content)
+
+        segments = [urljoin(m3u8_url, seg.uri) for seg in m3u8_processed.segments]
         self.logger.debug(f"Fetched {len(segments)} segments from m3u8 URL")
         return segments
 
