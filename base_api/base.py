@@ -191,6 +191,10 @@ class BaseCore:
         self.config.rotate_user_agent()
         self.session.headers.update({"User-Agent": self.config.headers["User-Agent"]})
 
+    def update_cookies(self):
+        """Updates cookies dynamically"""
+        self.session.cookies.update(self.config.cookies)
+
     def enable_kill_switch(self):
         """This is a function that will check and verify if your proxy is working before every request.
         As soon as there's a mismatch in the actual response IP and the proxy IP, the program will exit."""
@@ -251,6 +255,7 @@ class BaseCore:
                 sleep_time = delay - time_since_last_request
                 self.logger.debug(f"Enforcing delay of {sleep_time:.2f} seconds.")
                 time.sleep(sleep_time)
+        self.last_request_time = time.time()
 
     def fetch(
             self,
