@@ -310,7 +310,7 @@ class BaseCore:
 
                     if response.status_code == 404:
                         self.logger.error(f"URL: {url} Resource not found (404). This may indicate the content is unavailable.")
-                        return None  # Return None for unavailable resources
+                        return response  # Return None for unavailable resources
 
                     elif response.status_code == 403 and attempt >= 2:
                         self.logger.error(f"The website rejected access after {attempt} tries. Aborting!")
