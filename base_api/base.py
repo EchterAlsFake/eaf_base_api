@@ -11,7 +11,6 @@ import threading
 from typing import Union
 from functools import lru_cache
 from urllib.parse import urljoin
-from ffmpeg_progress_yield import FfmpegProgress
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
@@ -600,6 +599,12 @@ class BaseCore:
 
 
     def FFMPEG(self, video, quality: str, callback, path: str) -> bool:
+        try:
+            from ffmpeg_progress_yield import FfmpegProgress
+
+        except (ModuleNotFoundError, ImportError):
+            raise ModuleNotFoundError("To use FFmpeg progress, you need to install ffmpeg-progress-yield. "
+                                      "You can do so with: `pip install ffmpeg-progress-yield`")
         base_url = video.m3u8_base_url
         new_segment = self.get_m3u8_by_quality(quality=quality, m3u8_url=base_url)
         url_components = base_url.split('/')
