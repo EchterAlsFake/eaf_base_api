@@ -470,13 +470,24 @@ class BaseCore:
         self.logger.debug(f"Fetched {len(segments)} segments from m3u8 URL")
         return segments
 
-    def download(self, video, quality: str, downloader: str, path: str, callback=None) -> None:
+    def download_segment(self, url: str, timeout: int) -> tuple[str, bytes, bool]:
+        """
+        Attempt to download a single segment, retrying on failure.
+        Returns a tuple of the URL, content (empty if failed after retries), and a success flag.
+        """
+        content = self.fetch(url, timeout=timeout, get_bytes=True)
+        return url, content, True  # Success
+
+    def download(self, video, quality: str, downloader: str, path: str, callback=None, remux: bool = False,
+                 callback_remux=None) -> None:
         """
         :param video:
         :param callback:
         :param downloader:
         :param quality:
         :param path:
+        :param remux:
+        :param callback_remux:
         :return:
         """
 
@@ -484,90 +495,109 @@ class BaseCore:
             callback = Callback.text_progress_bar
 
         if downloader == "default":
-            self.default(video=video, quality=quality, path=path, callback=callback)
+            self.default(video=video, quality=quality, path=path, callback=callback, remux=remux, callback_remux=callback_remux)
 
         elif downloader == "threaded":
             threaded_download = self.threaded(max_workers=20, timeout=10)
-            threaded_download(self, video=video, quality=quality, path=path, callback=callback)
+            threaded_download(self, video=video, quality=quality, path=path, callback=callback, remux=remux,
+                              callback_remux=callback_remux)
 
         elif downloader == "FFMPEG":
             self.FFMPEG(video=video, quality=quality, path=path, callback=callback)
 
-    def download_segment(self, url: str, timeout: int) -> tuple[str, bytes, bool]:
-        """
-        Attempt to download a single segment, retrying on failure.
-        Returns a tuple of the URL, content (empty if failed after retries), and a success flag.
-        """
-
-        content = self.fetch(url, timeout=timeout, get_bytes=True)
-        return url, content, True  # Success
-
     def threaded(self, max_workers: int = 20, timeout: int = 10):
-        """
-        Creates a wrapper function for the actual download process, with retry logic.
-        """
-
-        def wrapper(self, video, quality: str, callback, path: str):
-            """
-            Download video segments in parallel, with retries for failures, and write to a file.
-            """
+        def wrapper(self, video, quality: str, callback, path: str, remux: bool = True, callback_remux=None):
             segments = self.get_segments(quality=quality, m3u8_url_master=video.m3u8_base_url)
             length = len(segments)
-            completed, successful_downloads = 0, 0
+            completed = 0
+            ts_buffers = []
 
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                future_to_hls_part = {
-                    executor.submit(self.download_segment, url, timeout): os.path.basename(url)
-                    for url in segments
+                future_to_url = {
+                    executor.submit(self.download_segment, url, timeout): url for url in segments
                 }
 
-                for future in as_completed(future_to_hls_part):
-                    hls_part = future_to_hls_part[future]
+                for future in as_completed(future_to_url):
+                    url = future_to_url[future]
                     try:
                         _, data, success = future.result()
                         completed += 1
                         if success:
-                            successful_downloads += 1
-                        callback(completed, length)  # Update progress callback
+                            ts_buffers.append((segments.index(url), data))
+                        callback(completed, length)
                     except Exception as e:
-                        self.logger.error(f"Error processing segment {hls_part}: {e}")
-                        raise SegmentError(f"Error processing segment {hls_part}: {e}")
+                        self.logger.error(f"Error processing segment {url}: {e}")
+                        raise SegmentError(f"Error processing segment {url}: {e}")
 
-            # Write only successful segments to the output file
-            with open(path, 'wb') as file:
-                for segment_url in segments:
-                    matched_futures = [
-                        future for future, hls_part in future_to_hls_part.items()
-                        if hls_part == os.path.basename(segment_url)
-                    ]
-                    if matched_futures:
-                        future = matched_futures[0]
-                        try:
-                            _, data, success = future.result()
-                            if success:
-                                file.write(data)
-                        except Exception as e:
-                            self.logger.error(f"Exception writing segment {segment_url}: {e}")
+            ts_buffers.sort(key=lambda x: x[0])
+            ts_combined = b''.join(data for _, data in ts_buffers)
+
+            if remux:
+                tmp_path = f"{path}.tmp"
+                with open(tmp_path, 'wb') as file:
+                    file.write(ts_combined)
+                self._convert_ts_to_mp4(tmp_path, path, callback=callback_remux)
+                os.remove(tmp_path)
+            else:
+                with open(path, 'wb') as file:
+                    file.write(ts_combined)
 
         return wrapper
 
-    def default(self, video, quality, callback, path, start: int = 0) -> bool:
+    def default(self, video, quality, callback, path, start: int = 0, remux: bool = True, callback_remux=None) -> bool:
         buffer = b''
         segments = self.get_segments(quality=quality, m3u8_url_master=video.m3u8_base_url)[start:]
         length = len(segments)
 
         for i, url in enumerate(segments):
             for _ in range(5):
+                try:
+                    segment = self.fetch(url, get_bytes=True)
+                    buffer += segment
+                    callback(i + 1, length)
+                    break
+                except Exception as e:
+                    self.logger.error(f"Failed to fetch segment {url}: {e}")
+                    continue
 
-                segment = self.fetch(url, get_bytes=True)
-                buffer += segment
-                callback(i + 1, length)
-                break
-
-        with open(path, 'wb') as file:
-            file.write(buffer)
+        if remux:
+            tmp_path = f"{path}.tmp"
+            with open(tmp_path, 'wb') as file:
+                file.write(buffer)
+            self._convert_ts_to_mp4(tmp_path, path, callback=callback_remux)
+            os.remove(tmp_path)
+        else:
+            with open(path, 'wb') as file:
+                file.write(buffer)
 
         return True
+
+    def _convert_ts_to_mp4(self, input_path: str, output_path: str, callback=None):
+        try:
+            import av
+        except (ModuleNotFoundError, ImportError):
+            raise ModuleNotFoundError("PyAV is required for remuxing. Install with `pip install av`. Not supported on Termux!")
+
+        input_ = av.open(input_path)
+        output = av.open(output_path, "w")
+
+        in_stream = input_.streams.video[0]
+        out_stream = output.add_stream_from_template(template=in_stream)
+
+        packets = list(input_.demux(in_stream))
+        total = len(packets)
+
+        for idx, packet in enumerate(packets):
+            if packet.dts is None:
+                continue
+            packet.stream = out_stream
+            output.mux(packet)
+            if callback:
+                callback(idx + 1, total)
+
+        input_.close()
+        output.close()
+
 
     def FFMPEG(self, video, quality: str, callback, path: str) -> bool:
         base_url = video.m3u8_base_url

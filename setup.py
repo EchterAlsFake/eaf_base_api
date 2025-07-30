@@ -2,9 +2,13 @@ from setuptools import setup, find_packages
 
 setup(
     name="eaf_base_api",
-    version="2.3.3",
+    version="2.3.4",
     packages=find_packages(),
-    install_requires=["ffmpeg-progress-yield", "m3u8", "httpx"],
+    install_requires=["m3u8", "httpx"],
+    extras_require={
+        "remux": ["av"],
+        "ffmpeg": ["ffmpeg-progress-yield"],
+    },
     entry_points={
         'console_scripts': [
             # If you want to create any executable scripts
