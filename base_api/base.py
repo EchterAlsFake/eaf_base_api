@@ -326,7 +326,7 @@ class BaseCore:
 
                 # Process and return content
                 # Collecting all chunks before processing because some sites cause issues with real-time decoding
-                if not self.config.max_bandwidth_mb is None:
+                if self.config.max_bandwidth_mb is not None and self.config.max_bandwidth_mb >= 0.2:
                     raw_content = bytearray()
                     chunk_size = 64 * 1024 # 64 KB
                     speed_limit = self.config.max_bandwidth_mb * 1024 * 1024
