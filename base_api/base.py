@@ -326,7 +326,26 @@ class BaseCore:
 
                 # Process and return content
                 # Collecting all chunks before processing because some sites cause issues with real-time decoding
-                raw_content = response.content
+                if not self.config.max_bandwidth_mb is None:
+                    raw_content = bytearray()
+                    chunk_size = 64 * 1024 # 64 KB
+                    speed_limit = self.config.max_bandwidth_mb * 1024 * 1024
+                    min_time_per_chunk = chunk_size / speed_limit
+                    start_time = time.time()
+
+                    for chunk in response.iter_bytes(chunk_size=chunk_size):
+                        raw_content.extend(chunk)
+                        elapsed = time.time() - start_time
+                        sleep_time = min_time_per_chunk - elapsed
+                        if sleep_time > 0:
+                            time.sleep(sleep_time)
+
+                        start_time = time.time()
+
+                    raw_content = bytes(raw_content)
+
+                else:
+                    raw_content = response.content
 
                 if get_bytes:
                     content = raw_content
