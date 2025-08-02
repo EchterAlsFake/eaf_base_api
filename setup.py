@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="eaf_base_api",
-    version="2.3.6",
+    version="2.3.7",
     packages=find_packages(),
     install_requires=["m3u8", "httpx"],
     extras_require={

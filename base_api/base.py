@@ -168,15 +168,16 @@ class BaseCore:
     """
     The base class which has all necessary functions for other API packages
     """
-    def __init__(self, config=config):
+    def __init__(self, config=config, auto_init: bool = True):
         self.last_request_time = time.time()
         self.total_requests = 0 # Tracks how many requests have been made
         self.session = None
         self.kill_switch = False
         self.config = config
         self.cache = Cache(self.config)
-        self.initialize_session()
         self.logger = setup_logger("BASE API - [BaseCore]", log_file=False, level=logging.ERROR)
+        if auto_init:
+            self.initialize_session()
 
     def enable_logging(self, log_file=None, level=logging.DEBUG, log_ip=None, log_port=None):
         """
