@@ -233,13 +233,13 @@ class BaseCore:
             raise KillSwitch("CRITICAL PROXY ERROR, CHECK LOGS!")
 
 
-    def initialize_session(self, verify=True): # Disable SSL verification only if you really need it....
+    def initialize_session(self): # Disable SSL verification only if you really need it....
         self.session = httpx.Client(
             proxy=self.config.proxy,
             headers=self.config.headers,
             timeout=self.config.timeout,
             follow_redirects=True,
-            verify=verify
+            verify=self.config.verify_ssl
         )
 
     def update_headers(self, headers: dict):
@@ -369,8 +369,12 @@ class BaseCore:
                 self.logger.error(f"Attempt {attempt}: The connection has been unexpectedly closed by: {url}. Retrying...")
                 continue
 
-            except httpx.RequestError as e:
+            except (httpx.RequestError, httpx.ConnectError) as e:
                 self.logger.error(f"Attempt {attempt}: Request error for URL {url}: {e}")
+
+                if "CERTIFICATE_VERIFY_FAILED" in str(e):
+                    raise ProxySSLError("Proxy has an invalid SSL certificate, to get around this error, set 'verify = False' in config")
+
                 self.logger.info(f"Retrying ({attempt}/{self.config.max_retries}) for URL: {url}")
                 continue # Continuing even failed requests, because they may succeed on another try (maybe idk)
 

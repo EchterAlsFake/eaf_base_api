@@ -42,3 +42,10 @@ class NetworkingError(Exception):
     def __init__(self, message):
         self.message = message
 
+
+class ProxySSLError(Exception):
+    """
+    Raises if a proxy request fails due to self-signed certificates or invalid TLS verification
+    """
+    def __init__(self, message):
+        self.message = message
