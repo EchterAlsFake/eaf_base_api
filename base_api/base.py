@@ -275,6 +275,7 @@ class BaseCore:
         support for proxies and custom timeout.
         """
         # Check cache first
+        last_error = None
 
         if timeout is None:
             timeout = self.config.timeout # pls don't ask thanks
@@ -399,11 +400,14 @@ class BaseCore:
                 self.logger.error(f"Proxy Error, please switch to another Proxy, it seems to be bad -->: {e}")
                 raise KillSwitch("Proxy error when trying a request, Aborting!")
 
-            except Exception:
+            except Exception as e:
+                last_error = e
                 self.logger.error(f"Attempt {attempt}: Unexpected error for URL {url}: {traceback.format_exc()}")
                 raise UnknownError(f"Unexpected error for URL {url}: {traceback.format_exc()}")
 
         self.logger.error(f"Failed to fetch URL {url} after {self.config.max_retries} attempts.")
+        if last_error:
+            raise last_error
         return None  # Return None if all attempts fail
 
     @classmethod
