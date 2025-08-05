@@ -28,6 +28,97 @@ loggers = {}
 # Default formatter
 formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
+_CF_BODY_MARKERS = (
+    "cf-browser-verification",
+    "cf_chl_",  # legacy CF challenge tokens
+    "challenges.cloudflare.com",  # Turnstile/challenge host
+    "cf-turnstile",  # Turnstile widget
+    "ddos protection by",
+    "just a moment...",
+    "please enable javascript and cookies",
+    "attention required!",
+)
+# Other common WAF/CDN markers
+_OTHER_BODY_MARKERS = (
+    "akamai bot manager",
+    "bm_sz=", "abck=", "ak_bmsc", "ak_bm",                # Akamai cookies
+    "request unsuccessful. incapsula incident id",        # Imperva/Incapsula
+)
+
+def _is_text_html(resp) -> bool:
+    ct = resp.headers.get("content-type", "").lower()
+    return "text/html" in ct or ct == ""  # some sites omit CT but send HTML
+
+def _header_has_any(hdr_val: str, *needles: str) -> bool:
+    s = (hdr_val or "").lower()
+    return any(n in s for n in needles)
+
+def _body_has_any(body: str, markers: tuple) -> bool:
+    b = (body or "").lower()
+    return any(m in b for m in markers)
+
+def _looks_like_challenge(resp) -> str | None:
+    """
+    Return a human-readable reason if the response looks like a bot/WAF challenge.
+    Return None if it looks like a normal page.
+    """
+    status = resp.status_code
+    server = resp.headers.get("server", "")
+    set_cookie = resp.headers.get("set-cookie", "")
+
+    # Collect cheap, header-based indicators first
+    has_cf_cookie = _header_has_any(set_cookie, "__cf_bm", "cf_clearance", "__cf_chl")
+    served_by_cf = _header_has_any(server, "cloudflare")
+    served_by_akamai = _header_has_any(server, "akamai")
+    served_by_incapsula = _header_has_any(server, "incapsula")
+
+    # History-based indicators (redirect to /cdn-cgi/ etc.)
+    history_urls = []
+    try:
+        for h in getattr(resp, "history", []) or []:
+            history_urls.append(str(getattr(h, "url", "")))
+    except Exception:
+        pass
+    redirected_via_cdn_cgi = any("/cdn-cgi/" in u for u in history_urls)
+
+    # Read a *small* slice of the body only if it’s HTML-like
+    body_snippet = ""
+    if _is_text_html(resp):
+        try:
+            # Read up to 20KB to capture challenge markup without huge memory hit
+            text = resp.text
+            body_snippet = text[:20000]
+        except Exception:
+            body_snippet = ""
+
+    has_cf_body_markers = _body_has_any(body_snippet, _CF_BODY_MARKERS)
+    has_other_waf_markers = _body_has_any(body_snippet, _OTHER_BODY_MARKERS)
+
+    # Heuristics:
+    # 1) Hard failure statuses usually mean a challenge/waf
+    if status in (403, 429, 503):
+        if served_by_cf or has_cf_cookie or redirected_via_cdn_cgi or has_cf_body_markers or has_other_waf_markers:
+            return (f"HTTP {status} with WAF indicators "
+                    f"(server={server!r}, cf_cookie={has_cf_cookie}, "
+                    f"cdn_cgi_redirect={redirected_via_cdn_cgi}, body_markers={has_cf_body_markers or has_other_waf_markers})")
+
+    # 2) Status 200 but body is a *challenge/interstitial*
+    #    Require strong evidence in the body or cookies, not just 'Server: cloudflare'.
+    if status == 200:
+        if has_cf_cookie or redirected_via_cdn_cgi or has_cf_body_markers or has_other_waf_markers:
+            return (f"200 OK but challenge content detected "
+                    f"(server={server!r}, cf_cookie={has_cf_cookie}, "
+                    f"cdn_cgi_redirect={redirected_via_cdn_cgi}, body_markers={has_cf_body_markers or has_other_waf_markers})")
+
+    # 3) Generic: if served by a known WAF/CDN and body is *obviously* an interstitial
+    if served_by_cf and has_cf_body_markers:
+        return "Cloudflare challenge markers present in body"
+    if served_by_akamai and has_other_waf_markers:
+        return "Akamai Bot Manager markers present in body"
+    if served_by_incapsula and has_other_waf_markers:
+        return "Imperva/Incapsula challenge markers present in body"
+
+    return None
 
 def is_android():
     """Detects if the script is running on an Android device."""
@@ -304,43 +395,21 @@ class BaseCore:
                                      follow_redirects=allow_redirects, data=data)
                 self.total_requests += 1
 
-                server_header = response.headers.get("Server", "").lower()
-                set_cookie_header = response.headers.get("Set-Cookie", "").lower()
-
-                if "cloudflare" in server_header or "__cf_bm" in set_cookie_header:
-                    snippet = ""
+                # NEW: bot/challenge detection
+                reason = _looks_like_challenge(response)
+                if reason:
+                    # Log a concise diagnostic with a small body preview
+                    body_preview = ""
                     try:
-                        snippet = response.text[:400]
+                        if _is_text_html(response):
+                            body_preview = response.text[:400]
                     except Exception:
                         pass
                     self.logger.error(
-                        "Bot protection detected: Server=%r, __cf_bm=%s, status=%s, body[:400]=%r",
-                        server_header,
-                        "__cf_bm" in set_cookie_header,
-                        response.status_code,
-                        snippet
+                        "Bot protection detected for %s: %s | Body[:400]=%r",
+                        url, reason, body_preview
                     )
-                    raise BotProtectionDetected(
-                        f"Bot protection triggered by {url} (status {response.status_code}). "
-                        f"Server={server_header}, __cf_bm={'__cf_bm' in set_cookie_header}"
-                    )
-
-                # Optional: detect generic 403/503 with known JS challenge markers
-                if response.status_code in (403, 503):
-                    lower_body = ""
-                    try:
-                        lower_body = response.text.lower()
-                    except Exception:
-                        pass
-                    if any(marker in lower_body for marker in (
-                            "cf-browser-verification",
-                            "jschl_vc",
-                            "ddos protection by",
-                            "attention required!"
-                    )):
-                        raise BotProtectionDetected(
-                            f"Bot protection (HTML challenge) detected at {url} (status {response.status_code})"
-                        )
+                    raise BotProtectionDetected(f"{reason} at {url}")
 
                 # Log and handle non-200 status codes
                 if response.status_code != 200:
