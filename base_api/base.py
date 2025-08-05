@@ -304,6 +304,44 @@ class BaseCore:
                                      follow_redirects=allow_redirects, data=data)
                 self.total_requests += 1
 
+                server_header = response.headers.get("Server", "").lower()
+                set_cookie_header = response.headers.get("Set-Cookie", "").lower()
+
+                if "cloudflare" in server_header or "__cf_bm" in set_cookie_header:
+                    snippet = ""
+                    try:
+                        snippet = response.text[:400]
+                    except Exception:
+                        pass
+                    self.logger.error(
+                        "Bot protection detected: Server=%r, __cf_bm=%s, status=%s, body[:400]=%r",
+                        server_header,
+                        "__cf_bm" in set_cookie_header,
+                        response.status_code,
+                        snippet
+                    )
+                    raise BotProtectionDetected(
+                        f"Bot protection triggered by {url} (status {response.status_code}). "
+                        f"Server={server_header}, __cf_bm={'__cf_bm' in set_cookie_header}"
+                    )
+
+                # Optional: detect generic 403/503 with known JS challenge markers
+                if response.status_code in (403, 503):
+                    lower_body = ""
+                    try:
+                        lower_body = response.text.lower()
+                    except Exception:
+                        pass
+                    if any(marker in lower_body for marker in (
+                            "cf-browser-verification",
+                            "jschl_vc",
+                            "ddos protection by",
+                            "attention required!"
+                    )):
+                        raise BotProtectionDetected(
+                            f"Bot protection (HTML challenge) detected at {url} (status {response.status_code})"
+                        )
+
                 # Log and handle non-200 status codes
                 if response.status_code != 200:
                     self.logger.warning(

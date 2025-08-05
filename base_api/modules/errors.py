@@ -57,3 +57,8 @@ class ResourceGone(Exception):
     """
     def __init__(self, message):
         self.message = message
+
+
+class BotProtectionDetected(Exception):
+    """Raised when Cloudflare or similar bot protection is detected."""
+    pass
