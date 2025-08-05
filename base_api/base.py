@@ -717,29 +717,90 @@ class BaseCore:
     def _convert_ts_to_mp4(self, input_path: str, output_path: str, callback=None):
         try:
             import av
+            from av.audio.resampler import AudioResampler
         except (ModuleNotFoundError, ImportError):
-            raise ModuleNotFoundError("PyAV is required for remuxing. Install with `pip install av`. Not supported on Termux!")
+            raise ModuleNotFoundError("PyAV is required for remuxing. Install with pip install av. Not supported on Termux!")
 
         input_ = av.open(input_path)
-        output = av.open(output_path, "w")
+        output = av.open(output_path, mode="w", format="mp4", options={"movflags": "faststart"})
 
-        in_stream = input_.streams.video[0]
-        out_stream = output.add_stream_from_template(template=in_stream)
+        # --- VIDEO: keep your exact remux approach ---
+        in_video = input_.streams.video[0]
+        out_video = output.add_stream_from_template(template=in_video)
 
-        packets = list(input_.demux(in_stream))
+        # --- AUDIO: copy if MP4-compatible; else transcode to AAC ---
+        in_audio = next((s for s in input_.streams if s.type == "audio"), None)
+        out_audio = None
+        transcode_audio = False
+        resampler = None
+
+        if in_audio:
+            # Common MP4-safe audio codecs to copy without transcoding.
+            copy_ok = {"aac", "alac", "mp3"}
+            codec_name = (in_audio.codec_context.name or "").lower()
+
+            if codec_name in copy_ok:
+                out_audio = output.add_stream_from_template(template=in_audio)
+            else:
+                # Build an AAC encoder stream. Match input rate/layout where possible.
+                transcode_audio = True
+                sample_rate = in_audio.codec_context.sample_rate or 48000
+                layout = (
+                    in_audio.codec_context.layout.name
+                    if getattr(in_audio.codec_context, "layout", None)
+                    else "stereo"
+                )
+                out_audio = output.add_stream("aac", rate=sample_rate)
+                # Setting layout/channels helps encoder pick sensible defaults.
+                try:
+                    out_audio.layout = layout
+                except Exception:
+                    pass
+
+                # Ensure frames handed to the AAC encoder are in a compatible sample format.
+                # ('fltp' is the usual format for AAC encoders.)
+                resampler = AudioResampler(format="fltp", layout=layout, rate=sample_rate)
+
+            # --- DEMUX both streams so audio is included ---
+        demux_streams = [in_video] + ([in_audio] if in_audio else [])
+        packets = list(input_.demux(demux_streams))  # keeps your progress logic
         total = len(packets)
 
         for idx, packet in enumerate(packets):
             if packet.dts is None:
+                if callback:
+                    callback(idx + 1, total)
                 continue
-            packet.stream = out_stream
-            output.mux(packet)
+
+            if packet.stream == in_video:
+                # Your original video remux path (no explicit rescale).
+                packet.stream = out_video
+                output.mux(packet)
+
+            elif in_audio and packet.stream == in_audio:
+                if not transcode_audio:
+                    # Audio is already MP4-compatible; just remux.
+                    packet.stream = out_audio
+                    output.mux(packet)
+                else:
+                    # Decode -> (optionally resample) -> encode AAC -> mux.
+                    for frame in packet.decode():
+                        # Resample to match encoder expectations.
+                        frames = resampler.resample(frame) if resampler else [frame]
+                        for f in frames:
+                            for enc_pkt in out_audio.encode(f):
+                                output.mux(enc_pkt)
+
             if callback:
                 callback(idx + 1, total)
 
+        # Flush audio encoder if we transcoded.
+        if transcode_audio and out_audio:
+            for enc_pkt in out_audio.encode(None):
+                output.mux(enc_pkt)
+
         input_.close()
         output.close()
-
 
     def FFMPEG(self, video, quality: str, callback, path: str) -> bool:
         try:
@@ -830,9 +891,15 @@ class BaseCore:
 
         return path
 
-    @classmethod
-    def truncate(cls, string_lol) -> str:
-        return string_lol[:200]
+    def truncate(self, name: str, max_bytes: int = 245) -> str: # only 245, because we need to append .mp4
+        encoded = name.encode("utf-8")
+        if len(encoded) > max_bytes:
+            encoded = encoded[:max_bytes]
+            # Ensure not to cut in middle of a UTF-8 sequence
+            while encoded[-1] & 0b11000000 == 0b10000000:
+                encoded = encoded[:-1]
+            return encoded.decode("utf-8", errors="ignore")
+        return name
 
     @staticmethod
     def str_to_bool(value):
