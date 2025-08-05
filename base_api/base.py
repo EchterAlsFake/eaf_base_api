@@ -409,7 +409,8 @@ class BaseCore:
                         "Bot protection detected for %s: %s | Body[:400]=%r",
                         url, reason, body_preview
                     )
-                    raise BotProtectionDetected(f"{reason} at {url}")
+                    if config.raise_bot_protection:
+                        raise BotProtectionDetected(f"{reason} at {url}")
 
                 # Log and handle non-200 status codes
                 if response.status_code != 200:

@@ -9,6 +9,7 @@ class RuntimeConfig:
         self.max_bandwidth_mb = None # Set speed limit in megabytes per second e.g, 2.0, 3.5 etc...
         self.ffmpeg_path = "ffmpeg"
         self.proxy = None
+        self.raise_bot_protection = False
         self.verify_ssl = True
         self.user_agents = [
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
