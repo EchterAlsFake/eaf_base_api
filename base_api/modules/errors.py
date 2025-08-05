@@ -49,3 +49,11 @@ class ProxySSLError(Exception):
     """
     def __init__(self, message):
         self.message = message
+
+
+class ResourceGone(Exception):
+    """
+    Raises if a resource is gone (http 410 error)
+    """
+    def __init__(self, message):
+        self.message = message

@@ -312,9 +312,16 @@ class BaseCore:
                         self.logger.error(f"URL: {url} Resource not found (404). This may indicate the content is unavailable.")
                         return response  # Return None for unavailable resources
 
+                    if response.status_code == 403:
+                        time.sleep(2) # Somehow fixes 403 on missav idk man
+                        self.update_user_agent()
+
                     elif response.status_code == 403 and attempt >= 2:
                         self.logger.error(f"The website rejected access after {attempt} tries. Aborting!")
                         return None # Return None for forbidden resources
+
+                    elif response.status_code == 410:
+                        raise ResourceGone(f"Resource: {url} is Gone.")
 
                     self.logger.info(f"Retrying ({attempt}/{self.config.max_retries}) for URL: {url}")
                     continue  # Retry for other non-200 status codes
