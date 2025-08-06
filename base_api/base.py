@@ -259,7 +259,7 @@ class BaseCore:
     """
     The base class which has all necessary functions for other API packages
     """
-    def __init__(self, config=config, auto_init: bool = True):
+    def __init__(self, config=config, auto_init: bool = True, headers: dict = None):
         self.last_request_time = time.time()
         self.total_requests = 0 # Tracks how many requests have been made
         self.session = None
@@ -268,7 +268,7 @@ class BaseCore:
         self.cache = Cache(self.config)
         self.logger = setup_logger("BASE API - [BaseCore]", log_file=False, level=logging.ERROR)
         if auto_init:
-            self.initialize_session()
+            self.initialize_session(headers)
 
     def enable_logging(self, log_file=None, level=logging.DEBUG, log_ip=None, log_port=None):
         """
@@ -276,11 +276,6 @@ class BaseCore:
         """
         self.logger = setup_logger(name="BASE API - [BaseCore]", log_file=log_file, level=level, http_ip=log_ip, http_port=log_port)
         self.cache.logger = setup_logger(name="BASE API - [Cache]", log_file=log_file, level=level, http_ip=log_ip, http_port=log_port)
-
-    def update_user_agent(self):
-        """Updates the User-Agent"""
-        self.config.rotate_user_agent()
-        self.session.headers.update({"User-Agent": self.config.headers["User-Agent"]})
 
     def update_cookies(self):
         """Updates cookies dynamically"""
@@ -324,14 +319,18 @@ class BaseCore:
             raise KillSwitch("CRITICAL PROXY ERROR, CHECK LOGS!")
 
 
-    def initialize_session(self): # Disable SSL verification only if you really need it....
+    def initialize_session(self, headers: dict = None): # Disable SSL verification only if you really need it....
         self.session = httpx.Client(
             proxy=self.config.proxy,
-            headers=self.config.headers,
             timeout=self.config.timeout,
             follow_redirects=True,
             verify=self.config.verify_ssl
         )
+
+        self.session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36"})
+
+        if headers:
+            self.session.headers.update(headers)
 
     def update_headers(self, headers: dict):
         self.session.headers.update(headers)
@@ -381,10 +380,6 @@ class BaseCore:
                 time.sleep(1.5 * attempt) # Sleeping for 1.5 seconds to minimize site overload when doing a lot of requests
 
             try:
-                # Update user agent periodically
-                if self.total_requests % 30 == 0: # Changing all 30 attempts
-                    self.update_user_agent()
-
                 self.enforce_delay()
 
                 if self.kill_switch and not bypass_kill_switch:
@@ -423,7 +418,6 @@ class BaseCore:
 
                     if response.status_code == 403:
                         time.sleep(2) # Somehow fixes 403 on missav idk man
-                        self.update_user_agent()
 
                     elif response.status_code == 403 and attempt >= 2:
                         self.logger.error(f"The website rejected access after {attempt} tries. Aborting!")
