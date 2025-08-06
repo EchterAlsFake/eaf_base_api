@@ -4,6 +4,7 @@ import sys
 import time
 import m3u8
 import httpx
+import random
 import logging
 import traceback
 import threading
@@ -22,6 +23,14 @@ except (ModuleNotFoundError, ImportError):
     from .modules.errors import *
     from .modules.config import config
     from .modules.progress_bars import Callback
+
+user_agents = [
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.1",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.3",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_12_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/103.0.0.0 Safari/537.3",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0."
+        ]
 
 loggers = {}
 
@@ -319,7 +328,7 @@ class BaseCore:
             raise KillSwitch("CRITICAL PROXY ERROR, CHECK LOGS!")
 
 
-    def initialize_session(self, headers: dict = None): # Disable SSL verification only if you really need it....
+    def initialize_session(self, headers: dict = None, cookies: dict = None): # Disable SSL verification only if you really need it....
         self.session = httpx.Client(
             proxy=self.config.proxy,
             timeout=self.config.timeout,
@@ -331,6 +340,9 @@ class BaseCore:
 
         if headers:
             self.session.headers.update(headers)
+
+        if cookies:
+            self.session.cookies.update(cookies)
 
     def update_headers(self, headers: dict):
         self.session.headers.update(headers)
@@ -418,6 +430,12 @@ class BaseCore:
 
                     if response.status_code == 403:
                         time.sleep(2) # Somehow fixes 403 on missav idk man
+                        self.session.headers.update({
+                            "User-Agent": random.choice(user_agents)
+                        })
+
+                        self.logger.warning(f"Switched User agent to: {self.session.headers['User-Agent']}")
+
 
                     elif response.status_code == 403 and attempt >= 2:
                         self.logger.error(f"The website rejected access after {attempt} tries. Aborting!")
