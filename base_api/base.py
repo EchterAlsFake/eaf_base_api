@@ -150,6 +150,7 @@ LOG_COLORS = {
 }
 RESET_COLOR = "\033[0m"
 
+
 class ColoredFormatter(logging.Formatter):
     def format(self, record):
         log_message = super().format(record)
@@ -604,13 +605,13 @@ class BaseCore:
         full_url = urljoin(m3u8_url, url_tmp) # Merges the primary with the new URL to get the full URL path
         return full_url
 
-    @lru_cache(maxsize=250)
     def get_segments(self, m3u8_url_master: str, quality: str) -> list:
         """Gets all video segments from a given quality and the primary m3u8 URL"""
         m3u8_url = self.get_m3u8_by_quality(m3u8_url=m3u8_url_master, quality=quality)
         self.logger.debug(f"Trying to fetch segment from m3u8 ->: {m3u8_url}")
         content = self.fetch(url=m3u8_url)
 
+        segments = []
         m3u8_processed = m3u8.loads(content)
 
         if m3u8_processed.is_variant:
@@ -620,8 +621,15 @@ class BaseCore:
             content = self.fetch(url=new_m3u8)
             m3u8_processed = m3u8.loads(content)
 
-        segments = [urljoin(m3u8_url, seg.uri) for seg in m3u8_processed.segments]
-        self.logger.debug(f"Fetched {len(segments)} segments from m3u8 URL")
+        if getattr(m3u8_processed, "segment_map", None):
+            init_uri = m3u8_processed.segment_map[0].uri
+            init_url = urljoin(m3u8_url, init_uri)
+            segments.append(init_url)
+            self.logger.debug(f"Found init segment: {init_url}")
+            # Needed for example for xhamster, cuz they switched to av1 and .m4s instead of .mp4 / .ts
+
+        segments.extend(urljoin(m3u8_url, seg.uri) for seg in m3u8_processed.segments)
+        self.logger.debug(f"Fetched {len(segments)} segments from m3u8 URL (including init if present)")
         return segments
 
     def download_segment(self, url: str, timeout: int) -> tuple[str, bytes, bool]:
@@ -728,13 +736,13 @@ class BaseCore:
 
     def _convert_ts_to_mp4(self, input_path: str, output_path: str, callback=None):
         try:
-            import av
+            from av import open as av_open
             from av.audio.resampler import AudioResampler
-        except (ModuleNotFoundError, ImportError):
-            raise ModuleNotFoundError("PyAV is required for remuxing. Install with pip install av. Not supported on Termux!")
+        except (ModuleNotFoundError, ImportError) as e:
+            raise ModuleNotFoundError(f"PyAV is required for remuxing. Install with pip install av. Not supported on Termux! {e}")
 
-        input_ = av.open(input_path)
-        output = av.open(output_path, mode="w", format="mp4", options={"movflags": "faststart"})
+        input_ = av_open(input_path)
+        output = av_open(output_path, mode="w", format="mp4", options={"movflags": "faststart"})
 
         # --- VIDEO: keep your exact remux approach ---
         in_video = input_.streams.video[0]
@@ -848,39 +856,91 @@ class BaseCore:
 
         return False
 
-    def legacy_download(self, path: str, url: str, callback=None) -> bool:
+    def legacy_download(self, path: str, url: str, callback=None,
+                        chunk_size: int = 1 << 20,  # 1 MiB
+                        max_retries: int = 5,
+                        read_timeout: float = 120.0) -> bool:
         """
-        Download a file using streaming, with support for progress updates.
+        Download a file using streaming with stall tolerance and resume.
+        Assumes self.session is an httpx.Client.
         """
         try:
-            with self.session.stream("GET", url, timeout=30) as response:  # Use a reasonable timeout
-                response.raise_for_status()
-                file_size = int(response.headers.get('content-length', 0))
+            # progress UI fallback
+            progress_bar = None
+            if callback is None:
+                progress_bar = Callback()
 
-                if callback is None:
-                    progress_bar = Callback()
+            # how many bytes we already have (for resume)
+            downloaded_so_far = os.path.getsize(path) if os.path.exists(path) else 0
+            etag = None
+            attempt = 0
 
-                downloaded_so_far = 0
+            # prefer a longer read timeout to ride out throttling pauses
+            timeout = httpx.Timeout(connect=10.0, read=read_timeout, write=30.0, pool=30.0)
 
-                # Open file for writing
-                with open(path, 'wb') as file:
-                    for chunk in response.iter_bytes(chunk_size=1024):
-                        if not chunk:
-                            break  # End of stream
+            while True:
+                headers = {
+                }
+                if downloaded_so_far:
+                    headers["Range"] = f"bytes={downloaded_so_far}-"
 
-                        file.write(chunk)
-                        downloaded_so_far += len(chunk)
+                # stream the next segment (or whole file if starting fresh)
+                with self.session.stream("GET", url, headers=headers,
+                                         follow_redirects=True, timeout=timeout) as response:
+                    # If we asked for a Range and got 200, server ignored it: start over.
+                    if downloaded_so_far and response.status_code == 200:
+                        downloaded_so_far = 0  # restart from scratch
+                    response.raise_for_status()
 
-                        # Update progress
-                        if callback:
-                            callback(downloaded_so_far, file_size)
-                        else:
-                            progress_bar.text_progress_bar(downloaded=downloaded_so_far, total=file_size)
+                    # track ETag to detect mid-download content changes
+                    etag_cur = response.headers.get("ETag")
+                    if etag is None:
+                        etag = etag_cur
+                    elif etag_cur and etag_cur != etag:
+                        raise RuntimeError("Remote content changed during download")
 
-                if not callback:
-                    del progress_bar
+                    total = None
+                    # Prefer Content-Range total when resuming; else fall back to Content-Length
+                    cr = response.headers.get("Content-Range")  # e.g., "bytes start-end/total"
+                    if cr and "/" in cr:
+                        try:
+                            total = int(cr.rsplit("/", 1)[1])
+                        except ValueError:
+                            total = None
+                    if total is None:
+                        try:
+                            total = int(response.headers.get("Content-Length", "0")) or None
+                        except ValueError:
+                            total = None
 
-                return True
+                    mode = "ab" if downloaded_so_far else "wb"
+                    with open(path, mode) as file:
+                        try:
+                            for chunk in response.iter_bytes(chunk_size=chunk_size):
+                                if not chunk:
+                                    continue
+                                file.write(chunk)
+                                downloaded_so_far += len(chunk)
+
+                                # update progress
+                                if callback:
+                                    callback(downloaded_so_far, total or 0)
+
+                                else:
+                                    progress_bar.text_progress_bar(downloaded=downloaded_so_far, total=total or 0)
+
+                            # finished successfully
+                            if progress_bar:
+                                del progress_bar
+                            return True
+
+                        except httpx.ReadTimeout:
+                            # stall: back off and retry from current offset
+                            attempt += 1
+                            if attempt > max_retries:
+                                raise
+                            time.sleep(min(2 ** attempt, 30))
+                            continue  # loop retries with Range  # let him coook!!!
 
         except httpx.StreamClosed:
             self.logger.error(f"Stream for: {url} was closed. This should not happen...")
