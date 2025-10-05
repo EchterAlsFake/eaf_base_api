@@ -9,7 +9,7 @@ import logging
 import traceback
 import threading
 
-from typing import Union
+from typing import Any, Dict, List, Optional, Union
 from functools import lru_cache
 from urllib.parse import urljoin
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -33,6 +33,111 @@ user_agents = [
         ]
 
 loggers = {}
+HEIGHT_FROM_URI = re.compile(r'(?<!\d)(\d{3,4})[pP](?!\d)')  # e.g., 1080p, 720P
+
+def _height_from_variant(variant) -> Optional[int]:
+    """Extract height from a variant:
+    1) stream_info.resolution (w, h)
+    2) URI pattern like .../720p/...
+    """
+    if getattr(variant, "stream_info", None) and variant.stream_info.resolution:
+        _, h = variant.stream_info.resolution  # (w, h)
+        return int(h)
+
+    if variant.uri:
+        m = HEIGHT_FROM_URI.search(variant.uri)
+        if m:
+            return int(m.group(1))
+
+    return None
+
+def _is_video_playlist(variant) -> bool:
+    """Filter out I-frames/audio-only playlists."""
+    # m3u8 lib sometimes sets is_iframe if EXT-X-I-FRAME-STREAM-INF is present.
+    if getattr(variant, "is_iframe", False):
+        return False
+
+    # If codecs known and contain only audio (mp4a, ac-3, ec-3, etc.)
+    codecs = getattr(variant.stream_info, "codecs", None) if getattr(variant, "stream_info", None) else None
+    if codecs:
+        # very light heuristic: if no video codec substring, probably audio-only.
+        # video: avc1, hvc1, hev1, vp9, av01, dvh
+        if not any(v in codecs.lower() for v in ("avc1", "hvc1", "hev1", "av01", "vp9", "dvh")):
+            return False
+
+    return True
+
+def _collect_variants(master: m3u8.M3U8) -> List[Dict[str, Any]]:
+    """Normalize playlist variants to a comparable list."""
+    items: List[Dict[str, Any]] = []
+    for v in master.playlists:
+        if not _is_video_playlist(v):
+            continue
+
+        h = _height_from_variant(v)
+        bw = getattr(v.stream_info, "bandwidth", 0) if getattr(v, "stream_info", None) else 0
+        fr = getattr(v.stream_info, "frame_rate", 0.0) if getattr(v, "stream_info", None) else 0.0
+        items.append({
+            "uri": v.uri,
+            "height": h,                 # may be None
+            "bandwidth": int(bw or 0),
+            "frame_rate": float(fr or 0.0),
+            "resolution": getattr(v.stream_info, "resolution", None) if getattr(v, "stream_info", None) else None,
+            "raw": v
+        })
+    return items
+
+def _pick_by_label(variants: List[Dict[str, Any]], label: str) -> Dict[str, Any]:
+    """best / worst / half based on a combined rank by (height, bandwidth)."""
+    # rank by height first, then bandwidth as tiebreaker
+    def key_fn(v):
+        return (v["height"] or 0, v["bandwidth"])
+    ordered = sorted(variants, key=key_fn)
+
+    if not ordered:
+        raise ValueError("No video variants available in master playlist.")
+
+    if label == "worst":
+        return ordered[0]
+    elif label == "half":
+        return ordered[len(ordered)//2]
+    elif label == "best":
+        return ordered[-1]
+    else:
+        raise ValueError("Invalid quality label.")
+
+def _normalize_quality(quality: Union[str, int]) -> Union[str, int]:
+    """Convert '1080p'->1080, '720'->720, keep labels as-is."""
+    if isinstance(quality, int):
+        return quality
+    q = str(quality).strip().lower()
+    if q in {"best", "worst", "half"}:
+        return q
+    m = re.search(r'(\d{3,4})', q)
+    if m:
+        return int(m.group(1))
+    raise ValueError(f"Invalid quality value: {quality!r}")
+
+def _pick_by_height(variants: List[Dict[str, Any]], target: int) -> Dict[str, Any]:
+    """Choose the highest height ≤ target; else closest by absolute diff (ties -> higher)."""
+    with_height = [v for v in variants if v["height"] is not None]
+    if with_height:
+        # Prefer height <= target
+        below_eq = [v for v in with_height if v["height"] <= target]
+        if below_eq:
+            # Among same height, prefer higher bandwidth then higher fps
+            best = sorted(below_eq, key=lambda v: (v["height"], v["bandwidth"], v["frame_rate"]))[-1]
+            return best
+
+        # Fallback: closest by absolute diff; ties -> higher height
+        def diff_key(v):
+            return (abs(v["height"] - target), -v["height"], v["bandwidth"], v["frame_rate"])
+        return sorted(with_height, key=diff_key)[0]
+
+    # If we have no heights at all, fall back to bandwidth ranking
+    return sorted(variants, key=lambda v: v["bandwidth"])[-1]
+
+
 
 # Default formatter
 formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
@@ -300,7 +405,7 @@ class BaseCore:
         proxy_ip = self.config.proxy
         pattern = re.compile(
             r'^(?P<scheme>http|socks5)://'
-            r'(?:(?:\w+:\w+)@)?'  # optional user:pass@
+            r'(?:\w+:\w+@)?'  # optional user:pass@
             r'(?P<host>[a-zA-Z0-9.-]+)'
             r':(?P<port>\d{1,5})$'
         )
@@ -528,7 +633,7 @@ class BaseCore:
 
         self.logger.error(f"Failed to fetch URL {url} after {self.config.max_retries} attempts.")
         if last_error:
-            raise last_error
+            pass
         return None  # Return None if all attempts fail
 
     @classmethod
@@ -562,60 +667,75 @@ class BaseCore:
         return sanitized[:max_length]
 
     @lru_cache(maxsize=250)
-    def get_m3u8_by_quality(self, m3u8_url: str, quality: str) -> str:
-        """Fetches the m3u8 URL for a given quality by extracting all possible sub-m3u8 URLs from the primary
-        m3u8 playlist"""
-        if "#" in m3u8_url:
-            playlist = m3u8.loads(m3u8_url)
-            self.logger.debug("Resolved custom m3u8")
+    def get_m3u8_by_quality(self, m3u8_url: str, quality: Union[str, int]) -> str:
+        """
+        Return the media-playlist URL for the requested quality.
 
+        quality:
+          - 'best' | 'half' | 'worst'
+          - 1080 / '1080' / '1080p' (and similar)
+        """
+        # Resolve master content
+        if m3u8_url.lstrip().startswith("#EXTM3U"):
+            master = m3u8.loads(m3u8_url)
+            self.logger.debug("Resolved inline/custom m3u8 master content.")
+            base_for_join = ""  # URIs should be absolute in inline cases; join will handle if relative
         else:
-            playlist_content = self.fetch(url=m3u8_url)
-            playlist = m3u8.loads(playlist_content)
-            self.logger.debug(f"Resolved m3u8 playlist: {m3u8_url}")
+            content = self.fetch(url=m3u8_url)
+            master = m3u8.loads(content)
+            base_for_join = m3u8_url
+            self.logger.debug(f"Resolved m3u8 master: {m3u8_url}")
 
-        if not playlist.is_variant:
-            raise ValueError("Provided URL is not a master playlist.")
+        if not master.is_variant:
+            raise ValueError("Provided URL/content is not a master playlist.")
 
-        # Extract available qualities and URLs
-        qualities = {
-            (variant.stream_info.resolution or "unknown"): variant.uri
-            for variant in playlist.playlists
-        } # Fetches the available qualities
+        variants = _collect_variants(master)
+        if not variants:
+            raise ValueError("No usable video variants found in master playlist.")
 
-        # Sort qualities by resolution (width x height)
-        sorted_qualities = sorted(
-            qualities.items(),
-            key=lambda x: (x[0][0] * x[0][1]) if x[0] != "unknown" else 0
-        ) # Sorts qualities to support different HLS naming schemes
+        q = _normalize_quality(quality)
+        if isinstance(q, str):  # 'best'/'half'/'worst'
+            chosen = _pick_by_label(variants, q)
+        else:  # numeric height like 1080, 720, etc.
+            chosen = _pick_by_height(variants, q)
 
-        # Select based on quality preference
-        if quality == "best":
-            url_tmp = sorted_qualities[-1][1]  # Highest resolution URL
-
-        elif quality == "worst":
-            url_tmp = sorted_qualities[0][1]  # Lowest resolution URL
-
-        elif quality == "half":
-            url_tmp = sorted_qualities[len(sorted_qualities) // 2][1]  # Mid-quality URL
-
-        else:
-            raise ValueError("Invalid quality provided.")
-
-        full_url = urljoin(m3u8_url, url_tmp) # Merges the primary with the new URL to get the full URL path
+        full_url = urljoin(base_for_join or m3u8_url, chosen["uri"])
         return full_url
 
-    def get_segments(self, m3u8_url_master: str, quality: str) -> list:
-        """Gets all video segments from a given quality and the primary m3u8 URL"""
+    def list_available_qualities(self, m3u8_url: str) -> List[int]:
+        """
+        Inspect the master playlist and return sorted unique heights (e.g., [240, 360, 480, 720, 1080]).
+        """
+        if m3u8_url.lstrip().startswith("#EXTM3U"):
+            master = m3u8.loads(m3u8_url)
+        else:
+            content = self.fetch(url=m3u8_url)
+            master = m3u8.loads(content)
+
+        if not master.is_variant:
+            return []
+
+        heights = {h for h in (_height_from_variant(v) for v in master.playlists) if h is not None}
+        if heights:
+            return sorted(heights)
+        # fallback: bandwidth-only (roughly infer tiers)
+        by_bw = sorted(
+            (getattr(v.stream_info, "bandwidth", 0) for v in master.playlists if _is_video_playlist(v)),
+            key=int
+        )
+        # Return rank numbers instead of heights if we truly can't infer—kept simple:
+        return [i for i, _ in enumerate(by_bw, start=1)]
+
+    def get_segments(self, m3u8_url_master: str, quality: Union[str, int]) -> list:
         m3u8_url = self.get_m3u8_by_quality(m3u8_url=m3u8_url_master, quality=quality)
-        self.logger.debug(f"Trying to fetch segment from m3u8 ->: {m3u8_url}")
+        self.logger.debug(f"Trying to fetch segment from m3u8 -> {m3u8_url}")
         content = self.fetch(url=m3u8_url)
 
         segments = []
         m3u8_processed = m3u8.loads(content)
 
         if m3u8_processed.is_variant:
-            self.logger.warning("The M3U8 Playlist is not a media playlist. Trying to resolve to the first m3u8...")
+            self.logger.warning("Media playlist expected; got variant. Resolving to first sub-playlist...")
             new_m3u8 = urljoin(m3u8_url, m3u8_processed.playlists[0].uri)
             self.logger.info(f"Resolved to new URL: {new_m3u8}")
             content = self.fetch(url=new_m3u8)
@@ -626,7 +746,6 @@ class BaseCore:
             init_url = urljoin(m3u8_url, init_uri)
             segments.append(init_url)
             self.logger.debug(f"Found init segment: {init_url}")
-            # Needed for example for xhamster, cuz they switched to av1 and .m4s instead of .mp4 / .ts
 
         segments.extend(urljoin(m3u8_url, seg.uri) for seg in m3u8_processed.segments)
         self.logger.debug(f"Fetched {len(segments)} segments from m3u8 URL (including init if present)")
