@@ -477,6 +477,8 @@ class BaseCore:
             bypass_kill_switch: bool = False, # prevents infinite loop
             data: dict = None,
             method: str = "GET",
+            headers: dict = None,
+            json: dict = None,
     ) -> Union[bytes, str, httpx.Response, None]:
         """
         Fetches content in UTF-8 Text, Bytes, or as a stream using multiple request attempts,
@@ -504,8 +506,11 @@ class BaseCore:
                     self.check_kill_switch()
 
                 # Perform the request with stream handling
+                if headers is None:
+                    headers = self.session.headers.copy()
+
                 response = self.session.request(method=method, url=url, timeout=timeout, cookies=cookies,
-                                     follow_redirects=allow_redirects, data=data)
+                                     follow_redirects=allow_redirects, data=data, headers=headers, json=json)
                 self.total_requests += 1
 
                 # NEW: bot/challenge detection
