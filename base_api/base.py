@@ -435,7 +435,15 @@ class BaseCore:
 
 
     def initialize_session(self, headers: dict = None, cookies: dict = None): # Disable SSL verification only if you really need it....
+        limits = httpx.Limits(
+            max_connections=getattr(self.config, "max_connections", 64),
+            max_keepalive_connections=getattr(self.config, "max_keepalive", 32),
+            keepalive_expiry=60.0,
+        )
+
         self.session = httpx.Client(
+            limits=limits,
+            http2=True,
             proxy=self.config.proxy,
             timeout=self.config.timeout,
             follow_redirects=True,
@@ -484,20 +492,17 @@ class BaseCore:
         Fetches content in UTF-8 Text, Bytes, or as a stream using multiple request attempts,
         support for proxies and custom timeout.
         """
-        # Check cache first
         last_error = None
-
-        if timeout is None:
-            timeout = self.config.timeout # pls don't ask thanks
-
+        timeout = timeout or self.config.timeout
         content = self.cache.handle_cache(url)
         if content:
             self.logger.info(f"Fetched content for: {url} from cache!")
             return content
 
         for attempt in range(1, self.config.max_retries + 1): # +1 because I feel like it
-            if attempt != 1:
-                time.sleep(1.5 * attempt) # Sleeping for 1.5 seconds to minimize site overload when doing a lot of requests
+            if attempt > 1:
+                sleep_s = min(5.0, 0.4 * (2 ** attempt)) + random.random() * 0.25
+                time.sleep(sleep_s)
 
             try:
                 self.enforce_delay()
@@ -512,97 +517,87 @@ class BaseCore:
                 response = self.session.request(method=method, url=url, timeout=timeout, cookies=cookies,
                                      follow_redirects=allow_redirects, data=data, headers=headers, json=json)
                 self.total_requests += 1
+                print(f"Response Status Code: {response.status_code}")
 
                 # NEW: bot/challenge detection
                 reason = _looks_like_challenge(response)
                 if reason:
-                    # Log a concise diagnostic with a small body preview
-                    body_preview = ""
-                    try:
-                        if _is_text_html(response):
-                            body_preview = response.text[:400]
-                    except Exception:
-                        pass
-                    self.logger.error(
-                        "Bot protection detected for %s: %s | Body[:400]=%r",
-                        url, reason, body_preview
-                    )
-                    if config.raise_bot_protection:
-                        raise BotProtectionDetected(f"{reason} at {url}")
+                    raise BotProtectionDetected(f"{reason} at {url}")
 
-                # Log and handle non-200 status codes
-                if response.status_code != 200:
-                    self.logger.warning(
-                        f"Attempt {attempt}: Unexpected status code {response.status_code} for URL: {url}")
+                if response.status_code == 404:
+                    self.logger.error(f"URL: {url} Resource not found (404). This may indicate the content is unavailable.")
+                    return response  # Return Response object to catch in APIs
 
-                    if response.status_code == 404:
-                        self.logger.error(f"URL: {url} Resource not found (404). This may indicate the content is unavailable.")
-                        return response  # Return None for unavailable resources
+                elif response.status_code == 403 and attempt >= 2:
+                    self.logger.error(f"The website rejected access after {attempt} tries. Aborting!")
+                    return None # Return None for forbidden resources
 
-                    if response.status_code == 403:
-                        time.sleep(2) # Somehow fixes 403 on missav idk man
-                        self.session.headers.update({
-                            "User-Agent": random.choice(user_agents)
-                        })
+                elif response.status_code == 403:
+                    time.sleep(2) # Somehow fixes 403 on missav idk man
+                    self.session.headers.update({
+                        "User-Agent": random.choice(user_agents)
+                    })
+                    self.logger.warning(f"Switched User agent to: {self.session.headers['User-Agent']}")
+                    continue
 
-                        self.logger.warning(f"Switched User agent to: {self.session.headers['User-Agent']}")
+                elif response.status_code == 410:
+                    raise ResourceGone(f"Resource: {url} is Gone.")
 
+                elif response.status_code == 429 and attempt >= 4:
+                    raise "You have been rate limited by the website. This issue can't be fixed. Either switch your IP, or wait."
 
-                    elif response.status_code == 403 and attempt >= 2:
-                        self.logger.error(f"The website rejected access after {attempt} tries. Aborting!")
-                        return None # Return None for forbidden resources
+                elif response.status_code == 429:
+                    continue
 
-                    elif response.status_code == 410:
-                        raise ResourceGone(f"Resource: {url} is Gone.")
+                elif response.status_code == 200:
+                    self.logger.debug(f"Attempt {attempt}: Successfully fetched URL: {url}")
 
-                    self.logger.info(f"Retrying ({attempt}/{self.config.max_retries}) for URL: {url}")
-                    continue  # Retry for other non-200 status codes
+                    if get_response:
+                        return response
 
-                self.logger.debug(f"Attempt {attempt}: Successfully fetched URL: {url}")
-
-                # Return response if requested
-                if get_response:
-                    return response
-
-                # Process and return content
-                # Collecting all chunks before processing because some sites cause issues with real-time decoding
-                if self.config.max_bandwidth_mb is not None and self.config.max_bandwidth_mb >= 0.2:
-                    raw_content = bytearray()
-                    chunk_size = 64 * 1024 # 64 KB
-                    speed_limit = self.config.max_bandwidth_mb * 1024 * 1024
-                    min_time_per_chunk = chunk_size / speed_limit
-                    start_time = time.time()
-
-                    for chunk in response.iter_bytes(chunk_size=chunk_size):
-                        raw_content.extend(chunk)
-                        elapsed = time.time() - start_time
-                        sleep_time = min_time_per_chunk - elapsed
-                        if sleep_time > 0:
-                            time.sleep(sleep_time)
-
+                    # Process and return content
+                    # Collecting all chunks before processing because some sites cause issues with real-time decoding
+                    if self.config.max_bandwidth_mb is not None and self.config.max_bandwidth_mb >= 0.2:
+                        raw_content = bytearray()
+                        chunk_size = 64 * 1024 # 64 KB
+                        speed_limit = self.config.max_bandwidth_mb * 1024 * 1024
+                        min_time_per_chunk = chunk_size / speed_limit
                         start_time = time.time()
 
-                    raw_content = bytes(raw_content)
+                        for chunk in response.iter_bytes(chunk_size=chunk_size):
+                            raw_content.extend(chunk)
+                            elapsed = time.time() - start_time
+                            sleep_time = min_time_per_chunk - elapsed
+                            if sleep_time > 0:
+                                time.sleep(sleep_time)
+
+                            start_time = time.time()
+
+                        raw_content = bytes(raw_content)
+
+                    else:
+                        raw_content = response.content
+
+                    if get_bytes:
+                        content = raw_content
+
+                    else:
+                        try:
+                            content = raw_content.decode("utf-8")
+
+                        except UnicodeDecodeError:
+                            self.logger.warning(f"Content could not be decoded as utf-8 ({url}), decoding in 'latin1' instead!")
+                            content = raw_content.decode("latin1") # Fallback, hope that works somehow idk
+
+                        if save_cache and not get_bytes:
+                            self.logger.debug(f"Saving content of {url} to local cache.")
+                            self.cache.save_cache(url, content)
+
+                    return content
 
                 else:
-                    raw_content = response.content
-
-                if get_bytes:
-                    content = raw_content
-
-                else:
-                    try:
-                        content = raw_content.decode("utf-8")
-
-                    except UnicodeDecodeError:
-                        self.logger.warning(f"Content could not be decoded as utf-8 ({url}), decoding in 'latin1' instead!")
-                        content = raw_content.decode("latin1") # Fallback, hope that works somehow idk
-
-                    if save_cache and not get_bytes:
-                        self.logger.debug(f"Saving content of {url} to local cache.")
-                        self.cache.save_cache(url, content)
-
-                return content
+                    self.logger.info(f"Retrying ({attempt}/{self.config.max_retries}) for URL: {url}")
+                    continue
 
             except httpx.CloseError:
                 self.logger.error(f"Attempt {attempt}: The connection has been unexpectedly closed by: {url}. Retrying...")
@@ -632,14 +627,19 @@ class BaseCore:
                 raise KillSwitch("Proxy error when trying a request, Aborting!")
 
             except Exception as e:
-                last_error = e
                 self.logger.error(f"Attempt {attempt}: Unexpected error for URL {url}: {traceback.format_exc()}")
                 raise UnknownError(f"Unexpected error for URL {url}: {traceback.format_exc()}")
 
-        self.logger.error(f"Failed to fetch URL {url} after {self.config.max_retries} attempts.")
-        if last_error:
-            pass
-        return None  # Return None if all attempts fail
+        self.logger.error(f"Failed to fetch URL {url} after {self.config.max_retries} attempts. Status code is: ")
+        raise f"""
+Warning: The Network API of my Porn APIs failed to fetch: {url} even after multiple resources.
+If you are sure that the site has not blocked you due to bot protection, you have a stable internet connection,
+you have configured the module correctly and you haven't made too many requests, please submit an error on GitHub under
+the repository: https://github.com/EchterAlsFake/eaf_base_api
+
+You don't need to provide any logs. Just tell me what you did, give me the URL and I will try to replicate it.
+Thank you <3
+"""
 
     @classmethod
     def strip_title(cls, title: str, max_length: int = 255) -> str:
@@ -794,29 +794,23 @@ class BaseCore:
     def threaded(self, max_workers: int = 20, timeout: int = 10):
         def wrapper(self, video, quality: str, callback, path: str, remux: bool = True, callback_remux=None):
             segments = self.get_segments(quality=quality, m3u8_url_master=video.m3u8_base_url)
-            length = len(segments)
+            n = len(segments)
             completed = 0
-            ts_buffers = []
+            parts = [None] * n  # preallocate
 
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                future_to_url = {
-                    executor.submit(self.download_segment, url, timeout): url for url in segments
-                }
-
-                for future in as_completed(future_to_url):
-                    url = future_to_url[future]
+            with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                futures = {ex.submit(self.download_segment, url, timeout): i for i, url in enumerate(segments)}
+                for fut in as_completed(futures):
+                    i = futures[fut]
                     try:
-                        _, data, success = future.result()
-                        completed += 1
+                        _, data, success = fut.result()
                         if success:
-                            ts_buffers.append((segments.index(url), data))
-                        callback(completed, length)
-                    except Exception as e:
-                        self.logger.error(f"Error processing segment {url}: {e}")
-                        raise SegmentError(f"Error processing segment {url}: {e}")
+                            parts[i] = data
+                    finally:
+                        completed += 1
+                        callback(completed, n)
 
-            ts_buffers.sort(key=lambda x: x[0])
-            ts_combined = b''.join(data for _, data in ts_buffers)
+            ts_combined = b"".join(parts)  # linear-time
 
             if remux:
                 tmp_path = f"{path}.tmp"
