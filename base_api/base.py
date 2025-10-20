@@ -11,10 +11,10 @@ import traceback
 import threading
 
 from functools import lru_cache
-from urllib.parse import urljoin
 from email.utils import parsedate_to_datetime
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union, Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import urljoin, urlsplit, urlunparse, urlparse, urlencode, quote, quote_plus, unquote
 
 try:
     from modules.errors import *
@@ -34,6 +34,35 @@ UA_DESKTOP_CHROME = (
 
 loggers = {}
 HEIGHT_FROM_URI = re.compile(r'(?<!\d)(\d{3,4})[pP](?!\d)')  # e.g., 1080p, 720P
+
+
+class ErrorVideo:
+    """
+    Why?:
+
+    Because when working with ThreadPool I give Video objects back, however, if just one video returns on error it will
+    raise the error immediately and thus interrupting the whole ThreadPool and this is just the easiest uncomplexest (does this work in English)
+    idk 'unkomplizierteste' Lösung ähhh solution that I can think of (bruh I need to learn English)
+    """
+    def __init__(self, url: str, err: Exception):
+        self.url = url
+        self._err = err
+
+    def __getattr__(self, _):
+        # Any attribute access surfaces the original error
+        raise self._err
+
+
+def url_parser(base_url, idx, fragments = None):
+    """
+    hours_wasted_here = 1 # Please fill this when doing PRs
+
+    A function to parse URLs and handle pagination. I have no idea if this works and how it works, but
+    let me cook.
+    """
+
+
+
 
 def _height_from_variant(variant) -> Optional[int]:
     """Extract height from a variant:
@@ -544,7 +573,7 @@ class BaseCore:
                         self.logger.info(f"Got 404 once for {url}, retrying in case of transient edge/CDN issue.")
                         continue
                     self.logger.error(f"Resource not found (404) for URL: {url}")
-                    response.raise_for_status()
+                    return response
 
                 # 410: permanent gone
                 if status == 410:
@@ -562,7 +591,7 @@ class BaseCore:
                         continue
                     else:
                         self.logger.error(f"Rate limited (429) after {max_retries} attempts for {url}.")
-                        response.raise_for_status()
+                        return response
 
                 # 5xx: transient server errors — retry until we run out
                 if 500 <= status < 600:
@@ -574,7 +603,7 @@ class BaseCore:
                     self.logger.info(f"HTTP {status} for {url} (attempt {attempt+1}/{max_retries}).")
                     if attempt < max_retries - 1:
                         continue
-                    response.raise_for_status()
+                    return response
 
             except httpx.CloseError:
                 self.logger.error(f"Attempt {attempt}: The connection has been unexpectedly closed by: {url}. Retrying...")
