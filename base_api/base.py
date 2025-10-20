@@ -1,6 +1,7 @@
 import re
 import os
 import sys
+import ssl
 import time
 import m3u8
 import httpx
@@ -9,9 +10,10 @@ import logging
 import traceback
 import threading
 
-from typing import Any, Dict, List, Optional, Union
 from functools import lru_cache
 from urllib.parse import urljoin
+from email.utils import parsedate_to_datetime
+from typing import Any, Dict, List, Optional, Union
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
@@ -24,13 +26,11 @@ except (ModuleNotFoundError, ImportError):
     from .modules.config import config
     from .modules.progress_bars import Callback
 
-user_agents = [
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.1",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.3",
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_12_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/103.0.0.0 Safari/537.3",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0."
-        ]
+UA_DESKTOP_CHROME = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko)"
+    "Chrome/122.0.0.0 Safari/537.36"
+)
 
 loggers = {}
 HEIGHT_FROM_URI = re.compile(r'(?<!\d)(\d{3,4})[pP](?!\d)')  # e.g., 1080p, 720P
@@ -142,97 +142,6 @@ def _pick_by_height(variants: List[Dict[str, Any]], target: int) -> Dict[str, An
 # Default formatter
 formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
-_CF_BODY_MARKERS = (
-    "cf-browser-verification",
-    "cf_chl_",  # legacy CF challenge tokens
-    "challenges.cloudflare.com",  # Turnstile/challenge host
-    "cf-turnstile",  # Turnstile widget
-    "ddos protection by",
-    "just a moment...",
-    "please enable javascript and cookies",
-    "attention required!",
-)
-# Other common WAF/CDN markers
-_OTHER_BODY_MARKERS = (
-    "akamai bot manager",
-    "bm_sz=", "abck=", "ak_bmsc", "ak_bm",                # Akamai cookies
-    "request unsuccessful. incapsula incident id",        # Imperva/Incapsula
-)
-
-def _is_text_html(resp) -> bool:
-    ct = resp.headers.get("content-type", "").lower()
-    return "text/html" in ct or ct == ""  # some sites omit CT but send HTML
-
-def _header_has_any(hdr_val: str, *needles: str) -> bool:
-    s = (hdr_val or "").lower()
-    return any(n in s for n in needles)
-
-def _body_has_any(body: str, markers: tuple) -> bool:
-    b = (body or "").lower()
-    return any(m in b for m in markers)
-
-def _looks_like_challenge(resp) -> str | None:
-    """
-    Return a human-readable reason if the response looks like a bot/WAF challenge.
-    Return None if it looks like a normal page.
-    """
-    status = resp.status_code
-    server = resp.headers.get("server", "")
-    set_cookie = resp.headers.get("set-cookie", "")
-
-    # Collect cheap, header-based indicators first
-    has_cf_cookie = _header_has_any(set_cookie, "__cf_bm", "cf_clearance", "__cf_chl")
-    served_by_cf = _header_has_any(server, "cloudflare")
-    served_by_akamai = _header_has_any(server, "akamai")
-    served_by_incapsula = _header_has_any(server, "incapsula")
-
-    # History-based indicators (redirect to /cdn-cgi/ etc.)
-    history_urls = []
-    try:
-        for h in getattr(resp, "history", []) or []:
-            history_urls.append(str(getattr(h, "url", "")))
-    except Exception:
-        pass
-    redirected_via_cdn_cgi = any("/cdn-cgi/" in u for u in history_urls)
-
-    # Read a *small* slice of the body only if it’s HTML-like
-    body_snippet = ""
-    if _is_text_html(resp):
-        try:
-            # Read up to 20KB to capture challenge markup without huge memory hit
-            text = resp.text
-            body_snippet = text[:20000]
-        except Exception:
-            body_snippet = ""
-
-    has_cf_body_markers = _body_has_any(body_snippet, _CF_BODY_MARKERS)
-    has_other_waf_markers = _body_has_any(body_snippet, _OTHER_BODY_MARKERS)
-
-    # Heuristics:
-    # 1) Hard failure statuses usually mean a challenge/waf
-    if status in (403, 429, 503):
-        if served_by_cf or has_cf_cookie or redirected_via_cdn_cgi or has_cf_body_markers or has_other_waf_markers:
-            return (f"HTTP {status} with WAF indicators "
-                    f"(server={server!r}, cf_cookie={has_cf_cookie}, "
-                    f"cdn_cgi_redirect={redirected_via_cdn_cgi}, body_markers={has_cf_body_markers or has_other_waf_markers})")
-
-    # 2) Status 200 but body is a *challenge/interstitial*
-    #    Require strong evidence in the body or cookies, not just 'Server: cloudflare'.
-    if status == 200:
-        if has_cf_cookie or redirected_via_cdn_cgi or has_cf_body_markers or has_other_waf_markers:
-            return (f"200 OK but challenge content detected "
-                    f"(server={server!r}, cf_cookie={has_cf_cookie}, "
-                    f"cdn_cgi_redirect={redirected_via_cdn_cgi}, body_markers={has_cf_body_markers or has_other_waf_markers})")
-
-    # 3) Generic: if served by a known WAF/CDN and body is *obviously* an interstitial
-    if served_by_cf and has_cf_body_markers:
-        return "Cloudflare challenge markers present in body"
-    if served_by_akamai and has_other_waf_markers:
-        return "Akamai Bot Manager markers present in body"
-    if served_by_incapsula and has_other_waf_markers:
-        return "Imperva/Incapsula challenge markers present in body"
-
-    return None
 
 def is_android():
     """Detects if the script is running on an Android device."""
@@ -243,24 +152,6 @@ def get_log_file_path(filename="app.log"):
     if is_android():
         return os.path.join(os.environ["HOME"], filename)  # Internal app storage
     return filename  # Default for Linux, Windows, Mac
-
-
-# Define ANSI color codes for different log levels
-LOG_COLORS = {
-    'DEBUG': "\033[37m",   # White
-    'INFO': "\033[34m",    # Blue
-    'WARNING': "\033[33m", # Yellow
-    'ERROR': "\033[31m",   # Red
-    'CRITICAL': "\033[41m"  # Red background
-}
-RESET_COLOR = "\033[0m"
-
-
-class ColoredFormatter(logging.Formatter):
-    def format(self, record):
-        log_message = super().format(record)
-        color = LOG_COLORS.get(record.levelname, RESET_COLOR)
-        return f"{color}{log_message}{RESET_COLOR}"
 
 
 def send_log_message(ip, port, message):
@@ -374,47 +265,61 @@ class BaseCore:
     """
     The base class which has all necessary functions for other API packages
     """
-    def __init__(self, config=config, auto_init: bool = True, headers: dict = None):
+    def __init__(self, config=config):
         self.last_request_time = time.time()
-        self.total_requests = 0 # Tracks how many requests have been made
-        self.session = None
+        self.total_requests = 0  # Tracks how many requests have been made
+        self.session: Optional[httpx.Client] = None
         self.kill_switch = False
         self.config = config
         self.cache = Cache(self.config)
         self.logger = setup_logger("BASE API - [BaseCore]", log_file=False, level=logging.ERROR)
-        if auto_init:
-            self.initialize_session(headers)
+        self.default_headers = {
+            "User-Agent": UA_DESKTOP_CHROME,
+            "Accept": (
+                "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                "image/avif,image/webp,*/*;q=0.8"
+            ),
+            "Accept-Language": self.config.locale,
+            "Accept-Encoding": "gzip, deflate, br",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-Dest": "document",
+        }
 
     def enable_logging(self, log_file=None, level=logging.DEBUG, log_ip=None, log_port=None):
-        """
-        Enables logging dynamically for this module.
-        """
+        """Enables logging dynamically for this module."""
         self.logger = setup_logger(name="BASE API - [BaseCore]", log_file=log_file, level=level, http_ip=log_ip, http_port=log_port)
         self.cache.logger = setup_logger(name="BASE API - [Cache]", log_file=log_file, level=level, http_ip=log_ip, http_port=log_port)
 
     def update_cookies(self):
         """Updates cookies dynamically"""
+        if self.session is None:
+            self.initialize_session()
         self.session.cookies.update(self.config.cookies)
 
+    def update_headers(self, key, value):
+        """Updates the headers dynamically"""
+        if self.session is None:
+            self.initialize_session()
+        self.session.headers[key] = value
+
     def enable_kill_switch(self):
-        """This is a function that will check and verify if your proxy is working before every request.
-        As soon as there's a mismatch in the actual response IP and the proxy IP, the program will exit."""
+        """This will verify your proxy before every request. If the proxy doesn't actually proxy, raise KillSwitch."""
         self.kill_switch = True
 
     def check_kill_switch(self):
-        proxy_ip = self.config.proxy
+        proxy_ip = self.config.proxy  # Needs to be a dictionary or URL string per httpx
         pattern = re.compile(
             r'^(?P<scheme>http|socks5)://'
             r'(?:\w+:\w+@)?'  # optional user:pass@
             r'(?P<host>[a-zA-Z0-9.-]+)'
             r':(?P<port>\d{1,5})$'
         )
-
-        match = pattern.match(proxy_ip
-    )
+        match = pattern.match(proxy_ip)
         if match:
             self.logger.info(f"Proxy has valid scheme: {match.group('scheme')} ")
-
         else:
             self.logger.critical("Proxy is INVALID! Exiting.")
             raise InvalidProxy("The Proxy is invalid, all requests will be aborted, please check your configuration!")
@@ -433,38 +338,32 @@ class BaseCore:
             self.logger.critical("IP is the same on both requests... Proxy is not working, exiting!")
             raise KillSwitch("CRITICAL PROXY ERROR, CHECK LOGS!")
 
-
-    def initialize_session(self, headers: dict = None, cookies: dict = None): # Disable SSL verification only if you really need it....
+    def initialize_session(self):
         limits = httpx.Limits(
-            max_connections=getattr(self.config, "max_connections", 64),
+            max_connections=getattr(self.config, "max_connections", 128),
             max_keepalive_connections=getattr(self.config, "max_keepalive", 32),
             keepalive_expiry=60.0,
         )
+        ctx = ssl.create_default_context()
+        if not self.config.verify_ssl:
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
 
         self.session = httpx.Client(
             limits=limits,
-            http2=True,
             proxy=self.config.proxy,
-            timeout=self.config.timeout,
+            timeout=self.config.timeout,  # e.g. 5s on good connections
+            verify=ctx,
+            http2=True,
             follow_redirects=True,
-            verify=self.config.verify_ssl
         )
-
-        self.session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36"})
-
-        if headers:
-            self.session.headers.update(headers)
-
-        if cookies:
-            self.session.cookies.update(cookies)
-
-    def update_headers(self, headers: dict):
-        self.session.headers.update(headers)
+        # Ensure our defaults are on the session
+        self.session.headers.update(self.default_headers)
 
     def enforce_delay(self):
-        """Enforces the specified delay in consts.REQUEST_DELAY"""
+        """Enforces the specified delay in config.request_delay (only if > 0)."""
         delay = self.config.request_delay
-        if delay > 0:
+        if delay and delay > 0:
             time_since_last_request = time.time() - self.last_request_time
             self.logger.debug(f"Time since last request: {time_since_last_request:.2f} seconds.")
             if time_since_last_request < delay:
@@ -473,106 +372,131 @@ class BaseCore:
                 time.sleep(sleep_time)
         self.last_request_time = time.time()
 
-    def fetch(
-            self,
-            url: str,
-            get_bytes: bool = False,
-            timeout: int = None,
-            get_response: bool = False,
-            save_cache: bool = True,
-            cookies: dict = None,
-            allow_redirects: bool = True,
-            bypass_kill_switch: bool = False, # prevents infinite loop
-            data: dict = None,
-            method: str = "GET",
-            headers: dict = None,
-            json: dict = None,
-    ) -> Union[bytes, str, httpx.Response, None]:
+    def _merged_headers(self, override: Optional[Dict[str, str]]) -> Dict[str, str]:
         """
-        Fetches content in UTF-8 Text, Bytes, or as a stream using multiple request attempts,
-        support for proxies and custom timeout.
+        Create request headers from current session headers + optional overrides.
+        Overrides win, session headers are the base.
         """
-        last_error = None
-        timeout = timeout or self.config.timeout
-        content = self.cache.handle_cache(url)
-        if content:
-            self.logger.info(f"Fetched content for: {url} from cache!")
-            return content
+        # Copy to avoid mutating session headers
+        base = self.session.headers.copy()
+        if override:
+            base.update(override)
 
-        for attempt in range(1, self.config.max_retries + 1): # +1 because I feel like it
-            if attempt > 1:
-                sleep_s = min(5.0, 0.4 * (2 ** attempt)) + random.random() * 0.25
-                time.sleep(sleep_s)
+        return base
+
+    def _parse_retry_after(self, response: httpx.Response) -> Optional[float]:
+        """Parse Retry-After (seconds or http-date) into seconds; None if not present/invalid."""
+        v = response.headers.get("Retry-After")
+        if not v:
+            return None
+        try:
+            # numeric seconds
+            return float(v)
+        except ValueError:
+            try:
+                dt = parsedate_to_datetime(v)
+                # Convert to seconds from now
+                delta = (dt - dt.now(dt.tzinfo)).total_seconds()
+                # clamp: negative -> 0
+                return max(0.0, delta)
+            except Exception:
+                return None
+
+    def fetch(
+        self,
+        url: str,
+        get_bytes: bool = False,
+        timeout: Optional[int] = None,
+        get_response: bool = False,
+        save_cache: bool = True,
+        cookies: Optional[Dict[str, str]] = None,
+        allow_redirects: bool = True,
+        bypass_kill_switch: bool = False,  # prevents infinite loop
+        data: Optional[Dict] = None,
+        method: str = "GET",
+        headers: Optional[Dict[str, str]] = None,
+        json: Optional[Dict] = None,
+    ) -> Union[bytes, str, httpx.Response]:
+        """
+        Fetch content with retries, optional caching, proxy support, and bandwidth limiting.
+
+        Returns:
+            - httpx.Response if get_response=True
+            - bytes            if get_bytes=True
+            - str (text)       otherwise
+
+        Raises:
+            - ResourceGone, ProxySSLError, KillSwitch, UnknownError
+            - httpx.HTTPStatusError on unrecoverable HTTP status (e.g., 4xx/5xx after retries, 403/429 exhausted)
+            - httpx.RequestError / Timeout errors may bubble up if not recoverable
+        """
+        if self.session is None:
+            self.initialize_session()
+
+        # Cache (only for text mode)
+        cache_hit = self.cache.handle_cache(url)
+        if cache_hit is not None and not get_bytes and not get_response:
+            self.logger.info(f"Fetched content for: {url} from cache!")
+            return cache_hit
+
+        req_timeout = timeout or self.config.timeout
+        last_response: Optional[httpx.Response] = None
+
+        max_retries = max(1, int(self.config.max_retries))
+        for attempt in range(max_retries):
+            # backoff (attempt 0 has no extra sleep)
+            if attempt >= 1:
+                # capped exponential backoff with jitter
+                base = min(5.0, 0.5 * (2 ** attempt))
+                jitter = random.random() * 0.25  # 0-250ms
+                time.sleep(base + jitter)
 
             try:
+                # Only applies if you explicitly set a delay in config (as you noted)
                 self.enforce_delay()
 
                 if self.kill_switch and not bypass_kill_switch:
                     self.check_kill_switch()
 
-                # Perform the request with stream handling
-                if headers is None:
-                    headers = self.session.headers.copy()
+                # Recompute headers each attempt so changes (like UA switch) take effect
+                req_headers = self._merged_headers(headers)
 
-                response = self.session.request(method=method, url=url, timeout=timeout, cookies=cookies,
-                                     follow_redirects=allow_redirects, data=data, headers=headers, json=json)
+                response = self.session.request(
+                    method=method,
+                    url=url,
+                    timeout=req_timeout,
+                    cookies=cookies,
+                    follow_redirects=allow_redirects,
+                    data=data,
+                    headers=req_headers,
+                    json=json,
+                )
+
+                last_response = response
                 self.total_requests += 1
-                print(f"Response Status Code: {response.status_code}")
+                status = response.status_code
 
-                # NEW: bot/challenge detection
-                reason = _looks_like_challenge(response)
-                if reason:
-                    raise BotProtectionDetected(f"{reason} at {url}")
-
-                if response.status_code == 404:
-                    self.logger.error(f"URL: {url} Resource not found (404). This may indicate the content is unavailable.")
-                    return response  # Return Response object to catch in APIs
-
-                elif response.status_code == 403 and attempt >= 2:
-                    self.logger.error(f"The website rejected access after {attempt} tries. Aborting!")
-                    return None # Return None for forbidden resources
-
-                elif response.status_code == 403:
-                    time.sleep(2) # Somehow fixes 403 on missav idk man
-                    self.session.headers.update({
-                        "User-Agent": random.choice(user_agents)
-                    })
-                    self.logger.warning(f"Switched User agent to: {self.session.headers['User-Agent']}")
-                    continue
-
-                elif response.status_code == 410:
-                    raise ResourceGone(f"Resource: {url} is Gone.")
-
-                elif response.status_code == 429 and attempt >= 4:
-                    raise "You have been rate limited by the website. This issue can't be fixed. Either switch your IP, or wait."
-
-                elif response.status_code == 429:
-                    continue
-
-                elif response.status_code == 200:
+                # Fast path
+                if status == 200:
                     self.logger.debug(f"Attempt {attempt}: Successfully fetched URL: {url}")
 
                     if get_response:
                         return response
 
-                    # Process and return content
-                    # Collecting all chunks before processing because some sites cause issues with real-time decoding
+                    # bandwidth-limited read (optional)
                     if self.config.max_bandwidth_mb is not None and self.config.max_bandwidth_mb >= 0.2:
                         raw_content = bytearray()
-                        chunk_size = 64 * 1024 # 64 KB
+                        chunk_size = 64 * 1024  # 64 KB
                         speed_limit = self.config.max_bandwidth_mb * 1024 * 1024
                         min_time_per_chunk = chunk_size / speed_limit
                         start_time = time.time()
-
                         for chunk in response.iter_bytes(chunk_size=chunk_size):
                             raw_content.extend(chunk)
                             elapsed = time.time() - start_time
                             sleep_time = min_time_per_chunk - elapsed
                             if sleep_time > 0:
                                 time.sleep(sleep_time)
-
                             start_time = time.time()
-
                         raw_content = bytes(raw_content)
 
                     else:
@@ -582,22 +506,75 @@ class BaseCore:
                         content = raw_content
 
                     else:
+                        # Prefer server-provided/guessed encoding; fallback to utf-8 then latin-1
+                        enc = response.encoding or "utf-8"
                         try:
-                            content = raw_content.decode("utf-8")
-
+                            content = raw_content.decode(enc, errors="strict")
                         except UnicodeDecodeError:
-                            self.logger.warning(f"Content could not be decoded as utf-8 ({url}), decoding in 'latin1' instead!")
-                            content = raw_content.decode("latin1") # Fallback, hope that works somehow idk
+                            self.logger.warning(f"Content could not be decoded as {enc} ({url}), decoding in 'latin1' instead!")
+                            content = raw_content.decode("latin1", errors="replace")
 
-                        if save_cache and not get_bytes:
+                        if save_cache:
                             self.logger.debug(f"Saving content of {url} to local cache.")
                             self.cache.save_cache(url, content)
 
                     return content
 
-                else:
-                    self.logger.info(f"Retrying ({attempt}/{self.config.max_retries}) for URL: {url}")
+                # 403 handling: try a UA switch once, then give up
+                if status == 403:
+                    if attempt >= 2:
+                        # sleep briefly then switch UA for the next try
+                        time.sleep(2)
+                        self.session.headers.update({
+                            "User-Agent": "AppleWebKit/537.36 (KHTML, like Gecko)"
+                        })
+                        self.logger.warning(f"Switched User-Agent to: {self.session.headers.get('User-Agent')}")
+                        # continue to retry with new UA
+                        continue
+
+                    else:
+                        # After at least one retry with new UA, fail
+                        msg = f"Forbidden (403) after {attempt+1} attempts for URL: {url}"
+                        self.logger.error(msg)
+                        response.raise_for_status()  # raises HTTPStatusError
+
+                # 404: usually not recoverable, but we try once (if attempt==0) in case of transient CDN
+                if status == 404:
+                    if attempt == 0 and max_retries > 1:
+                        self.logger.info(f"Got 404 once for {url}, retrying in case of transient edge/CDN issue.")
+                        continue
+                    self.logger.error(f"Resource not found (404) for URL: {url}")
+                    response.raise_for_status()
+
+                # 410: permanent gone
+                if status == 410:
+                    raise ResourceGone(f"Resource: {url} is Gone (410).")
+
+                # 429: rate limited — respect Retry-After if present, else backoff and retry up to cap
+                if status == 429:
+                    wait = self._parse_retry_after(response)
+                    if wait is None:
+                        # fall back to exponential backoff proportional to attempt
+                        wait = min(30.0, 0.5 * (2 ** attempt)) + random.random() * 0.5
+                    if attempt < max_retries - 1:
+                        self.logger.warning(f"Rate limited (429). Waiting {wait:.2f}s then retrying ({attempt+1}/{max_retries}) for {url}.")
+                        time.sleep(wait)
+                        continue
+                    else:
+                        self.logger.error(f"Rate limited (429) after {max_retries} attempts for {url}.")
+                        response.raise_for_status()
+
+                # 5xx: transient server errors — retry until we run out
+                if 500 <= status < 600:
+                    self.logger.warning(f"Server error {status} on {url}. Retrying ({attempt+1}/{max_retries})...")
                     continue
+
+                # Other non-200s: let httpx raise a typed error
+                if status != 200:
+                    self.logger.info(f"HTTP {status} for {url} (attempt {attempt+1}/{max_retries}).")
+                    if attempt < max_retries - 1:
+                        continue
+                    response.raise_for_status()
 
             except httpx.CloseError:
                 self.logger.error(f"Attempt {attempt}: The connection has been unexpectedly closed by: {url}. Retrying...")
@@ -605,41 +582,57 @@ class BaseCore:
 
             except (httpx.RequestError, httpx.ConnectError) as e:
                 self.logger.error(f"Attempt {attempt}: Request error for URL {url}: {e}")
-
                 if "CERTIFICATE_VERIFY_FAILED" in str(e):
-                    raise ProxySSLError("Proxy has an invalid SSL certificate, to get around this error, set 'verify = False' in config")
-
-                self.logger.info(f"Retrying ({attempt}/{self.config.max_retries}) for URL: {url}")
-                continue # Continuing even failed requests, because they may succeed on another try (maybe idk)
+                    raise ProxySSLError("Proxy has an invalid SSL certificate, set 'verify = False' in config")
+                # retry unless out of attempts
+                if attempt < max_retries - 1:
+                    self.logger.info(f"Retrying ({attempt+1}/{max_retries}) for URL: {url}")
+                    continue
+                raise
 
             except (httpx.TimeoutException, httpx.ConnectTimeout) as e:
-                self.logger.error(f"Attempt {attempt}: Timeout error for URL {url}: {e}. Please increase your timeout in "
-                                  f"the configuration options to prevent that, or get a stable internet connection ;)")
-                self.logger.info(f"Retrying ({attempt}/{self.config.max_retries}) for URL: {url}")
-                continue
+                self.logger.error(
+                    f"Attempt {attempt}: Timeout for URL {url}: {e}. "
+                    f"Consider increasing the timeout or check your connection."
+                )
+                if attempt < max_retries - 1:
+                    self.logger.info(f"Retrying ({attempt+1}/{max_retries}) for URL: {url}")
+                    continue
+                raise
 
             except httpx.CookieConflict as e:
-                self.logger.error(f"Some cookies are conflicting. Connection aborted! Please report this error immediately -->: {e}")
-                sys.exit(1)
+                self.logger.error(f"Cookie conflict. Aborting this request. Details: {e}")
+                raise UnknownError(f"Cookie conflict during request to {url}: {e}") from e
 
             except httpx.ProxyError as e:
-                self.logger.error(f"Proxy Error, please switch to another Proxy, it seems to be bad -->: {e}")
-                raise KillSwitch("Proxy error when trying a request, Aborting!")
+                self.logger.error(f"Proxy Error for {url}: {e}")
+                raise KillSwitch("Proxy error when trying a request, aborting!") from e
+
+            except ResourceGone:
+                # propagate as-is
+                raise
 
             except Exception as e:
-                self.logger.error(f"Attempt {attempt}: Unexpected error for URL {url}: {traceback.format_exc()}")
-                raise UnknownError(f"Unexpected error for URL {url}: {traceback.format_exc()}")
+                # Preserve original exception context
+                self.logger.error(
+                    f"Attempt {attempt}: Unexpected error for {url}: {e}\n{traceback.format_exc()}"
+                )
+                raise UnknownError(f"Unexpected error for URL {url}: {e}") from e
 
-        self.logger.error(f"Failed to fetch URL {url} after {self.config.max_retries} attempts. Status code is: ")
-        raise f"""
-Warning: The Network API of my Porn APIs failed to fetch: {url} even after multiple resources.
-If you are sure that the site has not blocked you due to bot protection, you have a stable internet connection,
-you have configured the module correctly and you haven't made too many requests, please submit an error on GitHub under
-the repository: https://github.com/EchterAlsFake/eaf_base_api
-
-You don't need to provide any logs. Just tell me what you did, give me the URL and I will try to replicate it.
-Thank you <3
-"""
+        # If we get here, we exhausted retries without returning or raising a httpx status error.
+        self.logger.error(f"Failed to fetch URL {url} after {max_retries} attempts.")
+        if last_response is not None:
+            # Raise a typed error with the last response if we have one.
+            try:
+                last_response.raise_for_status()
+            except httpx.HTTPStatusError as e:
+                raise e
+        # Otherwise raise a generic failure
+        raise UnknownError(
+            f"Failed to fetch: {url} after {max_retries} attempts. "
+            "If you're sure you're not blocked and your connection is stable, "
+            "please open an issue with the URL and steps to reproduce."
+        )
 
     @classmethod
     def strip_title(cls, title: str, max_length: int = 255) -> str:
@@ -732,37 +725,66 @@ Thank you <3
         return [i for i, _ in enumerate(by_bw, start=1)]
 
     def get_segments(self, m3u8_url_master: str, quality: Union[str, int]) -> list:
-        m3u8_url = self.get_m3u8_by_quality(m3u8_url=m3u8_url_master, quality=quality)
-        self.logger.debug(f"Trying to fetch segment from m3u8 -> {m3u8_url}")
-        content = self.fetch(url=m3u8_url)
+        # Resolve the quality-specific playlist URL (may still be a master in some edge cases)
+        playlist_url = self.get_m3u8_by_quality(m3u8_url=m3u8_url_master, quality=quality)
+        self.logger.debug(f"Trying to fetch segment from m3u8 -> {playlist_url}")
 
-        segments = []
-        m3u8_processed = m3u8.loads(content)
+        # M3U8s are volatile → don't cache
+        content = self.fetch(url=playlist_url, save_cache=False)
+        parsed = m3u8.loads(content)
 
-        if m3u8_processed.is_variant:
+        # If we accidentally got a master, pick the first media playlist (existing behavior),
+        # and IMPORTANT: update base_url for urljoin to the *new* playlist URL.
+        base_url = playlist_url
+        if parsed.is_variant:
             self.logger.warning("Media playlist expected; got variant. Resolving to first sub-playlist...")
-            new_m3u8 = urljoin(m3u8_url, m3u8_processed.playlists[0].uri)
-            self.logger.info(f"Resolved to new URL: {new_m3u8}")
-            content = self.fetch(url=new_m3u8)
-            m3u8_processed = m3u8.loads(content)
+            media_rel = parsed.playlists[0].uri
+            media_url = urljoin(playlist_url, media_rel)
+            self.logger.info(f"Resolved to new URL: {media_url}")
+            content = self.fetch(url=media_url, save_cache=False)
+            parsed = m3u8.loads(content)
+            base_url = media_url
 
-        if getattr(m3u8_processed, "segment_map", None):
-            init_uri = m3u8_processed.segment_map[0].uri
-            init_url = urljoin(m3u8_url, init_uri)
+        segments: List[str] = []
+
+        # Robust init segment handling (EXT-X-MAP)
+        # Older m3u8 lib: .segment_map; newer: .init_section
+        init_url = None
+        segmap = getattr(parsed, "segment_map", None)
+        if segmap:
+            try:
+                init_url = urljoin(base_url, segmap[0].uri)
+            except Exception:
+                pass
+        if init_url is None:
+            init_section = getattr(parsed, "init_section", None)
+            if init_section and getattr(init_section, "uri", None):
+                init_url = urljoin(base_url, init_section.uri)
+
+        if init_url:
             segments.append(init_url)
             self.logger.debug(f"Found init segment: {init_url}")
 
-        segments.extend(urljoin(m3u8_url, seg.uri) for seg in m3u8_processed.segments)
+        # Build absolute URLs for all media segments
+        for seg in parsed.segments:
+            segments.append(urljoin(base_url, seg.uri))
+
         self.logger.debug(f"Fetched {len(segments)} segments from m3u8 URL (including init if present)")
         return segments
 
     def download_segment(self, url: str, timeout: int) -> tuple[str, bytes, bool]:
         """
-        Attempt to download a single segment, retrying on failure.
-        Returns a tuple of the URL, content (empty if failed after retries), and a success flag.
+        Attempt to download a single segment.
+        Returns (url, content, success).
         """
-        content = self.fetch(url, timeout=timeout, get_bytes=True)
-        return url, content, True  # Success
+        try:
+            # Segments should not be cached (many unique, large, and short-lived).
+            content = self.fetch(url, timeout=timeout, get_bytes=True, save_cache=False)
+            return url, content, True
+        except Exception as e:
+            # Log and mark failure; the caller will decide whether to retry or abort.
+            self.logger.warning(f"Segment download failed: {url} -> {e}")
+            return url, b"", False
 
     def download(self, video, quality: str, downloader: str, path: str, callback=None, remux: bool = False,
                  callback_remux=None) -> None:
@@ -793,34 +815,97 @@ Thank you <3
 
     def threaded(self, max_workers: int = 20, timeout: int = 10):
         def wrapper(self, video, quality: str, callback, path: str, remux: bool = True, callback_remux=None):
+            """
+            This function has already been optimized a lot and is pretty much perfect in what's possible if we
+            don't go asynchronous. I don't want to go async for multiple reasons:
+            1) Complexity
+            2) I don't want to combine async + Qt
+            3) Gain is only 20-30%
+            4) The site usually throttles us, before we can achieve the maximum potential
+            5) This makes 115MB/s already possible. Why would you go over 1gbit/s?
+            """
+
             segments = self.get_segments(quality=quality, m3u8_url_master=video.m3u8_base_url)
             n = len(segments)
+            if n == 0:
+                raise UnknownError("No segments found for this playlist.")
+
+            # Cap workers to segment count to avoid idle threads
+            workers = max(1, min(max_workers, n))
+
+            # Track which parts are ready; keep bytes in memory only until we flush them to disk
+            parts: List[Optional[bytes]] = [None] * n
+            next_to_write = 0
             completed = 0
-            parts = [None] * n  # preallocate
+            failures = 0
 
-            with ThreadPoolExecutor(max_workers=max_workers) as ex:
-                futures = {ex.submit(self.download_segment, url, timeout): i for i, url in enumerate(segments)}
-                for fut in as_completed(futures):
-                    i = futures[fut]
-                    try:
-                        _, data, success = fut.result()
-                        if success:
+            # Write combined output incrementally to avoid a giant in-memory join
+            tmp_path = f"{path}.tmp"
+            with open(tmp_path, "wb") as out_fp:
+                # Submit all downloads
+                with ThreadPoolExecutor(max_workers=workers) as ex:
+                    futures = {ex.submit(self.download_segment, url, timeout): i for i, url in enumerate(segments)}
+
+                    # Optional: per-segment retry budget (on top of fetch() retries)
+                    seg_retries = [0] * n
+                    max_seg_retries = 2
+
+                    for fut in as_completed(futures):
+                        i = futures[fut]
+                        try:
+                            _, data, success = fut.result()
+                        except Exception as e:
+                            # Defensive: unexpected crash in worker
+                            self.logger.error(f"Worker exception for segment {i}: {e}")
+                            success, data = False, b""
+
+                        if success and data:
                             parts[i] = data
-                    finally:
-                        completed += 1
-                        callback(completed, n)
+                        else:
+                            # Retry this segment a couple more times at the executor level
+                            if seg_retries[i] < max_seg_retries:
+                                seg_retries[i] += 1
+                                # Resubmit and continue without touching progress
+                                futures[ex.submit(self.download_segment, segments[i], timeout)] = i
+                                continue
+                            # Give up on this segment
+                            failures += 1
+                            parts[i] = b""  # placeholder (prevents NoneType issues)
 
-            ts_combined = b"".join(parts)  # linear-time
+                        # After any completion (success or final failure), advance write cursor
+                        while next_to_write < n and parts[next_to_write] is not None:
+                            if parts[next_to_write]:
+                                out_fp.write(parts[next_to_write])
+                            next_to_write += 1
+                            completed += 1
+                            callback(completed, n)
+
+            if failures:
+                # Clean temp file to avoid leaving corrupted output
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
+                raise UnknownError(
+                    f"Failed to download {failures} segments. Try lowering workers or switching downloader=FFMPEG.")
 
             if remux:
-                tmp_path = f"{path}.tmp"
-                with open(tmp_path, 'wb') as file:
-                    file.write(ts_combined)
+                # Reuse your existing converter (atomic replace on success)
                 self._convert_ts_to_mp4(tmp_path, path, callback=callback_remux)
-                os.remove(tmp_path)
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
             else:
-                with open(path, 'wb') as file:
-                    file.write(ts_combined)
+                # Move tmp to final path atomically
+                try:
+                    os.replace(tmp_path, path)
+                except Exception:
+                    # Fallback if replace fails across devices
+                    with open(path, "wb") as final_fp, open(tmp_path, "rb") as in_fp:
+                        for chunk in iter(lambda: in_fp.read(1024 * 1024), b""):
+                            final_fp.write(chunk)
+                    os.remove(tmp_path)
 
         return wrapper
 
@@ -945,8 +1030,8 @@ Thank you <3
             from ffmpeg_progress_yield import FfmpegProgress
 
         except (ModuleNotFoundError, ImportError):
-            raise ModuleNotFoundError("To use FFmpeg progress, you need to install ffmpeg-progress-yield. "
-                                      "You can do so with: `pip install ffmpeg-progress-yield`")
+            raise ModuleNotFoundError("""
+You need to install `ffmpeg-progress-yield` to use the FFmpeg download mode.""")
         base_url = video.m3u8_base_url
         new_segment = self.get_m3u8_by_quality(quality=quality, m3u8_url=base_url)
         url_components = base_url.split('/')
@@ -1068,36 +1153,3 @@ Thank you <3
             error = traceback.format_exc()
             self.logger.error(f"Unknown (network) error for: {url}. Please report this! -->: {error}")
             raise NetworkingError(f"Unknown error for: {url}. Please report this! -->: {error}")
-
-    @classmethod
-    def return_path(cls, video, args) -> str:
-        path = args.output
-        if args.use_title:
-            if not str(path).endswith(os.sep):
-                path += os.sep
-            path += video.title + ".mp4"
-        else:
-            path = args.output
-
-        return path
-
-    def truncate(self, name: str, max_bytes: int = 245) -> str: # only 245, because we need to append .mp4
-        encoded = name.encode("utf-8")
-        if len(encoded) > max_bytes:
-            encoded = encoded[:max_bytes]
-            # Ensure not to cut in middle of a UTF-8 sequence
-            while encoded[-1] & 0b11000000 == 0b10000000:
-                encoded = encoded[:-1]
-            return encoded.decode("utf-8", errors="ignore")
-        return name
-
-    @staticmethod
-    def str_to_bool(value):
-        """
-        This function is needed for the ArgumentParser for the CLI version of my APIs. It basically maps the
-        booleans for the --no-title option to valid Python boolean values.
-        """
-        if value.lower() in ("true", "1", "yes"):
-            return True
-        elif value.lower() in ("false", "0", "no"):
-            return False
