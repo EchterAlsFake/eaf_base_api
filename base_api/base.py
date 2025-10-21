@@ -10,11 +10,12 @@ import logging
 import traceback
 import threading
 
+from itertools import islice
 from functools import lru_cache
+from urllib.parse import urljoin
 from email.utils import parsedate_to_datetime
 from typing import Any, Dict, List, Optional, Union, Callable
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib.parse import urljoin, urlsplit, urlunparse, urlparse, urlencode, quote, quote_plus, unquote
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 
 try:
     from modules.errors import *
@@ -51,17 +52,6 @@ class ErrorVideo:
     def __getattr__(self, _):
         # Any attribute access surfaces the original error
         raise self._err
-
-
-def url_parser(base_url, idx, fragments = None):
-    """
-    hours_wasted_here = 1 # Please fill this when doing PRs
-
-    A function to parse URLs and handle pagination. I have no idea if this works and how it works, but
-    let me cook.
-    """
-
-
 
 
 def _height_from_variant(variant) -> Optional[int]:
@@ -255,6 +245,7 @@ def setup_logger(name, log_file=None, level=logging.CRITICAL, http_ip=None, http
     loggers[name] = logger
     return logger
 
+
 class Cache:
     """
     Caches content from network requests
@@ -289,6 +280,132 @@ class Cache:
                 self.logger.info(f"Deleting: {first_key} from cache, due to caching limits...")
 
             self.cache_dictionary[url] = content
+
+
+class Helper:
+    def __init__(self, core, video):
+        super().__init__()
+        self.core = core
+        self.Video = video
+
+    @staticmethod
+    def chunked(iterable, size):
+        """
+        This function is used to limit page fetching, so that not all pages are fetched at once.
+        """
+        it = iter(iterable)
+        while True:
+            block = list(islice(it, size))
+            if not block:
+                return
+            yield block
+
+    def _get_video(self, url: str):
+        return self.Video(url, core=self.core)
+
+    def _make_video_safe(self, url: str):
+        try:
+            return self.Video(url, core=self.core)
+        except Exception as e:
+            return ErrorVideo(url, e)
+
+    def iterator(self, page_urls: List[str] = None, extractor: Callable = None,
+                 pages_concurrency: int = 5, videos_concurrency: int = 20):
+
+        # Results: (page_idx, vid_idx) -> Video/ErrorVideo
+        results = {}
+        # Count of videos for each site (known after extractor) needed to map videos to their sequence number (to keep them in order)
+        page_counts = {}
+
+        # Tracks the Index of videos, because we need to keep them in the correct order while fetching in parallel
+        next_page_idx = 0
+        next_video_idx = 0
+
+        def flush_ready():
+            nonlocal next_page_idx, next_video_idx # Make the variables accessible from above
+
+            while True:
+                # Stop if we don't know the video count of the next page yet
+                if next_page_idx not in page_counts:
+                    return
+
+                # If the site is finished, move on to the next one (keep the page workers always working)
+                if next_video_idx >= page_counts[next_page_idx]:
+                    next_page_idx += 1
+                    next_video_idx = 0
+                    continue
+
+                key = (next_page_idx, next_video_idx)
+                if key not in results:
+                    return
+
+                yield results.pop(key)
+                next_video_idx += 1
+
+        page_iter = iter(enumerate(page_urls))
+
+        with ThreadPoolExecutor(max_workers=pages_concurrency) as page_executor, \
+             ThreadPoolExecutor(max_workers=videos_concurrency) as video_executor:
+
+            # In-Flight-Maps
+            page_in_flight = {}   # future -> (page_idx, url)
+            video_in_flight = {}  # future -> (page_idx, vid_idx)
+
+            # Get URLs of pages and their index to start fetching
+            for _ in range(pages_concurrency):
+                try:
+                    pidx, url = next(page_iter)
+
+                except StopIteration:
+                    break
+
+                page_in_flight[page_executor.submit(self.core.fetch, url)] = (pidx, url)
+                # These are the results of the fetched pages
+
+            while page_in_flight or video_in_flight:
+                # Waiting for a finished site or a video
+                waiting_on = set(page_in_flight.keys()) | set(video_in_flight.keys())
+                done, _ = wait(waiting_on, return_when=FIRST_COMPLETED)
+
+                for fut in done:
+                    # A site is finished, now extracting the videos
+                    if fut in page_in_flight:
+                        pidx, url = page_in_flight.pop(fut)
+                        html = fut.result() # Get the HTML content
+
+                        # Extract the video URLs from the extractor
+                        video_urls = extractor(html)
+                        # Keep track fo the total count of videos in the current site
+                        page_counts[pidx] = len(video_urls)
+
+                        # Start getting Video objects in parallel, but with the index and URL to keep the correct order
+                        for vid_idx, vurl in enumerate(video_urls):
+                            vf = video_executor.submit(self._make_video_safe, vurl)
+                            video_in_flight[vf] = (pidx, vid_idx)
+
+                        # After start the jobs above, we can already try flushing
+                        yield from flush_ready()
+
+                        # A site is finished, so we fetch the next one
+                        try:
+                            npidx, nurl = next(page_iter)
+                            page_in_flight[page_executor.submit(self.core.fetch, nurl)] = (npidx, nurl)
+                        except StopIteration:
+                            pass
+
+                    # A video is finished, so we save it in the results to flush (return) it later
+                    elif fut in video_in_flight:
+                        pidx, vid_idx = video_in_flight.pop(fut)
+                        try:
+                            results[(pidx, vid_idx)] = fut.result()
+                        except Exception as e:
+                            results[(pidx, vid_idx)] = ErrorVideo(f"<unknown:{pidx}/{vid_idx}>", e)
+
+                        # return the things that are finished
+                        yield from flush_ready()
+
+            # clear anything left (shouldn't happen)
+            yield from flush_ready()
 
 class BaseCore:
     """
@@ -1182,3 +1299,26 @@ You need to install `ffmpeg-progress-yield` to use the FFmpeg download mode.""")
             error = traceback.format_exc()
             self.logger.error(f"Unknown (network) error for: {url}. Please report this! -->: {error}")
             raise NetworkingError(f"Unknown error for: {url}. Please report this! -->: {error}")
+
+
+    def truncate(self, name: str, max_bytes: int = 245) -> str:  # only 245, because we need to append .mp4
+        encoded = name.encode("utf-8")
+        if len(encoded) > max_bytes:
+            encoded = encoded[:max_bytes]
+            # Ensure not to cut in middle of a UTF-8 sequence
+            while encoded[-1] & 0b11000000 == 0b10000000:
+                encoded = encoded[:-1]
+            return encoded.decode("utf-8", errors="ignore")
+        return name
+
+    @staticmethod
+    def str_to_bool(value):
+        """
+        This function is needed for the ArgumentParser for the CLI version of my APIs. It basically maps the
+        booleans for the --no-title option to valid Python boolean values.
+        """
+        if value.lower() in ("true", "1", "yes"):
+            return True
+
+        elif value.lower() in ("false", "0", "no"):
+            return False
