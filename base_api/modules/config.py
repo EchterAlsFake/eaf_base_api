@@ -11,6 +11,7 @@ class RuntimeConfig:
         self.verify_ssl = True
         self.cookies = None
         self.locale = "en-US,en;q=0.9" # If you override this, it could change regexes and thus make stuff not work...
+        self.use_http2 = True
 
 # Singleton instance needed for my Porn Fetch project
 config = RuntimeConfig()

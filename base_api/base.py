@@ -2,6 +2,7 @@ import re
 import os
 import sys
 import ssl
+import uuid
 import time
 import m3u8
 import httpx
@@ -11,10 +12,11 @@ import traceback
 import threading
 
 from itertools import islice
+from collections import deque
 from functools import lru_cache
 from urllib.parse import urljoin
 from email.utils import parsedate_to_datetime
-from typing import Any, Dict, List, Optional, Union, Callable
+from typing import Any, Dict, List, Optional, Union, Callable, Tuple, Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 
 try:
@@ -27,12 +29,7 @@ except (ModuleNotFoundError, ImportError):
     from .modules.config import config
     from .modules.progress_bars import Callback
 
-UA_DESKTOP_CHROME = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko)"
-    "Chrome/122.0.0.0 Safari/537.36"
-)
-
+UA_DESKTOP_CHROME = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 loggers = {}
 HEIGHT_FROM_URI = re.compile(r'(?<!\d)(\d{3,4})[pP](?!\d)')  # e.g., 1080p, 720P
 
@@ -283,129 +280,312 @@ class Cache:
 
 
 class Helper:
-    def __init__(self, core, video):
+    def __init__(
+        self,
+        core,
+        video,
+        *,
+        logger: Optional[logging.Logger] = None,
+        log_name: str = "helper.iterator",
+        log_file: Optional[str] = None,
+        log_level: int = logging.INFO,
+        http_ip: Optional[str] = None,
+        http_port: Optional[int] = None,
+    ):
+        """
+        Args:
+            core: object with .fetch(url) -> html
+            video: callable Video(url, core=...)
+            logger: optional pre-configured logger (if not provided, one is created via setup_logger)
+            log_name/log_file/log_level/http_*: used only when `logger` is None
+        """
         super().__init__()
         self.core = core
         self.Video = video
 
+        if logger is not None:
+            self.logger = logger
+        else:
+            # Create a dedicated, re-usable logger; safe to call multiple times thanks to setup_logger
+            self.logger = setup_logger(
+                name=log_name,
+                log_file=log_file,
+                level=log_level,
+                http_ip=http_ip,
+                http_port=http_port,
+            )
+
     @staticmethod
-    def chunked(iterable, size):
+    def chunked(iterable: Iterable[Any], size: int) -> Iterable[list]:
         """
         This function is used to limit page fetching, so that not all pages are fetched at once.
+        Now with trace logs about chunk formation and exhaustion.
         """
+        if size <= 0:
+            raise ValueError("chunk size must be > 0")
         it = iter(iterable)
+        idx = 0
         while True:
             block = list(islice(it, size))
             if not block:
                 return
+            # Logging kept staticmethod-safe by using root logger to avoid needing self
+            logging.getLogger("helper.iterator").debug(
+                "chunked: yielding block #%d with %d items", idx, len(block)
+            )
+            idx += 1
             yield block
 
     def _get_video(self, url: str):
         return self.Video(url, core=self.core)
 
     def _make_video_safe(self, url: str):
+        # Small helper wrapped with verbose logging
+        logger = self.logger
+        start = time.perf_counter()
         try:
-            return self.Video(url, core=self.core)
+            v = self.Video(url, core=self.core)
+            dur = (time.perf_counter() - start) * 1000
+            logger.debug("video_init ok url=%s (%.2f ms)", url, dur)
+            return v
         except Exception as e:
+            dur = (time.perf_counter() - start) * 1000
+            logger.exception("video_init FAILED url=%s (%.2f ms): %s", url, dur, e)
             return ErrorVideo(url, e)
 
-    def iterator(self, page_urls: List[str] = None, extractor: Callable = None,
-                 pages_concurrency: int = 5, videos_concurrency: int = 20):
+    def iterator(
+            self,
+            page_urls: List[str] = None,
+            extractor: Callable = None,
+            pages_concurrency: int = 5,
+            videos_concurrency: int = 20,
+    ):
+        """
+        Yields Video/ErrorVideo in deterministic (page_idx, vid_idx) order while fetching concurrently.
+        Extremely detailed logs are emitted for: scheduling, completion, ordering, and exceptions.
+        """
+        logger = self.logger
+        run_id = uuid.uuid4().hex[:8]  # correlate all logs for this iterator call
+        t0 = time.perf_counter()
+
+        if page_urls is None:
+            raise ValueError("page_urls must be provided")
+        if extractor is None:
+            raise ValueError("extractor must be provided")
+        if videos_concurrency < 1:
+            raise ValueError("videos_concurrency must be >= 1")  # important to avoid deadlock
+
+        logger.info(
+            "[%s] iterator start pages=%d pages_conc=%d videos_conc=%d",
+            run_id, len(page_urls), pages_concurrency, videos_concurrency
+        )
 
         # Results: (page_idx, vid_idx) -> Video/ErrorVideo
-        results = {}
-        # Count of videos for each site (known after extractor) needed to map videos to their sequence number (to keep them in order)
-        page_counts = {}
+        results: Dict[Tuple[int, int], Any] = {}
+        # Count of videos per page
+        page_counts: Dict[int, int] = {}
 
-        # Tracks the Index of videos, because we need to keep them in the correct order while fetching in parallel
-        next_page_idx = 0
+        next_page_idx = 0  # ordering cursor
         next_video_idx = 0
 
         def flush_ready():
-            nonlocal next_page_idx, next_video_idx # Make the variables accessible from above
-
+            nonlocal next_page_idx, next_video_idx
+            flushed = 0
             while True:
-                # Stop if we don't know the video count of the next page yet
                 if next_page_idx not in page_counts:
+                    if flushed:
+                        logger.debug(
+                            "[%s] flush_ready paused: next_page=%d unknown count; flushed=%d",
+                            run_id, next_page_idx, flushed
+                        )
                     return
-
-                # If the site is finished, move on to the next one (keep the page workers always working)
                 if next_video_idx >= page_counts[next_page_idx]:
+                    logger.debug(
+                        "[%s] page complete pidx=%d total_videos=%d -> advancing",
+                        run_id, next_page_idx, page_counts[next_page_idx]
+                    )
                     next_page_idx += 1
                     next_video_idx = 0
                     continue
 
                 key = (next_page_idx, next_video_idx)
                 if key not in results:
+                    if flushed:
+                        logger.debug(
+                            "[%s] flush_ready stopping: awaiting key=%s; flushed=%d",
+                            run_id, key, flushed
+                        )
                     return
 
-                yield results.pop(key)
+                item = results.pop(key)
+                logger.debug(
+                    "[%s] flush_ready yield pidx=%d vidx=%d (remaining_results=%d)",
+                    run_id, key[0], key[1], len(results)
+                )
+                flushed += 1
                 next_video_idx += 1
+                yield item
 
         page_iter = iter(enumerate(page_urls))
 
         with ThreadPoolExecutor(max_workers=pages_concurrency) as page_executor, \
-             ThreadPoolExecutor(max_workers=videos_concurrency) as video_executor:
+                ThreadPoolExecutor(max_workers=videos_concurrency) as video_executor:
 
-            # In-Flight-Maps
-            page_in_flight = {}   # future -> (page_idx, url)
-            video_in_flight = {}  # future -> (page_idx, vid_idx)
+            page_in_flight: Dict[Any, Tuple[int, str]] = {}  # future -> (page_idx, url)
+            video_in_flight: Dict[Any, Tuple[int, int]] = {}  # future -> (page_idx, vid_idx)
 
-            # Get URLs of pages and their index to start fetching
+            # queue of discovered videos we haven't submitted yet
+            pending_videos: deque[Tuple[int, int, str]] = deque()
+
+            # helper to respect videos_concurrency strictly, otherwise we gonna be rate limited instantly lol
+            def schedule_videos():
+                scheduled = 0
+                while pending_videos and len(video_in_flight) < videos_concurrency:
+                    pidx, vid_idx, vurl = pending_videos.popleft()
+                    vf = video_executor.submit(self._make_video_safe, vurl)
+                    video_in_flight[vf] = (pidx, vid_idx)
+                    scheduled += 1
+                    logger.debug(
+                        "[%s] scheduled VIDEO pidx=%d vidx=%d vurl=%s "
+                        "(inflight_video=%d queued=%d)",
+                        run_id, pidx, vid_idx, vurl, len(video_in_flight), len(pending_videos)
+                    )
+                return scheduled
+
+            # Prime initial page fetches
             for _ in range(pages_concurrency):
                 try:
                     pidx, url = next(page_iter)
-
                 except StopIteration:
                     break
+                fut = page_executor.submit(self.core.fetch, url)
+                page_in_flight[fut] = (pidx, url)
+                logger.debug(
+                    "[%s] scheduled PAGE pidx=%d url=%s (queue=%d)",
+                    run_id, pidx, url, len(page_in_flight)
+                )
 
-                page_in_flight[page_executor.submit(self.core.fetch, url)] = (pidx, url)
-                # These are the results of the fetched pages
+            # Main loop
+            while page_in_flight or video_in_flight or pending_videos:
+                # Fill any free video slots before waiting
+                if pending_videos and len(video_in_flight) < videos_concurrency:
+                    schedule_videos()
 
-            while page_in_flight or video_in_flight:
-                # Waiting for a finished site or a video
                 waiting_on = set(page_in_flight.keys()) | set(video_in_flight.keys())
+                logger.debug(
+                    "[%s] waiting futures page=%d video=%d queued_videos=%d",
+                    run_id, len(page_in_flight), len(video_in_flight), len(pending_videos)
+                )
+
+                # If nothing in flight but items queued (shouldn't happen often), try to schedule then continue
+                if not waiting_on:
+                    # No futures to wait on; try to schedule (covers corner cases)
+                    schedule_videos()
+                    if not (page_in_flight or video_in_flight):
+                        break
+                    waiting_on = set(page_in_flight.keys()) | set(video_in_flight.keys())
+
                 done, _ = wait(waiting_on, return_when=FIRST_COMPLETED)
 
                 for fut in done:
-                    # A site is finished, now extracting the videos
+                    # PAGE completed
                     if fut in page_in_flight:
                         pidx, url = page_in_flight.pop(fut)
-                        html = fut.result() # Get the HTML content
+                        try:
+                            html = fut.result()
+                            logger.info(
+                                "[%s] PAGE done pidx=%d url=%s (inflight_page=%d inflight_video=%d)",
+                                run_id, pidx, url, len(page_in_flight), len(video_in_flight)
+                            )
+                        except Exception as e:
+                            logger.exception(
+                                "[%s] PAGE FAILED pidx=%d url=%s: %s",
+                                run_id, pidx, url, e
+                            )
+                            # mark page as having 0 videos so flush/ordering moves on
+                            page_counts[pidx] = 0
+                            # now-ordered items may be ready
+                            yield from flush_ready()
+                            # schedule next page if available
+                            try:
+                                npidx, nurl = next(page_iter)
+                                nfut = page_executor.submit(self.core.fetch, nurl)
+                                page_in_flight[nfut] = (npidx, nurl)
+                                logger.debug(
+                                    "[%s] scheduled NEXT PAGE pidx=%d url=%s after failure",
+                                    run_id, npidx, nurl
+                                )
+                            except StopIteration:
+                                pass
+                            continue
 
-                        # Extract the video URLs from the extractor
-                        video_urls = extractor(html)
-                        # Keep track fo the total count of videos in the current site
+                        # Extract video URLs
+                        try:
+                            video_urls = extractor(html) or []
+                            logger.debug(
+                                "[%s] extractor ok pidx=%d urls=%d",
+                                run_id, pidx, len(video_urls)
+                            )
+                        except Exception as e:
+                            logger.exception(
+                                "[%s] extractor FAILED pidx=%d url=%s: %s",
+                                run_id, pidx, url, e
+                            )
+                            video_urls = []
+
                         page_counts[pidx] = len(video_urls)
+                        logger.info(
+                            "[%s] PAGE indexed pidx=%d video_count=%d",
+                            run_id, pidx, page_counts[pidx]
+                        )
 
-                        # Start getting Video objects in parallel, but with the index and URL to keep the correct order
+                        # NEW: queue videos instead of submitting all at once
                         for vid_idx, vurl in enumerate(video_urls):
-                            vf = video_executor.submit(self._make_video_safe, vurl)
-                            video_in_flight[vf] = (pidx, vid_idx)
+                            pending_videos.append((pidx, vid_idx, vurl))
+                        # Fill available slots respecting videos_concurrency
+                        schedule_videos()
 
-                        # After start the jobs above, we can already try flushing
+                        # Try flushing any now-ready items
                         yield from flush_ready()
 
-                        # A site is finished, so we fetch the next one
+                        # Fetch next page
                         try:
                             npidx, nurl = next(page_iter)
-                            page_in_flight[page_executor.submit(self.core.fetch, nurl)] = (npidx, nurl)
+                            nfut = page_executor.submit(self.core.fetch, nurl)
+                            page_in_flight[nfut] = (npidx, nurl)
+                            logger.debug(
+                                "[%s] scheduled NEXT PAGE pidx=%d url=%s (inflight_page=%d)",
+                                run_id, npidx, nurl, len(page_in_flight)
+                            )
                         except StopIteration:
-                            pass
+                            logger.debug("[%s] no more pages to schedule", run_id)
 
-                    # A video is finished, so we save it in the results to flush (return) it later
+                    # VIDEO completed
                     elif fut in video_in_flight:
                         pidx, vid_idx = video_in_flight.pop(fut)
                         try:
-                            results[(pidx, vid_idx)] = fut.result()
+                            val = fut.result()
+                            results[(pidx, vid_idx)] = val
+                            logger.debug(
+                                "[%s] VIDEO done pidx=%d vidx=%d (inflight_video=%d results_cached=%d)",
+                                run_id, pidx, vid_idx, len(video_in_flight), len(results)
+                            )
                         except Exception as e:
+                            logger.exception(
+                                "[%s] VIDEO FAILED pidx=%d vidx=%d: %s",
+                                run_id, pidx, vid_idx, e
+                            )
                             results[(pidx, vid_idx)] = ErrorVideo(f"<unknown:{pidx}/{vid_idx}>", e)
 
-                        # return the things that are finished
+                        # Flush ordered results, then backfill video slots
                         yield from flush_ready()
+                        schedule_videos()
 
-            # clear anything left (shouldn't happen)
+            # Final flush (should be no-ops, but logged for completeness)
+            logger.debug("[%s] final flush start", run_id)
             yield from flush_ready()
+            total_ms = (time.perf_counter() - t0) * 1000
+            logger.info("[%s] iterator complete in %.2f ms", run_id, total_ms)
 
 class BaseCore:
     """
@@ -421,35 +601,14 @@ class BaseCore:
         self.logger = setup_logger("BASE API - [BaseCore]", log_file=False, level=logging.ERROR)
         self.default_headers = {
             "User-Agent": UA_DESKTOP_CHROME,
-            "Accept": (
-                "text/html,application/xhtml+xml,application/xml;q=0.9,"
-                "image/avif,image/webp,*/*;q=0.8"
-            ),
             "Accept-Language": self.config.locale,
-            "Accept-Encoding": "gzip, deflate, br",
-            "Cache-Control": "no-cache",
-            "Pragma": "no-cache",
-            "Sec-Fetch-Mode": "navigate",
-            "Sec-Fetch-Site": "none",
-            "Sec-Fetch-Dest": "document",
+            "Accept-Encoding": "gzip, deflate, br"
         }
 
     def enable_logging(self, log_file=None, level=logging.DEBUG, log_ip=None, log_port=None):
         """Enables logging dynamically for this module."""
         self.logger = setup_logger(name="BASE API - [BaseCore]", log_file=log_file, level=level, http_ip=log_ip, http_port=log_port)
         self.cache.logger = setup_logger(name="BASE API - [Cache]", log_file=log_file, level=level, http_ip=log_ip, http_port=log_port)
-
-    def update_cookies(self):
-        """Updates cookies dynamically"""
-        if self.session is None:
-            self.initialize_session()
-        self.session.cookies.update(self.config.cookies)
-
-    def update_headers(self, key, value):
-        """Updates the headers dynamically"""
-        if self.session is None:
-            self.initialize_session()
-        self.session.headers[key] = value
 
     def enable_kill_switch(self):
         """This will verify your proxy before every request. If the proxy doesn't actually proxy, raise KillSwitch."""
@@ -499,8 +658,8 @@ class BaseCore:
             limits=limits,
             proxy=self.config.proxy,
             timeout=self.config.timeout,  # e.g. 5s on good connections
+            http2=self.config.use_http2,
             verify=ctx,
-            http2=True,
             follow_redirects=True,
         )
         # Ensure our defaults are on the session
@@ -518,17 +677,17 @@ class BaseCore:
                 time.sleep(sleep_time)
         self.last_request_time = time.time()
 
-    def _merged_headers(self, override: Optional[Dict[str, str]]) -> Dict[str, str]:
+    def _merged_headers(self, override: Optional[Dict[str, str]]) -> None:
         """
         Create request headers from current session headers + optional overrides.
         Overrides win, session headers are the base.
         """
         # Copy to avoid mutating session headers
-        base = self.session.headers.copy()
-        if override:
-            base.update(override)
+        self.session.headers.update(override)
 
-        return base
+    def _merged_cookies(self, override: Optional[Dict[str, str]]) -> None:
+        """Same as above, but for cookies"""
+        self.session.cookies.update(override)
 
     def _parse_retry_after(self, response: httpx.Response) -> Optional[float]:
         """Parse Retry-After (seconds or http-date) into seconds; None if not present/invalid."""
@@ -605,17 +764,18 @@ class BaseCore:
                     self.check_kill_switch()
 
                 # Recompute headers each attempt so changes (like UA switch) take effect
-                req_headers = self._merged_headers(headers)
+                self._merged_headers(headers)
+                self._merged_cookies(cookies)
+                self.logger.debug(f"Using Headers: {self.session.headers}")
+                self.logger.debug(f"Using Cookies: {self.session.cookies}")
 
                 response = self.session.request(
                     method=method,
                     url=url,
                     timeout=req_timeout,
-                    cookies=cookies,
                     follow_redirects=allow_redirects,
                     data=data,
-                    headers=req_headers,
-                    json=json,
+                    json=json
                 )
 
                 last_response = response
@@ -668,7 +828,7 @@ class BaseCore:
 
                 # 403 handling: try a UA switch once, then give up
                 if status == 403:
-                    if attempt >= 2:
+                    if attempt == 0 or attempt == 1:
                         # sleep briefly then switch UA for the next try
                         time.sleep(2)
                         self.session.headers.update({
@@ -713,6 +873,15 @@ class BaseCore:
                 # 5xx: transient server errors — retry until we run out
                 if 500 <= status < 600:
                     self.logger.warning(f"Server error {status} on {url}. Retrying ({attempt+1}/{max_retries})...")
+                    try:
+                        from fake_useragent import UserAgent
+                        ua = UserAgent().random
+                        self.logger.warning(f"Changed User Agent to: {ua}")
+                        self.session.headers.update({"User-Agent": ua})
+
+                    except ModuleNotFoundError:
+                        self.logger.warning("Couldn't change user agent, because you don't have fake-useragent installed. This is NOT an error.")
+
                     continue
 
                 # Other non-200s: let httpx raise a typed error
