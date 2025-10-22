@@ -658,8 +658,8 @@ class BaseCore:
     def initialize_session(self):
         limits = httpx.Limits(
             max_connections=getattr(self.config, "max_connections", 128),
-            max_keepalive_connections=getattr(self.config, "max_keepalive", 32),
-            keepalive_expiry=60.0,
+            max_keepalive_connections=getattr(self.config, "max_keepalive", 4),
+            keepalive_expiry=10,
         )
         ctx = ssl.create_default_context()
         if not self.config.verify_ssl:
@@ -870,6 +870,12 @@ class BaseCore:
 
                 # 429: rate limited — respect Retry-After if present, else backoff and retry up to cap
                 if status == 429:
+                    if attempt == 0 or attempt == 1:
+                        self.logger.info("Trying 429 bypass (Initializing new session...)")
+                        del self.session
+                        self.initialize_session()
+                        continue
+
                     wait = self._parse_retry_after(response)
                     if wait is None:
                         # fall back to exponential backoff proportional to attempt
