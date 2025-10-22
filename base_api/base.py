@@ -291,6 +291,7 @@ class Helper:
         log_level: int = logging.INFO,
         http_ip: Optional[str] = None,
         http_port: Optional[int] = None,
+        other: Optional[Callable] = None
     ):
         """
         Args:
@@ -302,6 +303,7 @@ class Helper:
         super().__init__()
         self.core = core
         self.Video = video
+        self.OtherReturn = other
 
         if logger is not None:
             self.logger = logger
@@ -339,6 +341,10 @@ class Helper:
     def _get_video(self, url: str):
         return self.Video(url, core=self.core)
 
+    def _other_return(self, url: str):
+        """In rare cases e.g., Xhamster we don't always return video objects with the iterator"""
+        return self.OtherReturn(url, core=self.core)
+
     def _make_video_safe(self, url: str):
         # Small helper wrapped with verbose logging
         logger = self.logger
@@ -359,6 +365,7 @@ class Helper:
             extractor: Callable = None,
             pages_concurrency: int = 5,
             videos_concurrency: int = 20,
+            other_return: bool = False,
     ):
         """
         Yields Video/ErrorVideo in deterministic (page_idx, vid_idx) order while fetching concurrently.
@@ -442,7 +449,12 @@ class Helper:
                 scheduled = 0
                 while pending_videos and len(video_in_flight) < videos_concurrency:
                     pidx, vid_idx, vurl = pending_videos.popleft()
-                    vf = video_executor.submit(self._make_video_safe, vurl)
+                    if other_return:
+                        vf = video_executor.submit(self._other_return, vurl)
+
+                    else:
+                        vf = video_executor.submit(self._make_video_safe, vurl)
+
                     video_in_flight[vf] = (pidx, vid_idx)
                     scheduled += 1
                     logger.debug(
