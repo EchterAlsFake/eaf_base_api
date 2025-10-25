@@ -872,7 +872,6 @@ class BaseCore:
                 if status == 429:
                     if attempt == 0 or attempt == 1:
                         self.logger.info("Trying 429 bypass (Initializing new session...)")
-                        del self.session
                         self.initialize_session()
                         continue
 
