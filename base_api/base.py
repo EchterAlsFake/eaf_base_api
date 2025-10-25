@@ -1120,7 +1120,7 @@ class BaseCore:
             return url, b"", False
 
     def download(self, video, quality: str, downloader: str, path: str, callback=None, remux: bool = False,
-                 callback_remux=None) -> None:
+                 callback_remux=None, max_workers_download: int = 20) -> None:
         """
         :param video:
         :param callback:
@@ -1129,8 +1129,10 @@ class BaseCore:
         :param path:
         :param remux:
         :param callback_remux:
+        :param max_workers_download:
         :return:
         """
+        max_workers_download = max_workers_download or self.config.max_workers_download
 
         if callback is None:
             callback = Callback.text_progress_bar
@@ -1139,14 +1141,14 @@ class BaseCore:
             self.default(video=video, quality=quality, path=path, callback=callback, remux=remux, callback_remux=callback_remux)
 
         elif downloader == "threaded":
-            threaded_download = self.threaded(max_workers=20, timeout=10)
+            threaded_download = self.threaded(max_workers=max_workers_download, timeout=self.config.timeout)
             threaded_download(self, video=video, quality=quality, path=path, callback=callback, remux=remux,
                               callback_remux=callback_remux)
 
         elif downloader == "FFMPEG":
             self.FFMPEG(video=video, quality=quality, path=path, callback=callback)
 
-    def threaded(self, max_workers: int = 20, timeout: int = 10):
+    def threaded(self, max_workers: int, timeout: int):
         def wrapper(self, video, quality: str, callback, path: str, remux: bool = True, callback_remux=None):
             """
             This function has already been optimized a lot and is pretty much perfect in what's possible if we

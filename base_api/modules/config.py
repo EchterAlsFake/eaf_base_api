@@ -12,6 +12,10 @@ class RuntimeConfig:
         self.cookies = None
         self.locale = "en-US,en;q=0.9" # If you override this, it could change regexes and thus make stuff not work...
         self.use_http2 = True
+        self.max_workers_download = 20
+        self.videos_concurrency = 5
+        self.pages_concurrency = 2
+
 
 # Singleton instance needed for my Porn Fetch project
 config = RuntimeConfig()
