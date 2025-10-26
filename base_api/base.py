@@ -7,6 +7,7 @@ import time
 import m3u8
 import httpx
 import random
+import certifi
 import logging
 import traceback
 import threading
@@ -696,7 +697,7 @@ class BaseCore:
             max_keepalive_connections=getattr(self.config, "max_keepalive", 4),
             keepalive_expiry=10,
         )
-        ctx = ssl.create_default_context()
+        ctx = ssl.create_default_context(cafile=certifi.where())
         if not self.config.verify_ssl:
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
