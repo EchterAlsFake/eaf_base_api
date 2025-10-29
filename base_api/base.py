@@ -7,6 +7,7 @@ import time
 import m3u8
 import httpx
 import random
+import certifi
 import logging
 import traceback
 import threading
@@ -400,7 +401,7 @@ class Helper:
     ):
         """
         Yields Video/ErrorVideo in deterministic (page_idx, vid_idx) order while fetching concurrently.
-        Extremely detailed logs are emitted for: scheduling, completion, ordering, and exceptions.
+        Stops scraping pages once a 404 page is encountered (self.core.fetch returns an httpx.Response).
         """
         logger = self.logger
         run_id = uuid.uuid4().hex[:8]  # correlate all logs for this iterator call
@@ -425,6 +426,10 @@ class Helper:
 
         next_page_idx = 0  # ordering cursor
         next_video_idx = 0
+
+        # NEW: stop paging after first 404
+        stop_after_404 = False
+        stop_at_page_idx: Optional[int] = None
 
         def flush_ready():
             nonlocal next_page_idx, next_video_idx
@@ -475,17 +480,15 @@ class Helper:
             # queue of discovered videos we haven't submitted yet
             pending_videos: deque[Tuple[int, int, str]] = deque()
 
-            # helper to respect videos_concurrency strictly, otherwise we gonna be rate limited instantly lol
+            # helper to respect videos_concurrency strictly
             def schedule_videos():
                 scheduled = 0
                 while pending_videos and len(video_in_flight) < videos_concurrency:
                     pidx, vid_idx, vurl = pending_videos.popleft()
                     if other_return:
                         vf = video_executor.submit(self._other_return, vurl)
-
                     else:
                         vf = video_executor.submit(self._make_video_safe, vurl)
-
                     video_in_flight[vf] = (pidx, vid_idx)
                     scheduled += 1
                     logger.debug(
@@ -522,7 +525,6 @@ class Helper:
 
                 # If nothing in flight but items queued (shouldn't happen often), try to schedule then continue
                 if not waiting_on:
-                    # No futures to wait on; try to schedule (covers corner cases)
                     schedule_videos()
                     if not (page_in_flight or video_in_flight):
                         break
@@ -535,7 +537,7 @@ class Helper:
                     if fut in page_in_flight:
                         pidx, url = page_in_flight.pop(fut)
                         try:
-                            html = fut.result()
+                            html_or_resp = fut.result()
                             logger.info(
                                 "[%s] PAGE done pidx=%d url=%s (inflight_page=%d inflight_video=%d)",
                                 run_id, pidx, url, len(page_in_flight), len(video_in_flight)
@@ -549,20 +551,56 @@ class Helper:
                             page_counts[pidx] = 0
                             # now-ordered items may be ready
                             yield from flush_ready()
-                            # schedule next page if available
-                            try:
-                                npidx, nurl = next(page_iter)
-                                nfut = page_executor.submit(self.core.fetch, nurl)
-                                page_in_flight[nfut] = (npidx, nurl)
-                                logger.debug(
-                                    "[%s] scheduled NEXT PAGE pidx=%d url=%s after failure",
-                                    run_id, npidx, nurl
-                                )
-                            except StopIteration:
-                                pass
+                            # schedule next page if available (unless we've already stopped)
+                            if not stop_after_404:
+                                try:
+                                    npidx, nurl = next(page_iter)
+                                    nfut = page_executor.submit(self.core.fetch, nurl)
+                                    page_in_flight[nfut] = (npidx, nurl)
+                                    logger.debug(
+                                        "[%s] scheduled NEXT PAGE pidx=%d url=%s after failure",
+                                        run_id, npidx, nurl
+                                    )
+                                except StopIteration:
+                                    pass
                             continue
 
-                        # Extract video URLs
+                        # Detect a 404 "page" (httpx.Response returned)
+                        is_404 = False
+                        try:
+                            if isinstance(html_or_resp, httpx.Response) and html_or_resp.status_code == 404:
+                                is_404 = True
+                        except Exception:
+                            # Fallback duck-typing if httpx import fails for some reason
+                            if getattr(html_or_resp, "status_code", None) == 404 and hasattr(html_or_resp, "headers"):
+                                is_404 = True
+
+                        if is_404:
+                            logger.warning(
+                                "[%s] PAGE 404 pidx=%d url=%s -> stopping further page scheduling",
+                                run_id, pidx, url
+                            )
+                            stop_after_404 = True
+                            stop_at_page_idx = pidx
+                            # 404 page has 0 videos
+                            page_counts[pidx] = 0
+                            # Flush anything now ready
+                            yield from flush_ready()
+                            # Do NOT schedule any more pages
+                            continue
+
+                        # If we've already hit a 404 and this page index is after it, ignore this page
+                        if stop_after_404 and stop_at_page_idx is not None and pidx > stop_at_page_idx:
+                            logger.info(
+                                "[%s] ignoring PAGE pidx=%d url=%s (after first 404 at pidx=%d)",
+                                run_id, pidx, url, stop_at_page_idx
+                            )
+                            page_counts[pidx] = 0
+                            yield from flush_ready()
+                            continue
+
+                        # Normal path: Extract video URLs
+                        html = html_or_resp
                         try:
                             video_urls = extractor(html) or []
                             logger.debug(
@@ -582,26 +620,24 @@ class Helper:
                             run_id, pidx, page_counts[pidx]
                         )
 
-                        # NEW: queue videos instead of submitting all at once
                         for vid_idx, vurl in enumerate(video_urls):
                             pending_videos.append((pidx, vid_idx, vurl))
-                        # Fill available slots respecting videos_concurrency
                         schedule_videos()
 
-                        # Try flushing any now-ready items
                         yield from flush_ready()
 
-                        # Fetch next page
-                        try:
-                            npidx, nurl = next(page_iter)
-                            nfut = page_executor.submit(self.core.fetch, nurl)
-                            page_in_flight[nfut] = (npidx, nurl)
-                            logger.debug(
-                                "[%s] scheduled NEXT PAGE pidx=%d url=%s (inflight_page=%d)",
-                                run_id, npidx, nurl, len(page_in_flight)
-                            )
-                        except StopIteration:
-                            logger.debug("[%s] no more pages to schedule", run_id)
+                        # Fetch next page only if we haven't seen a 404
+                        if not stop_after_404:
+                            try:
+                                npidx, nurl = next(page_iter)
+                                nfut = page_executor.submit(self.core.fetch, nurl)
+                                page_in_flight[nfut] = (npidx, nurl)
+                                logger.debug(
+                                    "[%s] scheduled NEXT PAGE pidx=%d url=%s (inflight_page=%d)",
+                                    run_id, npidx, nurl, len(page_in_flight)
+                                )
+                            except StopIteration:
+                                logger.debug("[%s] no more pages to schedule", run_id)
 
                     # VIDEO completed
                     elif fut in video_in_flight:
@@ -692,7 +728,7 @@ class BaseCore:
             max_keepalive_connections=getattr(self.config, "max_keepalive", 4),
             keepalive_expiry=10,
         )
-        ctx = ssl.create_default_context()
+        ctx = ssl.create_default_context(cafile=certifi.where())
         if not self.config.verify_ssl:
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
@@ -889,11 +925,7 @@ class BaseCore:
 
                 # 404: usually not recoverable, but we try once (if attempt==0) in case of transient CDN
                 if status == 404:
-                    if attempt == 0 and max_retries > 1:
-                        self.logger.info(f"Got 404 once for {url}, retrying in case of transient edge/CDN issue.")
-                        continue
-                    self.logger.error(f"Resource not found (404) for URL: {url}")
-                    return response
+                    return response # Immediately returning response, because 404 usually means no more content when searching
 
                 # 410: permanent gone
                 if status == 410:
@@ -1318,85 +1350,90 @@ class BaseCore:
             raise ModuleNotFoundError(f"PyAV is required for remuxing. Install with pip install av. Not supported on Termux! {e}")
 
         input_ = av_open(input_path)
-        output = av_open(output_path, mode="w", format="mp4", options={"movflags": "faststart"})
+        if input_.format.name.lower() == "mpegts":
+            output = av_open(output_path, mode="w", format="mp4", options={"movflags": "faststart"})
 
-        # --- VIDEO: keep your exact remux approach ---
-        in_video = input_.streams.video[0]
-        out_video = output.add_stream_from_template(template=in_video)
+            # --- VIDEO: keep your exact remux approach ---
+            in_video = input_.streams.video[0]
+            out_video = output.add_stream_from_template(template=in_video)
 
-        # --- AUDIO: copy if MP4-compatible; else transcode to AAC ---
-        in_audio = next((s for s in input_.streams if s.type == "audio"), None)
-        out_audio = None
-        transcode_audio = False
-        resampler = None
+            # --- AUDIO: copy if MP4-compatible; else transcode to AAC ---
+            in_audio = next((s for s in input_.streams if s.type == "audio"), None)
+            out_audio = None
+            transcode_audio = False
+            resampler = None
 
-        if in_audio:
-            # Common MP4-safe audio codecs to copy without transcoding.
-            copy_ok = {"aac", "alac", "mp3"}
-            codec_name = (in_audio.codec_context.name or "").lower()
+            if in_audio:
+                # Common MP4-safe audio codecs to copy without transcoding.
+                copy_ok = {"aac", "alac", "mp3"}
+                codec_name = (in_audio.codec_context.name or "").lower()
 
-            if codec_name in copy_ok:
-                out_audio = output.add_stream_from_template(template=in_audio)
-            else:
-                # Build an AAC encoder stream. Match input rate/layout where possible.
-                transcode_audio = True
-                sample_rate = in_audio.codec_context.sample_rate or 48000
-                layout = (
-                    in_audio.codec_context.layout.name
-                    if getattr(in_audio.codec_context, "layout", None)
-                    else "stereo"
-                )
-                out_audio = output.add_stream("aac", rate=sample_rate)
-                # Setting layout/channels helps encoder pick sensible defaults.
-                try:
-                    out_audio.layout = layout
-                except Exception:
-                    pass
+                if codec_name in copy_ok:
+                    out_audio = output.add_stream_from_template(template=in_audio)
+                else:
+                    # Build an AAC encoder stream. Match input rate/layout where possible.
+                    transcode_audio = True
+                    sample_rate = in_audio.codec_context.sample_rate or 48000
+                    layout = (
+                        in_audio.codec_context.layout.name
+                        if getattr(in_audio.codec_context, "layout", None)
+                        else "stereo"
+                    )
+                    out_audio = output.add_stream("aac", rate=sample_rate)
+                    # Setting layout/channels helps encoder pick sensible defaults.
+                    try:
+                        out_audio.layout = layout
+                    except Exception:
+                        pass
 
-                # Ensure frames handed to the AAC encoder are in a compatible sample format.
-                # ('fltp' is the usual format for AAC encoders.)
-                resampler = AudioResampler(format="fltp", layout=layout, rate=sample_rate)
+                    # Ensure frames handed to the AAC encoder are in a compatible sample format.
+                    # ('fltp' is the usual format for AAC encoders.)
+                    resampler = AudioResampler(format="fltp", layout=layout, rate=sample_rate)
 
-            # --- DEMUX both streams so audio is included ---
-        demux_streams = [in_video] + ([in_audio] if in_audio else [])
-        packets = list(input_.demux(demux_streams))  # keeps your progress logic
-        total = len(packets)
+                # --- DEMUX both streams so audio is included ---
+            demux_streams = [in_video] + ([in_audio] if in_audio else [])
+            packets = list(input_.demux(demux_streams))  # keeps your progress logic
+            total = len(packets)
 
-        for idx, packet in enumerate(packets):
-            if packet.dts is None:
+            for idx, packet in enumerate(packets):
+                if packet.dts is None:
+                    if callback:
+                        callback(idx + 1, total)
+                    continue
+
+                if packet.stream == in_video:
+                    # Your original video remux path (no explicit rescale).
+                    packet.stream = out_video
+                    output.mux(packet)
+
+                elif in_audio and packet.stream == in_audio:
+                    if not transcode_audio:
+                        # Audio is already MP4-compatible; just remux.
+                        packet.stream = out_audio
+                        output.mux(packet)
+                    else:
+                        # Decode -> (optionally resample) -> encode AAC -> mux.
+                        for frame in packet.decode():
+                            # Resample to match encoder expectations.
+                            frames = resampler.resample(frame) if resampler else [frame]
+                            for f in frames:
+                                for enc_pkt in out_audio.encode(f):
+                                    output.mux(enc_pkt)
+
                 if callback:
                     callback(idx + 1, total)
-                continue
 
-            if packet.stream == in_video:
-                # Your original video remux path (no explicit rescale).
-                packet.stream = out_video
-                output.mux(packet)
+            # Flush audio encoder if we transcoded.
+            if transcode_audio and out_audio:
+                for enc_pkt in out_audio.encode(None):
+                    output.mux(enc_pkt)
 
-            elif in_audio and packet.stream == in_audio:
-                if not transcode_audio:
-                    # Audio is already MP4-compatible; just remux.
-                    packet.stream = out_audio
-                    output.mux(packet)
-                else:
-                    # Decode -> (optionally resample) -> encode AAC -> mux.
-                    for frame in packet.decode():
-                        # Resample to match encoder expectations.
-                        frames = resampler.resample(frame) if resampler else [frame]
-                        for f in frames:
-                            for enc_pkt in out_audio.encode(f):
-                                output.mux(enc_pkt)
+            input_.close()
+            output.close()
 
-            if callback:
-                callback(idx + 1, total)
-
-        # Flush audio encoder if we transcoded.
-        if transcode_audio and out_audio:
-            for enc_pkt in out_audio.encode(None):
-                output.mux(enc_pkt)
-
-        input_.close()
-        output.close()
+        else:
+            self.logger.info("Stream seems to be already in MP4! Skipping remux...")
+            os.rename(input_path, output_path)
 
     def FFMPEG(self, video, quality: str, callback, path: str) -> bool:
         try:
