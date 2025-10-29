@@ -34,6 +34,37 @@ loggers = {}
 HEIGHT_FROM_URI = re.compile(r'(?<!\d)(\d{3,4})[pP](?!\d)')  # e.g., 1080p, 720P
 
 
+def _normalize_quality_value(q) -> Union[str, int]:
+    if isinstance(q, int):
+        return q
+    s = str(q).lower().strip()
+    if s in {"best", "half", "worst"}:
+        return s
+    m = re.search(r'(\d{3,4})', s)
+    if m:
+        return int(m.group(1))
+    raise ValueError(f"Invalid quality: {q}")
+
+
+def _choose_quality_from_list(available: List[str | int], target: Union[str, int]):
+    # available like ["240", "360", "480", "720", "1080"]
+    av = sorted({int(x) for x in available})
+    if isinstance(target, str):
+        if target == "best":
+            return av[-1]
+        if target == "worst":
+            return av[0]
+        if target == "half":
+            return av[len(av) // 2]
+        raise ValueError("Invalid label.")
+    # numeric: highest ≤ target, else closest
+    le = [h for h in av if h <= target]
+    if le:
+        return le[-1]
+    # fallback closest (ties -> higher)
+    return min(av, key=lambda h: (abs(h - target), -h))
+
+
 class ErrorVideo:
     """
     Why?:
@@ -1178,41 +1209,49 @@ class BaseCore:
             with open(tmp_path, "wb") as out_fp:
                 # Submit all downloads
                 with ThreadPoolExecutor(max_workers=workers) as ex:
-                    futures = {ex.submit(self.download_segment, url, timeout): i for i, url in enumerate(segments)}
+                    # submit all segments
+                    pending = {ex.submit(self.download_segment, url, timeout): i
+                               for i, url in enumerate(segments)}
 
-                    # Optional: per-segment retry budget (on top of fetch() retries)
                     seg_retries = [0] * n
                     max_seg_retries = 2
 
-                    for fut in as_completed(futures):
-                        i = futures[fut]
-                        try:
-                            _, data, success = fut.result()
-                        except Exception as e:
-                            # Defensive: unexpected crash in worker
-                            self.logger.error(f"Worker exception for segment {i}: {e}")
-                            success, data = False, b""
+                    parts: List[Optional[bytes]] = [None] * n
+                    next_to_write = 0
+                    progressed = 0  # how many segments have finished (success or final failure)
 
-                        if success and data:
-                            parts[i] = data
-                        else:
-                            # Retry this segment a couple more times at the executor level
-                            if seg_retries[i] < max_seg_retries:
-                                seg_retries[i] += 1
-                                # Resubmit and continue without touching progress
-                                futures[ex.submit(self.download_segment, segments[i], timeout)] = i
-                                continue
-                            # Give up on this segment
-                            failures += 1
-                            parts[i] = b""  # placeholder (prevents NoneType issues)
+                    while pending:
+                        done, _ = wait(pending, return_when=FIRST_COMPLETED)
 
-                        # After any completion (success or final failure), advance write cursor
-                        while next_to_write < n and parts[next_to_write] is not None:
-                            if parts[next_to_write]:
-                                out_fp.write(parts[next_to_write])
-                            next_to_write += 1
-                            completed += 1
-                            callback(completed, n)
+                        for fut in done:
+                            i = pending.pop(fut)
+                            try:
+                                _, data, success = fut.result()
+                            except Exception as e:
+                                self.logger.error(f"Worker exception for segment {i}: {e}")
+                                success, data = False, b""
+
+                            if success and data:
+                                parts[i] = data
+                                # count immediately: a segment finished successfully
+                                progressed += 1
+                                callback(progressed, n)
+                            else:
+                                # retry a couple times
+                                if seg_retries[i] < max_seg_retries:
+                                    seg_retries[i] += 1
+                                    pending[ex.submit(self.download_segment, segments[i], timeout)] = i
+                                    continue
+                                # give up: mark placeholder and still advance progress
+                                parts[i] = b""
+                                progressed += 1
+                                callback(progressed, n)
+
+                            # now try to flush any contiguous ready parts
+                            while next_to_write < n and parts[next_to_write] is not None:
+                                if parts[next_to_write]:
+                                    out_fp.write(parts[next_to_write])
+                                next_to_write += 1
 
             if failures:
                 # Clean temp file to avoid leaving corrupted output
