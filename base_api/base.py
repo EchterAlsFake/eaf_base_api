@@ -15,10 +15,11 @@ import threading
 from itertools import islice
 from collections import deque
 from functools import lru_cache
-from urllib.parse import urljoin
 from email.utils import parsedate_to_datetime
+from datetime import datetime, timezone, timedelta
+from urllib.parse import urljoin, urlparse, parse_qs
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from typing import Any, Dict, List, Optional, Union, Callable, Tuple, Iterable
-from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 
 try:
     from modules.errors import *
@@ -309,6 +310,15 @@ class Cache:
                 self.logger.info(f"Deleting: {first_key} from cache, due to caching limits...")
 
             self.cache_dictionary[url] = content
+
+    def save_segments_to_cache(self, m3u8_url: str, segments: list):
+        with self.lock:
+            self.cache_dictionary[m3u8_url] = segments
+
+    def get_segments_from_cache(self, m3u8_url: str):
+        with self.lock:
+            segments = self.cache_dictionary.get(m3u8_url, None)
+            return segments
 
 
 class Helper:
@@ -723,18 +733,12 @@ class BaseCore:
             raise KillSwitch("CRITICAL PROXY ERROR, CHECK LOGS!")
 
     def initialize_session(self):
-        limits = httpx.Limits(
-            max_connections=getattr(self.config, "max_connections", 128),
-            max_keepalive_connections=getattr(self.config, "max_keepalive", 4),
-            keepalive_expiry=10,
-        )
         ctx = ssl.create_default_context(cafile=certifi.where())
         if not self.config.verify_ssl:
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
 
         self.session = httpx.Client(
-            limits=limits,
             proxy=self.config.proxy,
             timeout=self.config.timeout,  # e.g. 5s on good connections
             http2=self.config.use_http2,
@@ -929,7 +933,14 @@ class BaseCore:
 
                 # 410: permanent gone
                 if status == 410:
-                    raise ResourceGone(f"Resource: {url} is Gone (410).")
+                    self.logger.warning(f"""
+The resource: {url} is gone. This can happen because of an expired token. I will try to fix this automatically, by creating
+a new session and getting a fresh m3u8 URL. This fix is very experimental and I don't know if it works. """)
+                    self.initialize_session()
+
+
+
+
 
                 # 429: rate limited — respect Retry-After if present, else backoff and retry up to cap
                 if status == 429:
@@ -1119,7 +1130,37 @@ class BaseCore:
         # Return rank numbers instead of heights if we truly can't infer—kept simple:
         return [i for i, _ in enumerate(by_bw, start=1)]
 
+    def _to_epoch(self, v: str) -> int:
+        n = int(v)
+        return n // 1000 if n > 10 ** 12 else n  # handle ms too
+
+    def m3u8_expiry_validto(self, url: str, safety_seconds: int = 60):
+        q = {k: v[0] for k, v in parse_qs(urlparse(url).query).items() if v}
+        vf = q.get("validfrom")
+        vt = q.get("validto")
+        if not vt:
+            return None  # not this scheme
+        start_utc = datetime.fromtimestamp(self._to_epoch(vf), tz=timezone.utc) if vf else None
+        expires_utc = datetime.fromtimestamp(self._to_epoch(vt), tz=timezone.utc)
+        refresh_utc = expires_utc - timedelta(seconds=safety_seconds)
+        secs_left = int((expires_utc - datetime.now(timezone.utc)).total_seconds())
+        return {
+            "start_utc": start_utc,
+            "expires_utc": expires_utc,
+            "refresh_utc": refresh_utc,
+            "seconds_left": max(secs_left, 0),
+        }
+
+    # Example
+
+
     def get_segments(self, m3u8_url_master: str, quality: Union[str, int]) -> list:
+        _cache_url = f"{m3u8_url_master}{quality}"
+        _segments: list | None = self.cache.get_segments_from_cache(_cache_url)
+        if _segments:
+            self.logger.info(f"Received: {len(_segments)} from cache!")
+            return _segments
+
         # Resolve the quality-specific playlist URL (may still be a master in some edge cases)
         playlist_url = self.get_m3u8_by_quality(m3u8_url=m3u8_url_master, quality=quality)
         self.logger.debug(f"Trying to fetch segment from m3u8 -> {playlist_url}")
@@ -1165,6 +1206,8 @@ class BaseCore:
             segments.append(urljoin(base_url, seg.uri))
 
         self.logger.debug(f"Fetched {len(segments)} segments from m3u8 URL (including init if present)")
+        self.logger.info(f"Saving segments to cache....")
+        self.cache.save_segments_to_cache(_cache_url, segments)
         return segments
 
     def download_segment(self, url: str, timeout: int) -> tuple[str, bytes, bool]:
