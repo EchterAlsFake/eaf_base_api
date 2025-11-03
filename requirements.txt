@@ -1,0 +1,12 @@
+httpx
+m3u8
+certifi
+anyio
+brotli
+h2
+hpack
+httpcore
+hyperframe
+idna
+m3u8
+sniffio
