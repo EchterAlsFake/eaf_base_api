@@ -804,6 +804,7 @@ class BaseCore:
         method: str = "GET",
         headers: Optional[Dict[str, str]] = None,
         json: Optional[Dict] = None,
+        params: Optional[Dict] = None,
     ) -> Union[bytes, str, httpx.Response]:
         """
         Fetch content with retries, optional caching, proxy support, and bandwidth limiting.
@@ -858,7 +859,8 @@ class BaseCore:
                     timeout=req_timeout,
                     follow_redirects=allow_redirects,
                     data=data,
-                    json=json
+                    json=json,
+                    params=params,
                 )
 
                 last_response = response
@@ -908,6 +910,9 @@ class BaseCore:
                             self.cache.save_cache(url, content)
 
                     return content
+
+                elif status == 204:
+                    return response
 
                 # 403 handling: try a UA switch once, then give up
                 if status == 403:
