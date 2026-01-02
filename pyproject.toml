@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools>=77.0.3"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,20 +7,31 @@ name = "eaf_base_api"
 version = "2.5.1"
 description = "A base API for EchterAlsFake's Porn APIs"
 readme = "README.md"
-requires-python = ">=3.6"
-license = { text = "LGPLv3" }
+requires-python = ">=3.8"
+license = "LGPL-3.0-or-later"
+license-files = ["LICENSE*"]
+
 authors = [
-    { name = "Johannes Habel", email = "EchterAlsFake@proton.me" }
+  { name = "Johannes Habel", email = "EchterAlsFake@proton.me" }
 ]
-dependencies = [
-    "m3u8",
-    "httpx[socks, brotli, http2]"
-]
-optional-dependencies = {av = ["av"], ffmpeg = ["ffmpeg-progress-yield"], ua = ["fake-useragent"]}
+
 classifiers = [
-    "License :: OSI Approved :: GNU Lesser General Public License v3 (LGPLv3)",
-    "Programming Language :: Python",
+  "License :: OSI Approved :: GNU Lesser General Public License v3 or later (LGPLv3+)",
+  "Programming Language :: Python",
 ]
+
+dependencies = [
+  "httpx[socks,brotli,http2]",
+]
+
+[project.optional-dependencies]
+hls = [
+  "m3u8",
+  # av needs Python >= 3.10, so guard it (otherwise `pip install ...[hls]` fails on 3.8/3.9)
+  "av; python_version >= '3.10'",
+]
+ffmpeg = ["ffmpeg-progress-yield"]
+scraping = ["fake-useragent"]
 
 [project.urls]
 Homepage = "https://github.com/EchterAlsFake/eaf_base_api"
