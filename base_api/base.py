@@ -4,7 +4,6 @@ import sys
 import ssl
 import uuid
 import time
-import m3u8
 import httpx
 import random
 import certifi
@@ -30,6 +29,24 @@ except (ModuleNotFoundError, ImportError):
     from .modules.errors import *
     from .modules.config import config
     from .modules.progress_bars import Callback
+
+# The following imports are optional, because they depend on per API and I want to be as memory efficient as possible :)
+
+try:
+    import m3u8
+    # Needed for all videos that use HLS streaming. Some do not and use mp4 containers / files instead
+
+except (ModuleNotFoundError, ImportError):
+    m3u8 = None
+
+try:
+    from ffmpeg_progress_yield import FfmpegProgress
+    # Needed for progress reporting feature for the FFmpeg mode
+
+except (ModuleNotFoundError, ImportError):
+    FfmpegProgress = None
+
+
 
 UA_DESKTOP_CHROME = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 loggers = {}
@@ -116,7 +133,7 @@ def _is_video_playlist(variant) -> bool:
 
     return True
 
-def _collect_variants(master: m3u8.M3U8) -> List[Dict[str, Any]]:
+def _collect_variants(master) -> List[Dict[str, Any]]:
     """Normalize playlist variants to a comparable list."""
     items: List[Dict[str, Any]] = []
     for v in master.playlists:
@@ -228,6 +245,8 @@ class HTTPLogHandler(logging.Handler):
 
 def setup_logger(name, log_file=None, level=logging.CRITICAL, http_ip=None, http_port=None):
     """Creates or updates a logger for a specific module."""
+    format_ = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+
     if name in loggers:
         logger = loggers[name]
         logger.setLevel(level)
@@ -238,12 +257,12 @@ def setup_logger(name, log_file=None, level=logging.CRITICAL, http_ip=None, http
         if log_file and not file_handler_exists:
             log_file = get_log_file_path(log_file)
             fh = logging.FileHandler(log_file, mode='a')
-            fh.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+            fh.setFormatter(logging.Formatter(format_))
             logger.addHandler(fh)
 
         if http_ip and http_port and not http_handler_exists:
             http_handler = HTTPLogHandler(http_ip, http_port)
-            http_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+            http_handler.setFormatter(logging.Formatter(format_))
             logger.addHandler(http_handler)
 
         return logger
@@ -253,7 +272,7 @@ def setup_logger(name, log_file=None, level=logging.CRITICAL, http_ip=None, http
 
     if not any(isinstance(h, logging.StreamHandler) for h in logger.handlers):
         ch = logging.StreamHandler()
-        ch.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+        ch.setFormatter(logging.Formatter(format_))
         logger.addHandler(ch)
 
     if log_file:
@@ -264,12 +283,12 @@ def setup_logger(name, log_file=None, level=logging.CRITICAL, http_ip=None, http
         else:
             file_mode = 'a'
         fh = logging.FileHandler(log_file, mode=file_mode)
-        fh.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+        fh.setFormatter(logging.Formatter(format_))
         logger.addHandler(fh)
 
     if http_ip and http_port:
         http_handler = HTTPLogHandler(http_ip, http_port)
-        http_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+        http_handler.setFormatter(logging.Formatter(format_))
         logger.addHandler(http_handler)
 
     loggers[name] = logger
@@ -942,6 +961,7 @@ class BaseCore:
 The resource: {url} is gone. This can happen because of an expired token. I will try to fix this automatically, by creating
 a new session and getting a fresh m3u8 URL. This fix is very experimental and I don't know if it works. """)
                     self.initialize_session()
+                    # TODO
 
 
 
@@ -1084,6 +1104,15 @@ a new session and getting a fresh m3u8 URL. This fix is very experimental and I 
           - 'best' | 'half' | 'worst'
           - 1080 / '1080' / '1080p' (and similar)
         """
+        if m3u8 is None:
+            raise ModuleNotFoundError(f"""
+Using m3u8 is optional depending whether you use HLS videos or static videos. It seems like you are trying to download
+from HLS. Please install m3u8 using: `pip install m3u8`.
+
+If this does not fix the issue, there's an import error related to your environment. In this case please create
+a new Python file, import only m3u8 and see what error you get. 
+""")
+
         # Resolve master content
         if m3u8_url.lstrip().startswith("#EXTM3U"):
             master = m3u8.loads(m3u8_url)
@@ -1230,7 +1259,7 @@ a new session and getting a fresh m3u8 URL. This fix is very experimental and I 
             return url, b"", False
 
     def download(self, video, quality: str, downloader: str, path: str, callback=None, remux: bool = False,
-                 callback_remux=None, max_workers_download: int = 20) -> None:
+                 callback_remux=None, max_workers_download: int = 20, start_segment: int = 0) -> None:
         """
         :param video:
         :param callback:
@@ -1240,6 +1269,7 @@ a new session and getting a fresh m3u8 URL. This fix is very experimental and I 
         :param remux:
         :param callback_remux:
         :param max_workers_download:
+        :param start_segment:
         :return:
         """
         max_workers_download = max_workers_download or self.config.max_workers_download
@@ -1248,18 +1278,20 @@ a new session and getting a fresh m3u8 URL. This fix is very experimental and I 
             callback = Callback.text_progress_bar
 
         if downloader == "default":
-            self.default(video=video, quality=quality, path=path, callback=callback, remux=remux, callback_remux=callback_remux)
+            self.default(video=video, quality=quality, path=path, callback=callback, remux=remux, callback_remux=callback_remux,
+                         start_segment=start_segment)
 
         elif downloader == "threaded":
             threaded_download = self.threaded(max_workers=max_workers_download, timeout=self.config.timeout)
             threaded_download(self, video=video, quality=quality, path=path, callback=callback, remux=remux,
-                              callback_remux=callback_remux)
+                              callback_remux=callback_remux, start_segment=start_segment)
 
         elif downloader == "FFMPEG":
             self.FFMPEG(video=video, quality=quality, path=path, callback=callback)
 
     def threaded(self, max_workers: int, timeout: int):
-        def wrapper(self, video, quality: str, callback, path: str, remux: bool = True, callback_remux=None):
+        def wrapper(self, video, quality: str, callback, path: str, remux: bool = True, callback_remux=None,
+                    start_segment: int = 0):
             """
             This function has already been optimized a lot and is pretty much perfect in what's possible if we
             don't go asynchronous. I don't want to go async for multiple reasons:
@@ -1271,6 +1303,10 @@ a new session and getting a fresh m3u8 URL. This fix is very experimental and I 
             """
 
             segments = self.get_segments(quality=quality, m3u8_url_master=video.m3u8_base_url)
+
+            if start_segment > 0:
+                segments = segments[start_segment:]
+
             n = len(segments)
             if n == 0:
                 raise UnknownError("No segments found for this playlist.")
@@ -1362,9 +1398,14 @@ a new session and getting a fresh m3u8 URL. This fix is very experimental and I 
 
         return wrapper
 
-    def default(self, video, quality, callback, path, start: int = 0, remux: bool = True, callback_remux=None) -> bool:
+    def default(self, video, quality, callback, path, start: int = 0, remux: bool = True, callback_remux=None,
+                start_segment: int = 0) -> bool:
         buffer = b''
         segments = self.get_segments(quality=quality, m3u8_url_master=video.m3u8_base_url)[start:]
+
+        if start_segment > 0:
+            segments = segments[start_segment:]
+
         length = len(segments)
 
         for i, url in enumerate(segments):
