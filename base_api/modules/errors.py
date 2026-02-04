@@ -27,6 +27,14 @@ class UnknownError(Exception):
         self.message = message
 
 
+class DownloadCancelled(Exception):
+    """
+    Raised when a download is cancelled via a stop flag/event.
+    """
+    def __init__(self, message):
+        self.message = message
+
+
 class SegmentError(Exception):
     """
     Raises when a segment fails to get processed. I never that happen, but you never know.

@@ -1,13 +1,13 @@
 [build-system]
-requires = ["setuptools>=77.0.3"]
-build-backend = "setuptools.build_meta"
+requires = ["uv_build>=0.9.30,<0.10.0"]
+build-backend = "uv_build"
 
 [project]
 name = "eaf_base_api"
-version = "2.5.1"
+version = "2.5.2"
 description = "A base API for EchterAlsFake's Porn APIs"
-readme = "README.md"
-requires-python = ">=3.8"
+readme = { file = "README.md", content-type = "text/markdown" }
+requires-python = ">=3.9"
 license = "LGPL-3.0-or-later"
 license-files = ["LICENSE*"]
 
@@ -20,7 +20,7 @@ classifiers = [
 ]
 
 dependencies = [
-  "httpx[socks,brotli,http2]",
+  "httpx[brotli]", # Yes brotli is theoreticalyl not necessary but common it's soooo much faster and more lightweight
 ]
 
 [project.optional-dependencies]
@@ -29,11 +29,16 @@ hls = [
   # av needs Python >= 3.10, so guard it (otherwise `pip install ...[hls]` fails on 3.8/3.9)
   "av; python_version >= '3.10'",
 ]
-ffmpeg = ["ffmpeg-progress-yield"]
 scraping = ["fake-useragent"]
+httpx = ["httpx[socks,http2]"]
 
 [project.urls]
 Homepage = "https://github.com/EchterAlsFake/eaf_base_api"
+Repository = "https://github.com/EchterAlsFake/eaf_base_api"
 
-[tool.setuptools]
-packages = { find = {} }
+[tool.uv]
+publish-url = "https://upload.pypi.org/legacy/"
+
+[tool.uv.build-backend]
+module-root = ""
+module-name = "base_api" # Because I named it differently we need to change here
