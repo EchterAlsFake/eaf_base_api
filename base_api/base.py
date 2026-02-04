@@ -39,14 +39,6 @@ try:
 except (ModuleNotFoundError, ImportError):
     m3u8 = None
 
-try:
-    from ffmpeg_progress_yield import FfmpegProgress
-    # Needed for progress reporting feature for the FFmpeg mode
-
-except (ModuleNotFoundError, ImportError):
-    FfmpegProgress = None
-
-
 
 UA_DESKTOP_CHROME = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 loggers = {}
@@ -1144,7 +1136,7 @@ a new Python file, import only m3u8 and see what error you get.
         """
         Inspect the master playlist and return sorted unique heights (e.g., [240, 360, 480, 720, 1080]).
         """
-        if m3u8_url.lstrip().startswith("#EXTM3U"):
+        if not m3u8_url.startswith("https://"):
             master = m3u8.loads(m3u8_url)
         else:
             content = self.fetch(url=m3u8_url)
