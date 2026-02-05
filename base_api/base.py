@@ -840,6 +840,75 @@ Alternatively, set config.use_http2 = False to disable http2.
             except Exception:
                 return None
 
+    def _format_headers_for_log(self, headers: httpx.Headers) -> Dict[str, str]:
+        """Redact sensitive headers but keep enough signal for debugging."""
+        sensitive = {
+            "authorization",
+            "proxy-authorization",
+            "cookie",
+            "set-cookie",
+            "x-api-key",
+            "x-auth-token",
+            "x-csrf-token",
+            "x-xsrf-token",
+        }
+        out: Dict[str, str] = {}
+        for key, value in headers.multi_items():
+            lkey = key.lower()
+            if lkey in sensitive:
+                if lkey == "cookie":
+                    parts = [p.split("=", 1)[0].strip() for p in value.split(";") if p.strip()]
+                    value = f"<redacted:{','.join(parts)}>" if parts else "<redacted>"
+                else:
+                    value = "<redacted>"
+            if key in out:
+                out[key] = f"{out[key]}, {value}"
+            else:
+                out[key] = value
+        return out
+
+    def _response_body_preview(self, response: httpx.Response, max_bytes: int = 512) -> str:
+        try:
+            raw = response.content[:max_bytes]
+        except Exception as e:
+            return f"<failed to read body: {e}>"
+        if not raw:
+            return "<empty>"
+        enc = response.encoding or "utf-8"
+        try:
+            text = raw.decode(enc, errors="replace")
+        except Exception:
+            text = raw.decode("utf-8", errors="replace")
+        return text.replace("\r", "\\r").replace("\n", "\\n")
+
+    def _log_precondition_failed(self, response: httpx.Response, attempt: int) -> None:
+        try:
+            req_headers = self._format_headers_for_log(response.request.headers)
+        except Exception as e:
+            req_headers = {"<error>": f"failed to format request headers: {e}"}
+
+        try:
+            resp_headers = self._format_headers_for_log(response.headers)
+        except Exception as e:
+            resp_headers = {"<error>": f"failed to format response headers: {e}"}
+
+        cond_headers = [
+            k for k in response.request.headers.keys() if k.lower().startswith("if-")
+        ]
+        cond_note = f" conditional_headers={cond_headers}" if cond_headers else ""
+        body_preview = self._response_body_preview(response)
+
+        self.logger.warning(
+            "HTTP 412 precondition failed (attempt %d) for %s %s.%s request_headers=%s response_headers=%s body_preview=%s",
+            attempt + 1,
+            response.request.method,
+            response.url,
+            cond_note,
+            req_headers,
+            resp_headers,
+            body_preview,
+        )
+
     def fetch(
         self,
         url: str,
@@ -981,6 +1050,9 @@ Alternatively, set config.use_http2 = False to disable http2.
                         msg = f"Forbidden (403) after {attempt+1} attempts for URL: {url}"
                         self.logger.error(msg)
                         response.raise_for_status()  # raises HTTPStatusError
+
+                if status == 412:
+                    self._log_precondition_failed(response, attempt)
 
                 # 404: usually not recoverable, but we try once (if attempt==0) in case of transient CDN
                 if status == 404:
