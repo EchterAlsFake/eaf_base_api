@@ -775,17 +775,18 @@ Alternatively, set config.use_http2 = False to disable http2.
 """)
             self.config.use_http2 = False # Setting false
 
-        if "socks5" in self.config.proxy and not socks5_possible:
-            self.logger.error(f"""
-You have chosen to use a socks5 proxy, but have not installed the dependencies for it.
-Please run uv sync --extra httpx, or pip install httpx[socks5]
+        if self.config.proxy:
+            if "socks5" in self.config.proxy and not socks5_possible:
+                self.logger.error(f"""
+    You have chosen to use a socks5 proxy, but have not installed the dependencies for it.
+    Please run uv sync --extra httpx, or pip install httpx[socks5]
+    
+    Alternatively, don't use a socks proxy ;) 
+    
+    I'll abort your request now, because httpx would anyway
+    """)
 
-Alternatively, don't use a socks proxy ;) 
-
-I'll abort your request now, because httpx would anyway
-""")
-
-            raise "You don't have dependencies for socks5 proxy support, see logs for more info"
+                raise "You don't have dependencies for socks5 proxy support, see logs for more info"
 
         self.session = httpx.Client(
             proxy=self.config.proxy,
