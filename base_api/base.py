@@ -1420,7 +1420,6 @@ a new Python file, import only m3u8 and see what error you get.
         """
         :param video:
         :param callback:
-        :param downloader:
         :param quality:
         :param path:
         :param remux:
@@ -1435,13 +1434,28 @@ a new Python file, import only m3u8 and see what error you get.
         :param keep_segment_dir:
         :return:
         """
+        requested_workers = max_workers_download
         max_workers_download = max_workers_download or self.config.max_workers_download # Get max workers from config (fallback)
+        if not requested_workers:
+            self.logger.debug(f"download: using config max_workers_download={max_workers_download}")
 
         if callback is None:
             # Use a terminal text progressbar by default
             callback = Callback.text_progress_bar
+            self.logger.debug("download: no callback provided, using default text progress bar")
+
+        m3u8_url = getattr(video, "m3u8_base_url", None)
+        self.logger.info(
+            f"Download requested: quality={quality} path={path} remux={remux} max_workers={max_workers_download} "
+            f"start_segment={start_segment} segment_state_path={segment_state_path} segment_dir={segment_dir} "
+            f"return_report={return_report} cleanup_on_stop={cleanup_on_stop} keep_segment_dir={keep_segment_dir} "
+            f"stop_event_set={bool(stop_event and stop_event.is_set())}"
+        )
+        if m3u8_url:
+            self.logger.debug(f"Download m3u8_base_url={m3u8_url}")
 
         threaded_download = self.threaded(max_workers=max_workers_download, timeout=self.config.timeout)
+        self.logger.debug(f"download: dispatching to threaded downloader (timeout={self.config.timeout})")
         return threaded_download(
             self,
             video=video,
@@ -1490,9 +1504,24 @@ a new Python file, import only m3u8 and see what error you get.
             """
             Threaded HLS segment downloader with optional resume state and stop flag.
             """
+            self.logger.info(
+                f"Threaded download start: quality={quality} path={path} remux={remux} start_segment={start_segment} "
+                f"segment_state_path={segment_state_path} segment_dir={segment_dir} return_report={return_report} "
+                f"cleanup_on_stop={cleanup_on_stop} keep_segment_dir={keep_segment_dir} max_workers={max_workers} "
+                f"timeout={timeout} stop_event_set={bool(stop_event and stop_event.is_set())}"
+            )
+            self.logger.debug(
+                f"Threaded download callbacks: callback_set={bool(callback)} callback_remux_set={bool(callback_remux)}"
+            )
             resume_state = None
             resume_mode = False
             created_at = None
+
+            if segment_state_path:
+                if os.path.exists(segment_state_path):
+                    self.logger.info(f"Found segment state file: {segment_state_path}. Attempting resume.")
+                else:
+                    self.logger.debug(f"No segment state file found at: {segment_state_path}. Starting fresh.")
 
             if segment_state_path and os.path.exists(segment_state_path):
                 try: # This starts resuming from previous download
@@ -1532,16 +1561,32 @@ a new Python file, import only m3u8 and see what error you get.
                 start_segment = state_start
                 m3u8_url = resume_state.get("m3u8_url")
                 state_quality = resume_state.get("quality", quality)
+                self.logger.info(
+                    f"Resume state loaded: segments={len(segments)} start_segment={start_segment} "
+                    f"segment_dir={segment_dir} segment_index_width={width} created_at={created_at} "
+                    f"quality={state_quality} m3u8_url={m3u8_url}"
+                )
 
             else:
-                segments = self.get_segments(quality=quality, m3u8_url_master=video.m3u8_base_url)
+                m3u8_master = getattr(video, "m3u8_base_url", None)
+                self.logger.info(f"Fetching segments for quality={quality} m3u8_url_master={m3u8_master}")
+                segments = self.get_segments(quality=quality, m3u8_url_master=m3u8_master)
+                total_before = len(segments)
                 if start_segment > 0:
+                    self.logger.debug(
+                        f"Applying start_segment offset: {start_segment} (from total={total_before})"
+                    )
                     segments = segments[start_segment:]
                 if segment_state_path and segment_dir is None:
                     segment_dir = f"{path}.segments"
+                    self.logger.debug(f"segment_dir set from state path: {segment_dir}")
                 width = self._segment_index_width(len(segments)) if segment_dir else 0
-                m3u8_url = getattr(video, "m3u8_base_url", None)
+                m3u8_url = m3u8_master
                 state_quality = quality
+                self.logger.info(
+                    f"Segments ready: count={len(segments)} segment_dir={segment_dir} "
+                    f"segment_index_width={width} m3u8_url={m3u8_url}"
+                )
 
             n = len(segments) # Total amount of segments
             if n == 0:
@@ -1550,6 +1595,8 @@ a new Python file, import only m3u8 and see what error you get.
 
             if segment_dir:
                 os.makedirs(segment_dir, exist_ok=True) # Creates the segment directory for later resuming
+                self.logger.debug(f"Segment directory ready: {segment_dir}")
+            self.logger.info(f"Segment plan: total={n} segment_dir={segment_dir}")
 
             downloaded = [False] * n # Keeps track of total downloaded segments
 
@@ -1561,41 +1608,59 @@ a new Python file, import only m3u8 and see what error you get.
             """
 
             if segment_dir: # Tries to find existing segments that we already downloaded
+                existing_segments = 0
                 for i in range(n): # Does that for every segment
                     seg_path = self._segment_file_path(segment_dir, i, width) # Gets the file path
                     try:
                         if os.path.exists(seg_path) and os.path.getsize(seg_path) > 0:
                             # if it exists, we treat it as already downloaded (makes sense)
                             downloaded[i] = True
+                            existing_segments += 1
                     except Exception:
                         # If something goes wrong, we treat it as not downloaded and re-fetch it later
                         downloaded[i] = False
+                self.logger.info(
+                    f"Existing segments detected: {existing_segments}/{n} in {segment_dir}"
+                )
 
             progressed = sum(downloaded) # Amount of already downloaded segments
+            downloaded_count = progressed
             if progressed and callback: # Does an initial callback, so that Porn Fetch can start showing the user how
                 # many segments have already been downloaded
                 callback(progressed, n)
+            if progressed:
+                self.logger.info(f"Resume progress: already_downloaded={progressed}/{n}")
 
             target_indices = [i for i in range(n) if not downloaded[i]] # The segments we still need to fetch
+            self.logger.info(f"Target segments to download: {len(target_indices)}/{n}")
 
             tmp_path = f"{path}.tmp" # Creates a temporary path where we write stuff to
             cancelled = False # This is the cancellation event that stops the download
             max_seg_retries = 2 # Maximum retries to get segments
             seg_retries = [0] * n
+            progress_log_step = max(1, n // 20)
+            next_progress_log = ((progressed // progress_log_step) + 1) * progress_log_step
 
             if stop_event is not None and stop_event.is_set():
                 cancelled = True
                 target_indices = [] # Empty list stops the download :)
+                self.logger.warning("Stop event already set; cancelling before scheduling segments.")
 
             if target_indices:
                 workers = max(1, min(max_workers, len(target_indices)))
                 parts: Optional[List[Optional[bytes]]] = None
                 next_to_write = 0
                 out_fp = None
+                self.logger.info(
+                    f"Starting segment download pool: workers={workers} targets={len(target_indices)}"
+                )
 
                 if not segment_dir:
                     parts = [None] * n
                     out_fp = open(tmp_path, "wb")
+                    self.logger.debug(f"Using in-memory segment assembly. tmp_path={tmp_path}")
+                else:
+                    self.logger.debug(f"Writing segments to disk. segment_dir={segment_dir} tmp_path={tmp_path}")
 
                 try:
                     with ThreadPoolExecutor(max_workers=workers) as ex:
@@ -1622,6 +1687,7 @@ a new Python file, import only m3u8 and see what error you get.
 
                                 if success and data:
                                     downloaded[i] = True # Successfully got segment, mark it as done
+                                    downloaded_count += 1
                                     if segment_dir:
                                         # Write to a temp path (good for resuming, but not I/O efficient)
                                         seg_path = self._segment_file_path(segment_dir, i, width)
@@ -1635,15 +1701,36 @@ a new Python file, import only m3u8 and see what error you get.
                                     progressed += 1 # Fetched +1 segment, so we give back callback
                                     if callback:
                                         callback(progressed, n)
+                                    if progressed >= next_progress_log or progressed == n:
+                                        remaining = n - downloaded_count
+                                        self.logger.debug(
+                                            f"Segment progress: processed={progressed}/{n} "
+                                            f"downloaded={downloaded_count} remaining={remaining}"
+                                        )
+                                        next_progress_log += progress_log_step
 
                                 else:
                                     if not cancelled and seg_retries[i] < max_seg_retries: # Retry
                                         seg_retries[i] += 1
+                                        self.logger.warning(
+                                            f"Segment {i} failed; retrying {seg_retries[i]}/{max_seg_retries}"
+                                        )
                                         pending[ex.submit(self.download_segment, segments[i], timeout, stop_event)] = i
                                         continue
+                                    if not cancelled:
+                                        self.logger.error(
+                                            f"Segment {i} failed after {seg_retries[i]} retries."
+                                        )
                                     progressed += 1
                                     if callback:
                                         callback(progressed, n)
+                                    if progressed >= next_progress_log or progressed == n:
+                                        remaining = n - downloaded_count
+                                        self.logger.debug(
+                                            f"Segment progress: processed={progressed}/{n} "
+                                            f"downloaded={downloaded_count} remaining={remaining}"
+                                        )
+                                        next_progress_log += progress_log_step
 
                                 if not segment_dir and parts is not None:
                                     while next_to_write < n and parts[next_to_write] is not None:
@@ -1656,6 +1743,14 @@ a new Python file, import only m3u8 and see what error you get.
 
             missing = [i for i, ok in enumerate(downloaded) if not ok] # Missing segments
             missing_urls = [segments[i] for i in missing] # Missing URLs of segments
+            self.logger.info(
+                f"Segment download finished: downloaded={downloaded_count}/{n} missing={len(missing)} cancelled={cancelled}"
+            )
+            if missing:
+                sample = missing[:10]
+                self.logger.error(
+                    f"Missing segments detected: count={len(missing)} sample={sample}"
+                )
 
             report = { # Generates a detailed report
                 "status": "cancelled" if cancelled else ("failed" if missing else "completed"),
@@ -1670,12 +1765,16 @@ a new Python file, import only m3u8 and see what error you get.
             }
 
             if cancelled: # If user cancels, we clean up stuff
+                self.logger.warning(
+                    f"Download cancelled. cleanup_on_stop={cleanup_on_stop} keep_segment_dir={keep_segment_dir}"
+                )
                 if cleanup_on_stop:
                     self._safe_remove(tmp_path)
                     if segment_dir and not keep_segment_dir:
                         self._safe_rmtree(segment_dir)
 
                 if segment_state_path:
+                    self.logger.info(f"Writing segment state to: {segment_state_path}")
                     state = self._build_segment_state(
                         segments=segments,
                         missing=missing,
@@ -1690,12 +1789,19 @@ a new Python file, import only m3u8 and see what error you get.
                     self._write_segment_state(segment_state_path, state)
 
                 if return_report:
+                    self.logger.debug(
+                        f"Returning cancelled report: downloaded={report['downloaded']} missing={len(report['missing'])}"
+                    )
                     return report
                 raise DownloadCancelled("Download cancelled.")
 
             if missing:
+                self.logger.error(
+                    f"Download incomplete: {len(missing)} segments missing. Writing state={bool(segment_state_path)}"
+                )
                 self._safe_remove(tmp_path)
                 if segment_state_path:
+                    self.logger.info(f"Writing segment state to: {segment_state_path}")
                     state = self._build_segment_state(
                         segments=segments,
                         missing=missing,
@@ -1709,12 +1815,18 @@ a new Python file, import only m3u8 and see what error you get.
                     )
                     self._write_segment_state(segment_state_path, state)
                 if return_report:
+                    self.logger.debug(
+                        f"Returning failed report: downloaded={report['downloaded']} missing={len(report['missing'])}"
+                    )
                     return report
                 raise UnknownError(
                     f"Failed to download {len(missing)} segments. Try lowering workers or switching downloader=FFMPEG."
                 )
 
             if segment_dir:
+                self.logger.info(
+                    f"Assembling {n} segments from {segment_dir} into {tmp_path}"
+                )
                 with open(tmp_path, "wb") as out_fp:
                     for i in range(n):
                         seg_path = self._segment_file_path(segment_dir, i, width)
@@ -1725,8 +1837,12 @@ a new Python file, import only m3u8 and see what error you get.
                             shutil.copyfileobj(seg_fp, out_fp, length=1024 * 1024)
 
                 if missing:
+                    self.logger.error(
+                        f"Missing segment file during assemble: index={missing[0]} segment_dir={segment_dir}"
+                    )
                     self._safe_remove(tmp_path)
                     if segment_state_path:
+                        self.logger.info(f"Writing segment state to: {segment_state_path}")
                         state = self._build_segment_state(
                             segments=segments,
                             missing=missing,
@@ -1743,19 +1859,27 @@ a new Python file, import only m3u8 and see what error you get.
                     report["missing"] = missing
                     report["missing_urls"] = [segments[i] for i in missing]
                     if return_report:
+                        self.logger.debug(
+                            f"Returning failed report after assemble: downloaded={report['downloaded']} "
+                            f"missing={len(report['missing'])}"
+                        )
                         return report
                     raise UnknownError("Missing segment files during assemble.")
 
             if remux:
+                self.logger.info(f"Remuxing TS to MP4: input={tmp_path} output={path}")
                 self._convert_ts_to_mp4(tmp_path, path, callback=callback_remux) # Remuxes stuff into valid mp4 container
                 # This is important, because not all players can play MPEG-TS AND I want to write
                 # metadata to the files, and this doesn't work without a container.
                 self._safe_remove(tmp_path)
+                self.logger.info(f"Remux completed: output={path}")
 
             else:
+                self.logger.debug("Remux disabled; moving temporary file into place.")
                 try:
                     os.replace(tmp_path, path) # If we don't remux, we just rename it to mp4 and treat it as done :)
                 except Exception: # Shouldn't happen and I also don't know what this does lol
+                    self.logger.warning("os.replace failed; falling back to manual copy.")
                     with open(path, "wb") as final_fp, open(tmp_path, "rb") as in_fp: # ?
                         for chunk in iter(lambda: in_fp.read(1024 * 1024), b""): # ?
                             final_fp.write(chunk) # Write stuff I guess
@@ -1765,27 +1889,47 @@ a new Python file, import only m3u8 and see what error you get.
                 self._safe_rmtree(segment_dir) # Delete segment dir (cleanup) (optional)
             if segment_state_path: # Delete segment state (optional)
                 self._safe_remove(segment_state_path)
+            self.logger.info(f"Download completed successfully: path={path}")
 
             if return_report: # Do a report, if user asked to
+                self.logger.debug(
+                    f"Returning completed report: downloaded={report['downloaded']} missing={len(report['missing'])}"
+                )
                 return report
 
         return wrapper # Return the wraper (start stuff)
 
     def _convert_ts_to_mp4(self, input_path: str, output_path: str, callback=None):
+        start_ts = time.perf_counter()
+        self.logger.info(f"Remux start: input={input_path} output={output_path}")
+        try:
+            input_size = os.path.getsize(input_path)
+            self.logger.debug(f"Remux input size: {input_size} bytes")
+        except Exception as e:
+            self.logger.debug(f"Remux input size unavailable: {e}")
+
         try:
             from av import open as av_open
             from av.audio.resampler import AudioResampler
 
         except (ModuleNotFoundError, ImportError) as e:
+            self.logger.error(f"PyAV import failed for remux: {e}")
             raise ModuleNotFoundError(f"PyAV is required for remuxing. Install with pip install av. Not supported on Termux! {e}")
 
+        self.logger.debug(f"Opening input for remux: {input_path}")
         input_ = av_open(input_path)
-        if input_.format.name.lower() == "mpegts":
+        fmt_name = (input_.format.name or "").lower()
+        self.logger.info(f"Input format detected: {fmt_name or '<unknown>'}")
+        if fmt_name == "mpegts":
             output = av_open(output_path, mode="w", format="mp4", options={"movflags": "faststart"})
 
             # --- VIDEO: keep your exact remux approach ---
             in_video = input_.streams.video[0]
             out_video = output.add_stream_from_template(template=in_video)
+            self.logger.debug(
+                f"Video stream: codec={getattr(in_video.codec_context, 'name', None)} "
+                f"bit_rate={getattr(in_video.codec_context, 'bit_rate', None)}"
+            )
 
             # --- AUDIO: copy if MP4-compatible; else transcode to AAC ---
             in_audio = next((s for s in input_.streams if s.type == "audio"), None)
@@ -1797,9 +1941,19 @@ a new Python file, import only m3u8 and see what error you get.
                 # Common MP4-safe audio codecs to copy without transcoding.
                 copy_ok = {"aac", "alac", "mp3"}
                 codec_name = (in_audio.codec_context.name or "").lower()
+                sample_rate = in_audio.codec_context.sample_rate or 0
+                layout_name = (
+                    in_audio.codec_context.layout.name
+                    if getattr(in_audio.codec_context, "layout", None)
+                    else "unknown"
+                )
+                self.logger.debug(
+                    f"Audio stream: codec={codec_name} sample_rate={sample_rate} layout={layout_name}"
+                )
 
                 if codec_name in copy_ok:
                     out_audio = output.add_stream_from_template(template=in_audio)
+                    self.logger.info("Audio codec MP4-compatible; remuxing without transcoding.")
                 else:
                     # Build an AAC encoder stream. Match input rate/layout where possible.
                     transcode_audio = True
@@ -1810,6 +1964,9 @@ a new Python file, import only m3u8 and see what error you get.
                         else "stereo"
                     )
                     out_audio = output.add_stream("aac", rate=sample_rate)
+                    self.logger.info(
+                        f"Transcoding audio to AAC: sample_rate={sample_rate} layout={layout}"
+                    )
                     # Setting layout/channels helps encoder pick sensible defaults.
                     try:
                         out_audio.layout = layout
@@ -1819,11 +1976,16 @@ a new Python file, import only m3u8 and see what error you get.
                     # Ensure frames handed to the AAC encoder are in a compatible sample format.
                     # ('fltp' is the usual format for AAC encoders.)
                     resampler = AudioResampler(format="fltp", layout=layout, rate=sample_rate)
+            else:
+                self.logger.info("No audio stream detected; remuxing video only.")
 
-                # --- DEMUX both streams so audio is included ---
+            # --- DEMUX both streams so audio is included ---
             demux_streams = [in_video] + ([in_audio] if in_audio else [])
             packets = list(input_.demux(demux_streams))  # keeps your progress logic
             total = len(packets)
+            self.logger.info(f"Demuxed packets: total={total}")
+            progress_step = max(1, total // 10) if total else 0
+            next_progress_log = progress_step if progress_step else 0
 
             for idx, packet in enumerate(packets):
                 if packet.dts is None:
@@ -1852,18 +2014,34 @@ a new Python file, import only m3u8 and see what error you get.
 
                 if callback:
                     callback(idx + 1, total)
+                if progress_step and (idx + 1) >= next_progress_log:
+                    self.logger.debug(f"Remux progress: packets={idx + 1}/{total}")
+                    next_progress_log += progress_step
 
             # Flush audio encoder if we transcoded.
             if transcode_audio and out_audio:
+                self.logger.debug("Flushing AAC encoder.")
                 for enc_pkt in out_audio.encode(None):
                     output.mux(enc_pkt)
 
             input_.close()
             output.close()
+            elapsed = time.perf_counter() - start_ts
+            try:
+                out_size = os.path.getsize(output_path)
+                self.logger.info(
+                    f"Remux complete: output={output_path} size={out_size} bytes elapsed={elapsed:.2f}s"
+                )
+            except Exception as e:
+                self.logger.info(
+                    f"Remux complete: output={output_path} elapsed={elapsed:.2f}s (size unavailable: {e})"
+                )
 
         else:
             self.logger.info("Stream seems to be already in MP4! Skipping remux...")
             os.rename(input_path, output_path)
+            elapsed = time.perf_counter() - start_ts
+            self.logger.info(f"Remux skipped; file moved. elapsed={elapsed:.2f}s")
 
     def legacy_download(self, path: str, url: str, callback=None,
                         chunk_size: int = 1 << 20,  # 1 MiB
@@ -1873,14 +2051,24 @@ a new Python file, import only m3u8 and see what error you get.
         Download a file using streaming with stall tolerance and resume.
         Assumes self.session is an httpx.Client.
         """
+        self.logger.info(
+            f"Legacy download start: url={url} path={path} chunk_size={chunk_size} "
+            f"max_retries={max_retries} read_timeout={read_timeout}"
+        )
+        downloaded_so_far = 0
         try:
             # progress UI fallback
             progress_bar = None
             if callback is None:
                 progress_bar = Callback()
+                self.logger.debug("legacy_download: no callback provided, using default progress bar")
 
             # how many bytes we already have (for resume)
             downloaded_so_far = os.path.getsize(path) if os.path.exists(path) else 0
+            if downloaded_so_far:
+                self.logger.info(f"Resuming legacy download at offset={downloaded_so_far} bytes")
+            else:
+                self.logger.debug("Starting new legacy download with no existing file.")
             etag = None
             attempt = 0
 
@@ -1890,14 +2078,24 @@ a new Python file, import only m3u8 and see what error you get.
             while True:
                 headers = {
                 }
+                self.logger.debug(
+                    f"Legacy download request: attempt={attempt + 1}/{max_retries} offset={downloaded_so_far}"
+                )
                 if downloaded_so_far:
                     headers["Range"] = f"bytes={downloaded_so_far}-"
+                    self.logger.debug(f"Using Range header: bytes={downloaded_so_far}-")
 
                 # stream the next segment (or whole file if starting fresh)
                 with self.session.stream("GET", url, headers=headers,
                                          follow_redirects=True, timeout=timeout) as response:
+                    self.logger.debug(
+                        f"Legacy download response: status={response.status_code} url={url}"
+                    )
                     # If we asked for a Range and got 200, server ignored it: start over.
                     if downloaded_so_far and response.status_code == 200:
+                        self.logger.warning(
+                            "Server ignored Range request; restarting download from scratch."
+                        )
                         downloaded_so_far = 0  # restart from scratch
                     response.raise_for_status()
 
@@ -1906,6 +2104,9 @@ a new Python file, import only m3u8 and see what error you get.
                     if etag is None:
                         etag = etag_cur
                     elif etag_cur and etag_cur != etag:
+                        self.logger.error(
+                            f"ETag changed mid-download: previous={etag} current={etag_cur}"
+                        )
                         raise RuntimeError("Remote content changed during download")
 
                     total = None
@@ -1921,10 +2122,17 @@ a new Python file, import only m3u8 and see what error you get.
                             total = int(response.headers.get("Content-Length", "0")) or None
                         except ValueError:
                             total = None
+                    if total:
+                        self.logger.info(f"Legacy download total size: {total} bytes")
+                    else:
+                        self.logger.debug("Legacy download total size unknown.")
 
                     mode = "ab" if downloaded_so_far else "wb"
+                    self.logger.debug(f"Opening output file: mode={mode} path={path}")
                     with open(path, mode) as file:
                         try:
+                            log_every_bytes = max(5 * 1024 * 1024, 10 * chunk_size)
+                            next_log_bytes = downloaded_so_far + log_every_bytes
                             for chunk in response.iter_bytes(chunk_size=chunk_size):
                                 if not chunk:
                                     continue
@@ -1937,10 +2145,24 @@ a new Python file, import only m3u8 and see what error you get.
 
                                 else:
                                     progress_bar.text_progress_bar(downloaded=downloaded_so_far, total=total or 0)
+                                if downloaded_so_far >= next_log_bytes:
+                                    if total:
+                                        pct = (downloaded_so_far / total) * 100
+                                        self.logger.debug(
+                                            f"Legacy download progress: {downloaded_so_far}/{total} bytes ({pct:.1f}%)"
+                                        )
+                                    else:
+                                        self.logger.debug(
+                                            f"Legacy download progress: {downloaded_so_far} bytes"
+                                        )
+                                    next_log_bytes += log_every_bytes
 
                             # finished successfully
                             if progress_bar:
                                 del progress_bar
+                            self.logger.info(
+                                f"Legacy download complete: bytes={downloaded_so_far} path={path}"
+                            )
                             return True
 
                         except httpx.ReadTimeout:
@@ -1948,16 +2170,25 @@ a new Python file, import only m3u8 and see what error you get.
                             attempt += 1
                             if attempt > max_retries:
                                 raise
-                            time.sleep(min(2 ** attempt, 30))
+                            backoff = min(2 ** attempt, 30)
+                            self.logger.warning(
+                                f"Read timeout; retrying {attempt}/{max_retries} in {backoff}s "
+                                f"(offset={downloaded_so_far})"
+                            )
+                            time.sleep(backoff)
                             continue  # loop retries with Range  # let him coook!!!
 
         except httpx.StreamClosed:
-            self.logger.error(f"Stream for: {url} was closed. This should not happen...")
+            self.logger.error(
+                f"Stream for: {url} was closed at offset={downloaded_so_far}. This should not happen..."
+            )
             raise NetworkingError(f"Stream for: {url} was closed, if this happens again, please report it!")
 
         except Exception:
             error = traceback.format_exc()
-            self.logger.error(f"Unknown (network) error for: {url}. Please report this! -->: {error}")
+            self.logger.error(
+                f"Unknown (network) error for: {url} at offset={downloaded_so_far}. Please report this! -->: {error}"
+            )
             raise NetworkingError(f"Unknown error for: {url}. Please report this! -->: {error}")
 
 
