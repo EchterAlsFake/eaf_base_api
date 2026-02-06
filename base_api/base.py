@@ -2046,17 +2046,22 @@ a new Python file, import only m3u8 and see what error you get.
     def legacy_download(self, path: str, url: str, callback=None,
                         chunk_size: int = 1 << 20,  # 1 MiB
                         max_retries: int = 5,
-                        read_timeout: float = 120.0) -> bool:
+                        read_timeout: float = 120.0,
+                        stop_event: Optional[threading.Event] = None) -> bool:
         """
         Download a file using streaming with stall tolerance and resume.
         Assumes self.session is an httpx.Client.
         """
         self.logger.info(
             f"Legacy download start: url={url} path={path} chunk_size={chunk_size} "
-            f"max_retries={max_retries} read_timeout={read_timeout}"
+            f"max_retries={max_retries} read_timeout={read_timeout} "
+            f"stop_event_set={bool(stop_event and stop_event.is_set())}"
         )
         downloaded_so_far = 0
         try:
+            if stop_event is not None and stop_event.is_set():
+                self.logger.warning("Stop event already set; cancelling legacy download.")
+                raise DownloadCancelled("Download cancelled.")
             # progress UI fallback
             progress_bar = None
             if callback is None:
@@ -2076,6 +2081,9 @@ a new Python file, import only m3u8 and see what error you get.
             timeout = httpx.Timeout(connect=10.0, read=read_timeout, write=30.0, pool=30.0)
 
             while True:
+                if stop_event is not None and stop_event.is_set():
+                    self.logger.warning("Stop event set; cancelling legacy download.")
+                    raise DownloadCancelled("Download cancelled.")
                 headers = {
                 }
                 self.logger.debug(
@@ -2134,6 +2142,9 @@ a new Python file, import only m3u8 and see what error you get.
                             log_every_bytes = max(5 * 1024 * 1024, 10 * chunk_size)
                             next_log_bytes = downloaded_so_far + log_every_bytes
                             for chunk in response.iter_bytes(chunk_size=chunk_size):
+                                if stop_event is not None and stop_event.is_set():
+                                    self.logger.warning("Stop event set; cancelling legacy download.")
+                                    raise DownloadCancelled("Download cancelled.")
                                 if not chunk:
                                     continue
                                 file.write(chunk)
@@ -2175,7 +2186,12 @@ a new Python file, import only m3u8 and see what error you get.
                                 f"Read timeout; retrying {attempt}/{max_retries} in {backoff}s "
                                 f"(offset={downloaded_so_far})"
                             )
-                            time.sleep(backoff)
+                            if stop_event is not None:
+                                if stop_event.wait(backoff):
+                                    self.logger.warning("Stop event set; cancelling legacy download.")
+                                    raise DownloadCancelled("Download cancelled.")
+                            else:
+                                time.sleep(backoff)
                             continue  # loop retries with Range  # let him coook!!!
 
         except httpx.StreamClosed:
@@ -2183,6 +2199,12 @@ a new Python file, import only m3u8 and see what error you get.
                 f"Stream for: {url} was closed at offset={downloaded_so_far}. This should not happen..."
             )
             raise NetworkingError(f"Stream for: {url} was closed, if this happens again, please report it!")
+
+        except DownloadCancelled:
+            self.logger.warning(
+                f"Legacy download cancelled at offset={downloaded_so_far} for url={url}"
+            )
+            raise
 
         except Exception:
             error = traceback.format_exc()
