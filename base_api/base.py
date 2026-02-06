@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import re
 import os
 import sys
@@ -16,9 +18,9 @@ import threading
 from itertools import islice
 from collections import deque
 from functools import lru_cache
+from urllib.parse import urljoin
+from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
-from datetime import datetime, timezone, timedelta
-from urllib.parse import urljoin, urlparse, parse_qs
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from typing import Any, Dict, List, Optional, Union, Callable, Tuple, Iterable
 
@@ -1259,30 +1261,6 @@ a new Python file, import only m3u8 and see what error you get.
         # Return rank numbers instead of heights if we truly can't infer—kept simple:
         return [i for i, _ in enumerate(by_bw, start=1)]
 
-    def _to_epoch(self, v: str) -> int:
-        n = int(v)
-        return n // 1000 if n > 10 ** 12 else n  # handle ms too
-
-    def m3u8_expiry_validto(self, url: str, safety_seconds: int = 60):
-        q = {k: v[0] for k, v in parse_qs(urlparse(url).query).items() if v}
-        vf = q.get("validfrom")
-        vt = q.get("validto")
-        if not vt:
-            return None  # not this scheme
-        start_utc = datetime.fromtimestamp(self._to_epoch(vf), tz=timezone.utc) if vf else None
-        expires_utc = datetime.fromtimestamp(self._to_epoch(vt), tz=timezone.utc)
-        refresh_utc = expires_utc - timedelta(seconds=safety_seconds)
-        secs_left = int((expires_utc - datetime.now(timezone.utc)).total_seconds())
-        return {
-            "start_utc": start_utc,
-            "expires_utc": expires_utc,
-            "refresh_utc": refresh_utc,
-            "seconds_left": max(secs_left, 0),
-        }
-
-    # Example
-
-
     def get_segments(self, m3u8_url_master: str, quality: Union[str, int]) -> list:
         _cache_url = f"{m3u8_url_master}{quality}"
         _segments: list | None = self.cache.get_segments_from_cache(_cache_url)
@@ -1292,7 +1270,7 @@ a new Python file, import only m3u8 and see what error you get.
 
         # Resolve the quality-specific playlist URL (may still be a master in some edge cases)
         playlist_url = self.get_m3u8_by_quality(m3u8_url=m3u8_url_master, quality=quality)
-        self.logger.debug(f"Trying to fetch segment from m3u8 -> {playlist_url}")
+        self.logger.debug(f"Trying to fetch segments from m3u8 -> {playlist_url}")
 
         # M3U8s are volatile → don't cache
         content = self.fetch(url=playlist_url, save_cache=False)
@@ -1412,7 +1390,8 @@ a new Python file, import only m3u8 and see what error you get.
         """
         try:
             if stop_event is not None and stop_event.is_set():
-                return url, b"", False
+                return url, b"", False # Stopping the download here
+
             # Segments should not be cached (many unique, large, and short-lived).
             content = self.fetch(url, timeout=timeout, get_bytes=True, save_cache=False)
             return url, content, True
@@ -1423,19 +1402,18 @@ a new Python file, import only m3u8 and see what error you get.
 
     def download(
         self,
-        video,
-        quality: str,
-        downloader: str,
-        path: str,
-        callback=None,
-        remux: bool = False,
-        callback_remux=None,
-        max_workers_download: int = 20,
-        start_segment: int = 0,
-        stop_event: Optional[threading.Event] = None,
-        segment_state_path: Optional[str] = None,
-        segment_dir: Optional[str] = None,
-        return_report: bool = False,
+        video, # The video object
+        quality: str, # Selected quality e.g., 720, 1080 and so on
+        path: str, # Output Path
+        callback=None, # The callback (function that accepts pos and total)
+        remux: bool = False, # Whether to remux the video from MPEG-TS to mp4 container
+        callback_remux=None, # Callback for the remuxing process
+        max_workers_download: int = 20, # The maximum amount of workers that fetch segments at the same time
+        start_segment: int = 0, # The start segment to work on (only relevant for resuming)
+        stop_event: Optional[threading.Event] = None, # Stop event to exit the download
+        segment_state_path: Optional[str] = None, # The path for the segment state (json), for resuming
+        segment_dir: Optional[str] = None, # The directory of segments
+        return_report: bool = False, # Whether to do a report
         cleanup_on_stop: bool = True,
         keep_segment_dir: bool = False
     ) -> Optional[Union[Dict[str, Any], bool]]:
@@ -1457,51 +1435,42 @@ a new Python file, import only m3u8 and see what error you get.
         :param keep_segment_dir:
         :return:
         """
-        max_workers_download = max_workers_download or self.config.max_workers_download
+        max_workers_download = max_workers_download or self.config.max_workers_download # Get max workers from config (fallback)
 
         if callback is None:
+            # Use a terminal text progressbar by default
             callback = Callback.text_progress_bar
 
-        if downloader == "default":
-            return self.default(
-                video=video,
-                quality=quality,
-                path=path,
-                callback=callback,
-                remux=remux,
-                callback_remux=callback_remux,
-                start_segment=start_segment,
-                stop_event=stop_event,
-                segment_state_path=segment_state_path,
-                segment_dir=segment_dir,
-                return_report=return_report,
-                cleanup_on_stop=cleanup_on_stop,
-                keep_segment_dir=keep_segment_dir,
-            )
+        threaded_download = self.threaded(max_workers=max_workers_download, timeout=self.config.timeout)
+        return threaded_download(
+            self,
+            video=video,
+            quality=quality,
+            path=path,
+            callback=callback,
+            remux=remux,
+            callback_remux=callback_remux,
+            start_segment=start_segment,
+            stop_event=stop_event,
+            segment_state_path=segment_state_path,
+            segment_dir=segment_dir,
+            return_report=return_report,
+            cleanup_on_stop=cleanup_on_stop,
+            keep_segment_dir=keep_segment_dir,
+        )
 
-        elif downloader == "threaded":
-            threaded_download = self.threaded(max_workers=max_workers_download, timeout=self.config.timeout)
-            return threaded_download(
-                self,
-                video=video,
-                quality=quality,
-                path=path,
-                callback=callback,
-                remux=remux,
-                callback_remux=callback_remux,
-                start_segment=start_segment,
-                stop_event=stop_event,
-                segment_state_path=segment_state_path,
-                segment_dir=segment_dir,
-                return_report=return_report,
-                cleanup_on_stop=cleanup_on_stop,
-                keep_segment_dir=keep_segment_dir,
-            )
-
-        elif downloader == "FFMPEG":
-            return self.FFMPEG(video=video, quality=quality, path=path, callback=callback)
+        """
+        I removed ffmpeg and default download because you can configure the treaded downloader to behave exactly as the
+        default download by setting max workers to one and ffmpeg as not used by Porn Fetch anymore and I don't wanna
+        say to much, but I think that this implementation is way faster and more **reliable** then FFmpeg. (Yeah PyCharm no shit this code is unreachable, bro it's not even code lol) 
+        
+        *hopefully
+        """
 
     def threaded(self, max_workers: int, timeout: int):
+        # ChatGPT cooked so hard, not even wannabe influencers in dubai get that hot when they get exposed to the sun
+        # <xD emoji from Hyprland Discord server here>
+
         def wrapper(
             self,
             video,
@@ -1526,31 +1495,44 @@ a new Python file, import only m3u8 and see what error you get.
             created_at = None
 
             if segment_state_path and os.path.exists(segment_state_path):
-                try:
+                try: # This starts resuming from previous download
                     resume_state = self._load_segment_state(segment_state_path)
                     resume_mode = True
-                except Exception as e:
+                except Exception as e: # Shouldn't happen, but if it does, we just do a new download
                     self.logger.warning(f"Failed to load segment state {segment_state_path}: {e}. Starting fresh.")
                     resume_state = None
                     resume_mode = False
 
             if resume_mode:
-                segments = resume_state.get("segments") or []
+                segments = resume_state.get("segments") or [] # This fetches the list of segments from the resume state
                 if not segments:
-                    raise UnknownError("Segment state is invalid or empty.")
+                    raise UnknownError("Segment state is invalid or empty.") # Shouldn't happen ;)
+
                 segment_dir = resume_state.get("segment_dir") or segment_dir
                 if not segment_dir:
                     raise UnknownError("Segment state is missing segment_dir.")
+
                 created_at = resume_state.get("created_at")
                 width = int(resume_state.get("segment_index_width") or self._segment_index_width(len(segments)))
-                state_start = int(resume_state.get("start_segment", 0) or 0)
+                state_start = int(resume_state.get("start_segment", 0) or 0) # Where we start writing segments
+
+                """
+                Because every segment has a different binary offset, we can't just inject specific segments into specific
+                parts of the file. That's why I can only start after xx successful segments.
+                
+                So, let's say 0-12 segments were successful, but 13 was not and from 14-17 everything went smooth.
+                In this case, I need to start from 13 and STILL override 14-17.
+                """
+
                 if start_segment and state_start != start_segment:
                     self.logger.warning(
                         f"start_segment={start_segment} ignored; resuming from state start_segment={state_start}."
                     )
+
                 start_segment = state_start
                 m3u8_url = resume_state.get("m3u8_url")
                 state_quality = resume_state.get("quality", quality)
+
             else:
                 segments = self.get_segments(quality=quality, m3u8_url_master=video.m3u8_base_url)
                 if start_segment > 0:
@@ -1561,37 +1543,49 @@ a new Python file, import only m3u8 and see what error you get.
                 m3u8_url = getattr(video, "m3u8_base_url", None)
                 state_quality = quality
 
-            n = len(segments)
+            n = len(segments) # Total amount of segments
             if n == 0:
                 raise UnknownError("No segments found for this playlist.")
+                # Shouldn't happen
 
             if segment_dir:
-                os.makedirs(segment_dir, exist_ok=True)
+                os.makedirs(segment_dir, exist_ok=True) # Creates the segment directory for later resuming
 
-            downloaded = [False] * n
-            if segment_dir:
-                for i in range(n):
-                    seg_path = self._segment_file_path(segment_dir, i, width)
+            downloaded = [False] * n # Keeps track of total downloaded segments
+
+            """
+            We write a list with [False, False, n] where n is the value of the total amount of segments.
+            This creates a lit with as many False entries as segments. Since `self.download_segment` returns a bool
+            along with the data, we can use that to keep track, since we just change the bool to True for every downloaded
+            segments.
+            """
+
+            if segment_dir: # Tries to find existing segments that we already downloaded
+                for i in range(n): # Does that for every segment
+                    seg_path = self._segment_file_path(segment_dir, i, width) # Gets the file path
                     try:
                         if os.path.exists(seg_path) and os.path.getsize(seg_path) > 0:
+                            # if it exists, we treat it as already downloaded (makes sense)
                             downloaded[i] = True
                     except Exception:
+                        # If something goes wrong, we treat it as not downloaded and re-fetch it later
                         downloaded[i] = False
 
-            progressed = sum(downloaded)
-            if progressed and callback:
+            progressed = sum(downloaded) # Amount of already downloaded segments
+            if progressed and callback: # Does an initial callback, so that Porn Fetch can start showing the user how
+                # many segments have already been downloaded
                 callback(progressed, n)
 
-            target_indices = [i for i in range(n) if not downloaded[i]]
+            target_indices = [i for i in range(n) if not downloaded[i]] # The segments we still need to fetch
 
-            tmp_path = f"{path}.tmp"
-            cancelled = False
-            max_seg_retries = 2
+            tmp_path = f"{path}.tmp" # Creates a temporary path where we write stuff to
+            cancelled = False # This is the cancellation event that stops the download
+            max_seg_retries = 2 # Maximum retries to get segments
             seg_retries = [0] * n
 
             if stop_event is not None and stop_event.is_set():
                 cancelled = True
-                target_indices = []
+                target_indices = [] # Empty list stops the download :)
 
             if target_indices:
                 workers = max(1, min(max_workers, len(target_indices)))
@@ -1607,14 +1601,14 @@ a new Python file, import only m3u8 and see what error you get.
                     with ThreadPoolExecutor(max_workers=workers) as ex:
                         pending = {
                             ex.submit(self.download_segment, segments[i], timeout, stop_event): i
-                            for i in target_indices
+                            for i in target_indices # Fetches the actual data of the segments
                         }
 
                         while pending:
                             if stop_event is not None and stop_event.is_set():
                                 cancelled = True
                                 for fut in list(pending):
-                                    fut.cancel()
+                                    fut.cancel() # Cancels all pending segments
 
                             done, _ = wait(pending, return_when=FIRST_COMPLETED)
 
@@ -1627,20 +1621,23 @@ a new Python file, import only m3u8 and see what error you get.
                                     success, data = False, b""
 
                                 if success and data:
-                                    downloaded[i] = True
+                                    downloaded[i] = True # Successfully got segment, mark it as done
                                     if segment_dir:
+                                        # Write to a temp path (good for resuming, but not I/O efficient)
                                         seg_path = self._segment_file_path(segment_dir, i, width)
                                         tmp_seg = f"{seg_path}.part"
                                         with open(tmp_seg, "wb") as seg_fp:
                                             seg_fp.write(data)
                                         os.replace(tmp_seg, seg_path)
                                     else:
-                                        parts[i] = data
-                                    progressed += 1
+                                        parts[i] = data # Keep in memory (I/O efficient)
+
+                                    progressed += 1 # Fetched +1 segment, so we give back callback
                                     if callback:
                                         callback(progressed, n)
+
                                 else:
-                                    if not cancelled and seg_retries[i] < max_seg_retries:
+                                    if not cancelled and seg_retries[i] < max_seg_retries: # Retry
                                         seg_retries[i] += 1
                                         pending[ex.submit(self.download_segment, segments[i], timeout, stop_event)] = i
                                         continue
@@ -1657,10 +1654,10 @@ a new Python file, import only m3u8 and see what error you get.
                     if out_fp is not None:
                         out_fp.close()
 
-            missing = [i for i, ok in enumerate(downloaded) if not ok]
-            missing_urls = [segments[i] for i in missing]
+            missing = [i for i, ok in enumerate(downloaded) if not ok] # Missing segments
+            missing_urls = [segments[i] for i in missing] # Missing URLs of segments
 
-            report = {
+            report = { # Generates a detailed report
                 "status": "cancelled" if cancelled else ("failed" if missing else "completed"),
                 "total": n,
                 "downloaded": n - len(missing),
@@ -1672,11 +1669,12 @@ a new Python file, import only m3u8 and see what error you get.
                 "quality": state_quality,
             }
 
-            if cancelled:
+            if cancelled: # If user cancels, we clean up stuff
                 if cleanup_on_stop:
                     self._safe_remove(tmp_path)
                     if segment_dir and not keep_segment_dir:
                         self._safe_rmtree(segment_dir)
+
                 if segment_state_path:
                     state = self._build_segment_state(
                         segments=segments,
@@ -1690,6 +1688,7 @@ a new Python file, import only m3u8 and see what error you get.
                         created_at=created_at,
                     )
                     self._write_segment_state(segment_state_path, state)
+
                 if return_report:
                     return report
                 raise DownloadCancelled("Download cancelled.")
@@ -1748,269 +1747,35 @@ a new Python file, import only m3u8 and see what error you get.
                     raise UnknownError("Missing segment files during assemble.")
 
             if remux:
-                self._convert_ts_to_mp4(tmp_path, path, callback=callback_remux)
+                self._convert_ts_to_mp4(tmp_path, path, callback=callback_remux) # Remuxes stuff into valid mp4 container
+                # This is important, because not all players can play MPEG-TS AND I want to write
+                # metadata to the files, and this doesn't work without a container.
                 self._safe_remove(tmp_path)
+
             else:
                 try:
-                    os.replace(tmp_path, path)
-                except Exception:
-                    with open(path, "wb") as final_fp, open(tmp_path, "rb") as in_fp:
-                        for chunk in iter(lambda: in_fp.read(1024 * 1024), b""):
-                            final_fp.write(chunk)
-                    self._safe_remove(tmp_path)
+                    os.replace(tmp_path, path) # If we don't remux, we just rename it to mp4 and treat it as done :)
+                except Exception: # Shouldn't happen and I also don't know what this does lol
+                    with open(path, "wb") as final_fp, open(tmp_path, "rb") as in_fp: # ?
+                        for chunk in iter(lambda: in_fp.read(1024 * 1024), b""): # ?
+                            final_fp.write(chunk) # Write stuff I guess
+                    self._safe_remove(tmp_path) # Remove stuff I guess
 
             if segment_dir and not keep_segment_dir:
-                self._safe_rmtree(segment_dir)
-            if segment_state_path:
+                self._safe_rmtree(segment_dir) # Delete segment dir (cleanup) (optional)
+            if segment_state_path: # Delete segment state (optional)
                 self._safe_remove(segment_state_path)
 
-            if return_report:
+            if return_report: # Do a report, if user asked to
                 return report
 
-        return wrapper
-
-    def default(
-        self,
-        video,
-        quality,
-        callback,
-        path,
-        start: int = 0,
-        remux: bool = True,
-        callback_remux=None,
-        start_segment: int = 0,
-        stop_event: Optional[threading.Event] = None,
-        segment_state_path: Optional[str] = None,
-        segment_dir: Optional[str] = None,
-        return_report: bool = False,
-        cleanup_on_stop: bool = True,
-        keep_segment_dir: bool = False,
-    ) -> Union[bool, Dict[str, Any], None]:
-        resume_state = None
-        resume_mode = False
-        created_at = None
-
-        if segment_state_path and os.path.exists(segment_state_path):
-            try:
-                resume_state = self._load_segment_state(segment_state_path)
-                resume_mode = True
-            except Exception as e:
-                self.logger.warning(f"Failed to load segment state {segment_state_path}: {e}. Starting fresh.")
-                resume_state = None
-                resume_mode = False
-
-        if resume_mode:
-            segments = resume_state.get("segments") or []
-            if not segments:
-                raise UnknownError("Segment state is invalid or empty.")
-            segment_dir = resume_state.get("segment_dir") or segment_dir
-            if not segment_dir:
-                raise UnknownError("Segment state is missing segment_dir.")
-            created_at = resume_state.get("created_at")
-            width = int(resume_state.get("segment_index_width") or self._segment_index_width(len(segments)))
-            state_start = int(resume_state.get("start_segment", 0) or 0)
-            if start_segment and state_start != start_segment:
-                self.logger.warning(
-                    f"start_segment={start_segment} ignored; resuming from state start_segment={state_start}."
-                )
-            start_segment = state_start
-            m3u8_url = resume_state.get("m3u8_url")
-            state_quality = resume_state.get("quality", quality)
-        else:
-            segments = self.get_segments(quality=quality, m3u8_url_master=video.m3u8_base_url)[start:]
-            if start_segment > 0:
-                segments = segments[start_segment:]
-            if segment_state_path and segment_dir is None:
-                segment_dir = f"{path}.segments"
-            width = self._segment_index_width(len(segments)) if segment_dir else 0
-            m3u8_url = getattr(video, "m3u8_base_url", None)
-            state_quality = quality
-
-        length = len(segments)
-        if length == 0:
-            raise UnknownError("No segments found for this playlist.")
-
-        if segment_dir:
-            os.makedirs(segment_dir, exist_ok=True)
-
-        downloaded = [False] * length
-        if segment_dir:
-            for i in range(length):
-                seg_path = self._segment_file_path(segment_dir, i, width)
-                try:
-                    if os.path.exists(seg_path) and os.path.getsize(seg_path) > 0:
-                        downloaded[i] = True
-                except Exception:
-                    downloaded[i] = False
-
-        progressed = sum(downloaded)
-        if progressed and callback:
-            callback(progressed, length)
-
-        buffer = b"" if not segment_dir else None
-        cancelled = False
-        max_retries = 5
-
-        if stop_event is not None and stop_event.is_set():
-            cancelled = True
-
-        for i, url in enumerate(segments):
-            if cancelled:
-                break
-            if downloaded[i]:
-                continue
-            if stop_event is not None and stop_event.is_set():
-                cancelled = True
-                break
-            success = False
-            for _ in range(max_retries):
-                try:
-                    segment = self.fetch(url, get_bytes=True)
-                    success = True
-                    if segment_dir:
-                        seg_path = self._segment_file_path(segment_dir, i, width)
-                        tmp_seg = f"{seg_path}.part"
-                        with open(tmp_seg, "wb") as seg_fp:
-                            seg_fp.write(segment)
-                        os.replace(tmp_seg, seg_path)
-                    else:
-                        buffer += segment
-                    downloaded[i] = True
-                    break
-                except Exception as e:
-                    self.logger.error(f"Failed to fetch segment {url}: {e}")
-                    continue
-            progressed += 1
-            if callback:
-                callback(progressed, length)
-
-            if not success and stop_event is not None and stop_event.is_set():
-                cancelled = True
-                break
-
-        missing = [i for i, ok in enumerate(downloaded) if not ok]
-        missing_urls = [segments[i] for i in missing]
-
-        report = {
-            "status": "cancelled" if cancelled else ("failed" if missing else "completed"),
-            "total": length,
-            "downloaded": length - len(missing),
-            "missing": missing,
-            "missing_urls": missing_urls,
-            "segment_dir": segment_dir,
-            "segment_state_path": segment_state_path,
-            "start_segment": start_segment,
-            "quality": state_quality,
-        }
-
-        if cancelled:
-            if cleanup_on_stop:
-                self._safe_remove(f"{path}.tmp")
-                if segment_dir and not keep_segment_dir:
-                    self._safe_rmtree(segment_dir)
-            if segment_state_path:
-                state = self._build_segment_state(
-                    segments=segments,
-                    missing=missing,
-                    segment_dir=segment_dir,
-                    segment_index_width=width if segment_dir else 0,
-                    path=path,
-                    quality=str(state_quality),
-                    start_segment=start_segment,
-                    m3u8_url=m3u8_url,
-                    created_at=created_at,
-                )
-                self._write_segment_state(segment_state_path, state)
-            if return_report:
-                return report
-            raise DownloadCancelled("Download cancelled.")
-
-        if missing:
-            if segment_state_path:
-                state = self._build_segment_state(
-                    segments=segments,
-                    missing=missing,
-                    segment_dir=segment_dir,
-                    segment_index_width=width if segment_dir else 0,
-                    path=path,
-                    quality=str(state_quality),
-                    start_segment=start_segment,
-                    m3u8_url=m3u8_url,
-                    created_at=created_at,
-                )
-                self._write_segment_state(segment_state_path, state)
-            if return_report:
-                return report
-            raise UnknownError(
-                f"Failed to download {len(missing)} segments. Try lowering workers or switching downloader=FFMPEG."
-            )
-
-        if segment_dir:
-            tmp_path = f"{path}.tmp"
-            with open(tmp_path, "wb") as out_fp:
-                for i in range(length):
-                    seg_path = self._segment_file_path(segment_dir, i, width)
-                    if not os.path.exists(seg_path):
-                        missing = [i]
-                        break
-                    with open(seg_path, "rb") as seg_fp:
-                        shutil.copyfileobj(seg_fp, out_fp, length=1024 * 1024)
-
-            if missing:
-                self._safe_remove(tmp_path)
-                if segment_state_path:
-                    state = self._build_segment_state(
-                        segments=segments,
-                        missing=missing,
-                        segment_dir=segment_dir,
-                        segment_index_width=width if segment_dir else 0,
-                        path=path,
-                        quality=str(state_quality),
-                        start_segment=start_segment,
-                        m3u8_url=m3u8_url,
-                        created_at=created_at,
-                    )
-                    self._write_segment_state(segment_state_path, state)
-                report["status"] = "failed"
-                report["missing"] = missing
-                report["missing_urls"] = [segments[i] for i in missing]
-                if return_report:
-                    return report
-                raise UnknownError("Missing segment files during assemble.")
-
-        if remux:
-            tmp_path = f"{path}.tmp"
-            if not segment_dir:
-                with open(tmp_path, "wb") as file:
-                    file.write(buffer or b"")
-            self._convert_ts_to_mp4(tmp_path, path, callback=callback_remux)
-            self._safe_remove(tmp_path)
-        else:
-            if segment_dir:
-                try:
-                    os.replace(f"{path}.tmp", path)
-                except Exception:
-                    with open(path, "wb") as final_fp, open(f"{path}.tmp", "rb") as in_fp:
-                        for chunk in iter(lambda: in_fp.read(1024 * 1024), b""):
-                            final_fp.write(chunk)
-                    self._safe_remove(f"{path}.tmp")
-            else:
-                with open(path, "wb") as file:
-                    file.write(buffer or b"")
-
-        if segment_dir and not keep_segment_dir:
-            self._safe_rmtree(segment_dir)
-        if segment_state_path:
-            self._safe_remove(segment_state_path)
-
-        if return_report:
-            return report
-        return True
+        return wrapper # Return the wraper (start stuff)
 
     def _convert_ts_to_mp4(self, input_path: str, output_path: str, callback=None):
         try:
             from av import open as av_open
             from av.audio.resampler import AudioResampler
+
         except (ModuleNotFoundError, ImportError) as e:
             raise ModuleNotFoundError(f"PyAV is required for remuxing. Install with pip install av. Not supported on Termux! {e}")
 
@@ -2197,6 +1962,10 @@ a new Python file, import only m3u8 and see what error you get.
 
 
     def truncate(self, name: str, max_bytes: int = 245) -> str:  # only 245, because we need to append .mp4
+        """
+        Some websites have titles that are so long (lookint at you missav.ws) that you can't name a file like
+        that and thus we need to make sure the file name doesn't exceed the OS limits lol
+        """
         encoded = name.encode("utf-8")
         if len(encoded) > max_bytes:
             encoded = encoded[:max_bytes]
@@ -2208,6 +1977,7 @@ a new Python file, import only m3u8 and see what error you get.
 
     @staticmethod
     def str_to_bool(value):
+        # Some function that I have for some reason idk if this has ever been used lmao
         """
         This function is needed for the ArgumentParser for the CLI version of my APIs. It basically maps the
         booleans for the --no-title option to valid Python boolean values.
@@ -2216,4 +1986,4 @@ a new Python file, import only m3u8 and see what error you get.
             return True
 
         elif value.lower() in ("false", "0", "no"):
-            return False
+            return False # OMG EXACTLY 2000 LINES WOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOH
