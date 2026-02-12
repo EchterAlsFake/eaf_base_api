@@ -14,6 +14,7 @@ class RuntimeConfig:
         self.max_workers_download = 20
         self.videos_concurrency = 5
         self.pages_concurrency = 2
+        self.ssl_context = None # Custom SSL context if you want
 
 
 # Singleton instance needed for my Porn Fetch project

@@ -763,10 +763,11 @@ class BaseCore:
             raise KillSwitch("CRITICAL PROXY ERROR, CHECK LOGS!")
 
     def initialize_session(self):
-        ctx = ssl.create_default_context(cafile=certifi.where())
-        if not self.config.verify_ssl:
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
+        if not self.config.ssl_context:
+            ctx = ssl.create_default_context(cafile=certifi.where())
+            if not self.config.verify_ssl:
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
 
         if not http2_possible and self.config.use_http2:
             self.logger.error(f"""
