@@ -4,7 +4,7 @@ build-backend = "uv_build"
 
 [project]
 name = "eaf_base_api"
-version = "2.5.2"
+version = "2.5.3"
 description = "A base API for EchterAlsFake's Porn APIs"
 readme = { file = "README.md", content-type = "text/markdown" }
 requires-python = ">=3.9"
