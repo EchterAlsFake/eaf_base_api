@@ -1,28 +1,38 @@
 from __future__ import annotations
 
+"""
+The code in this library is insanely well documented. This was 50/50 by me and AI because this codebase got so complex
+and handles so many edge cases I NEED this much detail in the docs to not get lost when comming back to this
+after 2 weeks. 
+
+Thanks for understanding :)
+"""
+
 import re
 import os
 import sys
-import ssl
 import json
 import uuid
 import time
-import httpx
-import random
-import certifi
-import logging
 import shutil
+import random
+import asyncio
+import logging
 import traceback
 import threading
 
+from queue import Queue
 from itertools import islice
 from collections import deque
 from functools import lru_cache
 from urllib.parse import urljoin
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
-from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from typing import Any, Dict, List, Optional, Union, Callable, Tuple, Iterable
+
+from curl_cffi import requests
+from curl_cffi.requests.errors import RequestsError
+from curl_cffi.requests import AsyncSession, Response
 
 try:
     from modules.errors import *
@@ -44,64 +54,64 @@ except (ModuleNotFoundError, ImportError):
     m3u8 = None
 
 
-try:
-    import h2
-    http2_possible = True
-
-except (ModuleNotFoundError, ImportError):
-    http2_possible = False
-
-try:
-    import socksio
-    socks5_possible = True
-
-except (ModuleNotFoundError, ImportError):
-    socks5_possible = False
-
-
 UA_DESKTOP_CHROME = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 loggers = {}
 HEIGHT_FROM_URI = re.compile(r'(?<!\d)(\d{3,4})[pP](?!\d)')  # e.g., 1080p, 720P
 
 
-def _normalize_quality_value(q) -> Union[str, int]:
-    if isinstance(q, int):
-        return q
-    s = str(q).lower().strip()
-    if s in {"best", "half", "worst"}:
-        return s
-    m = re.search(r'(\d{3,4})', s)
+def _normalize_quality_value(quality) -> Union[str, int]:
+    """
+    quality: represents the quality value that should be normalized
+    """
+    if isinstance(quality, int):
+        return quality # If the quality value is already an int, just return it directly
+
+    quality = str(quality).lower().strip() # Convert to string, lower and remove white spaces
+
+    if quality in {"best", "half", "worst"}:
+        return quality # best, half and worst are also accepted values and will be further resolved in other functions
+
+    m = re.search(r'(\d{3,4})', quality) # Search for int values that fit 144p-2160p values. if found: return as int
     if m:
         return int(m.group(1))
-    raise ValueError(f"Invalid quality: {q}")
+    raise ValueError(f"Invalid quality: {quality}")
 
 
 def _choose_quality_from_list(available: List[str | int], target: Union[str, int]):
-    # available like ["240", "360", "480", "720", "1080"]
-    av = sorted({int(x) for x in available})
+    # available like ["240", "360", "480", "720", "1080"] (Can also be unsorted)
+    available = sorted({int(x) for x in available}) # -> [144, 240, etc...]
     if isinstance(target, str):
         if target == "best":
-            return av[-1]
+            return available[-1] # Return the last index, as this represents the best quality [144,360,720] -1 = 720
         if target == "worst":
-            return av[0]
+            return available[0] # Return the first index, as this represents the worst quality [144,360,720] 0 = 144
         if target == "half":
-            return av[len(av) // 2]
+            return available[len(available) // 2] # Divides all options by 2 to find the middle, will round up though
         raise ValueError("Invalid label.")
+
     # numeric: highest ≤ target, else closest
-    le = [h for h in av if h <= target]
+    le = [h for h in available if h <= target]
+
+    """
+    This works by iterating over the available qualities until the target is reached. It creates a new list with these
+    qualities and returns the last index, as the last index in this case must be maximum best quality before we go over
+    the specified one.
+    """
+
     if le:
-        return le[-1]
+        return le[-1] # Returns the stuff
     # fallback closest (ties -> higher)
-    return min(av, key=lambda h: (abs(h - target), -h))
+    # This happens if the user for example specified 144 as the quality, but only 240+ is available.
+    return available[0]
 
 
 class ErrorVideo:
     """
-    Why?:
+    Basically, when I have all the async video objects flowing in and a video raises an error it would lead to massive
+    problems for all future video objects.
 
-    Because when working with ThreadPool I give Video objects back, however, if just one video returns on error it will
-    raise the error immediately and thus interrupting the whole ThreadPool and this is just the easiest uncomplexest (does this work in English)
-    idk 'unkomplizierteste' Lösung ähhh solution that I can think of (bruh I need to learn English)
+    This way, we just return the Video back like normal, but give the error to all 'usual' attributes lol
+    May not be the best solution, but works though
     """
     def __init__(self, url: str, err: Exception):
         self.url = url
@@ -118,14 +128,16 @@ def _height_from_variant(variant) -> Optional[int]:
     2) URI pattern like .../720p/...
     """
     if getattr(variant, "stream_info", None) and variant.stream_info.resolution:
-        _, h = variant.stream_info.resolution  # (w, h)
-        return int(h)
+        _, h = variant.stream_info.resolution  # (width, height)
+        return int(h) # -> returns the height of a variant of an m3u8 master playlist
 
+    # Fallback to search with a regex pattern
     if variant.uri:
         m = HEIGHT_FROM_URI.search(variant.uri)
         if m:
             return int(m.group(1))
 
+    # If nothing is found, though this shouldn't happen
     return None
 
 def _is_video_playlist(variant) -> bool:
@@ -183,17 +195,6 @@ def _pick_by_label(variants: List[Dict[str, Any]], label: str) -> Dict[str, Any]
     else:
         raise ValueError("Invalid quality label.")
 
-def _normalize_quality(quality: Union[str, int]) -> Union[str, int]:
-    """Convert '1080p'->1080, '720'->720, keep labels as-is."""
-    if isinstance(quality, int):
-        return quality
-    q = str(quality).strip().lower()
-    if q in {"best", "worst", "half"}:
-        return q
-    m = re.search(r'(\d{3,4})', q)
-    if m:
-        return int(m.group(1))
-    raise ValueError(f"Invalid quality value: {quality!r}")
 
 def _pick_by_height(variants: List[Dict[str, Any]], target: int) -> Dict[str, Any]:
     """Choose the highest height ≤ target; else closest by absolute diff (ties -> higher)."""
@@ -215,7 +216,6 @@ def _pick_by_height(variants: List[Dict[str, Any]], target: int) -> Dict[str, An
     return sorted(variants, key=lambda v: v["bandwidth"])[-1]
 
 
-
 # Default formatter
 formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
@@ -235,15 +235,13 @@ def send_log_message(ip, port, message):
     """Sends a log message to a remote server via HTTP or HTTPS."""
     try:
         url = f"https://{ip}:{port}/feedback"
-        with httpx.Client(timeout=5) as client:
-            client.post(url, json={"message": message})
+        requests.post(url, json={"message": message}, timeout=5, impersonate="chrome110")
     except Exception as e:
         print(f"Failed to send log to {ip}:{port} - {e}", file=sys.stderr)
 
 
 class HTTPLogHandler(logging.Handler):
     """Custom log handler that sends logs to a remote HTTP server."""
-
     def __init__(self, ip, port):
         super().__init__()
         self.ip = ip
@@ -413,16 +411,22 @@ class Helper:
     def _get_video(self, url: str):
         return self.Video(url, core=self.core)
 
-    def _other_return(self, url: str):
+    async def _other_return(self, url: str):
         """In rare cases e.g., Xhamster we don't always return video objects with the iterator"""
-        return self.OtherReturn(url, core=self.core)
+        v = self.OtherReturn(url, core=self.core)
+        if asyncio.iscoroutine(v):
+            v = await v
+        return v
 
-    def _make_video_safe(self, url: str):
+    async def _make_video_safe(self, url: str):
         # Small helper wrapped with verbose logging
         logger = self.logger
         start = time.perf_counter()
         try:
-            v = self.Video(url, core=self.core)
+            html = await self.core.fetch(url)
+            v = self.Video(url, core=self.core, html_content=html)
+            if asyncio.iscoroutine(v):
+                v = await v
             dur = (time.perf_counter() - start) * 1000
             logger.debug("video_init ok url=%s (%.2f ms)", url, dur)
             return v
@@ -431,7 +435,7 @@ class Helper:
             logger.exception("video_init FAILED url=%s (%.2f ms): %s", url, dur, e)
             return ErrorVideo(url, e)
 
-    def iterator(
+    async def iterator(
             self,
             page_urls: List[str] = None,
             extractor: Callable = None,
@@ -441,7 +445,7 @@ class Helper:
     ):
         """
         Yields Video/ErrorVideo in deterministic (page_idx, vid_idx) order while fetching concurrently.
-        Stops scraping pages once a 404 page is encountered (self.core.fetch returns an httpx.Response).
+        Stops scraping pages once a 404 page is encountered (self.core.fetch returns a Response).
         """
         logger = self.logger
         run_id = uuid.uuid4().hex[:8]  # correlate all logs for this iterator call
@@ -473,6 +477,7 @@ class Helper:
 
         def flush_ready():
             nonlocal next_page_idx, next_video_idx
+            items_to_yield = []
             flushed = 0
             while True:
                 if next_page_idx not in page_counts:
@@ -481,7 +486,7 @@ class Helper:
                             "[%s] flush_ready paused: next_page=%d unknown count; flushed=%d",
                             run_id, next_page_idx, flushed
                         )
-                    return
+                    return items_to_yield
                 if next_video_idx >= page_counts[next_page_idx]:
                     logger.debug(
                         "[%s] page complete pidx=%d total_videos=%d -> advancing",
@@ -498,213 +503,272 @@ class Helper:
                             "[%s] flush_ready stopping: awaiting key=%s; flushed=%d",
                             run_id, key, flushed
                         )
-                    return
+                    return items_to_yield
 
                 item = results.pop(key)
                 logger.debug(
                     "[%s] flush_ready yield pidx=%d vidx=%d (remaining_results=%d)",
                     run_id, key[0], key[1], len(results)
                 )
+                items_to_yield.append(item)
                 flushed += 1
                 next_video_idx += 1
-                yield item
 
         page_iter = iter(enumerate(page_urls))
 
-        with ThreadPoolExecutor(max_workers=pages_concurrency) as page_executor, \
-                ThreadPoolExecutor(max_workers=videos_concurrency) as video_executor:
+        page_in_flight: Dict[asyncio.Task, Tuple[int, str]] = {}
+        video_in_flight: Dict[asyncio.Task, Tuple[int, int]] = {}
+        pending_videos: deque[Tuple[int, int, str]] = deque()
 
-            page_in_flight: Dict[Any, Tuple[int, str]] = {}  # future -> (page_idx, url)
-            video_in_flight: Dict[Any, Tuple[int, int]] = {}  # future -> (page_idx, vid_idx)
+        def schedule_videos():
+            scheduled = 0
+            while pending_videos and len(video_in_flight) < videos_concurrency:
+                pidx, vid_idx, vurl = pending_videos.popleft()
+                if other_return:
+                    task = asyncio.create_task(self._other_return(vurl))
+                else:
+                    task = asyncio.create_task(self._make_video_safe(vurl))
+                video_in_flight[task] = (pidx, vid_idx)
+                scheduled += 1
+                logger.debug(
+                    "[%s] scheduled VIDEO pidx=%d vidx=%d vurl=%s "
+                    "(inflight_video=%d queued=%d)",
+                    run_id, pidx, vid_idx, vurl, len(video_in_flight), len(pending_videos)
+                )
+            return scheduled
 
-            # queue of discovered videos we haven't submitted yet
-            pending_videos: deque[Tuple[int, int, str]] = deque()
+        # Prime initial page fetches
+        for _ in range(pages_concurrency):
+            try:
+                pidx, url = next(page_iter)
+            except StopIteration:
+                break
+            task = asyncio.create_task(self.core.fetch(url))
+            page_in_flight[task] = (pidx, url)
+            logger.debug(
+                "[%s] scheduled PAGE pidx=%d url=%s (queue=%d)",
+                run_id, pidx, url, len(page_in_flight)
+            )
 
-            # helper to respect videos_concurrency strictly
-            def schedule_videos():
-                scheduled = 0
-                while pending_videos and len(video_in_flight) < videos_concurrency:
-                    pidx, vid_idx, vurl = pending_videos.popleft()
-                    if other_return:
-                        vf = video_executor.submit(self._other_return, vurl)
-                    else:
-                        vf = video_executor.submit(self._make_video_safe, vurl)
-                    video_in_flight[vf] = (pidx, vid_idx)
-                    scheduled += 1
-                    logger.debug(
-                        "[%s] scheduled VIDEO pidx=%d vidx=%d vurl=%s "
-                        "(inflight_video=%d queued=%d)",
-                        run_id, pidx, vid_idx, vurl, len(video_in_flight), len(pending_videos)
-                    )
-                return scheduled
+        # Main loop
+        while page_in_flight or video_in_flight or pending_videos:
+            # Fill any free video slots before waiting
+            if pending_videos and len(video_in_flight) < videos_concurrency:
+                schedule_videos()
 
-            # Prime initial page fetches
-            for _ in range(pages_concurrency):
-                try:
-                    pidx, url = next(page_iter)
-                except StopIteration:
+            waiting_on = set(page_in_flight.keys()) | set(video_in_flight.keys())
+            logger.debug(
+                "[%s] waiting futures page=%d video=%d queued_videos=%d",
+                run_id, len(page_in_flight), len(video_in_flight), len(pending_videos)
+            )
+
+            # If nothing in flight but items queued (shouldn't happen often), try to schedule then continue
+            if not waiting_on:
+                schedule_videos()
+                if not (page_in_flight or video_in_flight):
                     break
-                fut = page_executor.submit(self.core.fetch, url)
-                page_in_flight[fut] = (pidx, url)
-                logger.debug(
-                    "[%s] scheduled PAGE pidx=%d url=%s (queue=%d)",
-                    run_id, pidx, url, len(page_in_flight)
-                )
-
-            # Main loop
-            while page_in_flight or video_in_flight or pending_videos:
-                # Fill any free video slots before waiting
-                if pending_videos and len(video_in_flight) < videos_concurrency:
-                    schedule_videos()
-
                 waiting_on = set(page_in_flight.keys()) | set(video_in_flight.keys())
-                logger.debug(
-                    "[%s] waiting futures page=%d video=%d queued_videos=%d",
-                    run_id, len(page_in_flight), len(video_in_flight), len(pending_videos)
-                )
 
-                # If nothing in flight but items queued (shouldn't happen often), try to schedule then continue
-                if not waiting_on:
-                    schedule_videos()
-                    if not (page_in_flight or video_in_flight):
-                        break
-                    waiting_on = set(page_in_flight.keys()) | set(video_in_flight.keys())
+            done, _ = await asyncio.wait(waiting_on, return_when=asyncio.FIRST_COMPLETED)
 
-                done, _ = wait(waiting_on, return_when=FIRST_COMPLETED)
-
-                for fut in done:
-                    # PAGE completed
-                    if fut in page_in_flight:
-                        pidx, url = page_in_flight.pop(fut)
-                        try:
-                            html_or_resp = fut.result()
-                            logger.info(
-                                "[%s] PAGE done pidx=%d url=%s (inflight_page=%d inflight_video=%d)",
-                                run_id, pidx, url, len(page_in_flight), len(video_in_flight)
-                            )
-                        except Exception as e:
-                            logger.exception(
-                                "[%s] PAGE FAILED pidx=%d url=%s: %s",
-                                run_id, pidx, url, e
-                            )
-                            # mark page as having 0 videos so flush/ordering moves on
-                            page_counts[pidx] = 0
-                            # now-ordered items may be ready
-                            yield from flush_ready()
-                            # schedule next page if available (unless we've already stopped)
-                            if not stop_after_404:
-                                try:
-                                    npidx, nurl = next(page_iter)
-                                    nfut = page_executor.submit(self.core.fetch, nurl)
-                                    page_in_flight[nfut] = (npidx, nurl)
-                                    logger.debug(
-                                        "[%s] scheduled NEXT PAGE pidx=%d url=%s after failure",
-                                        run_id, npidx, nurl
-                                    )
-                                except StopIteration:
-                                    pass
-                            continue
-
-                        # Detect a 404 "page" (httpx.Response returned)
-                        is_404 = False
-                        try:
-                            if isinstance(html_or_resp, httpx.Response) and html_or_resp.status_code == 404:
-                                is_404 = True
-                        except Exception:
-                            # Fallback duck-typing if httpx import fails for some reason
-                            if getattr(html_or_resp, "status_code", None) == 404 and hasattr(html_or_resp, "headers"):
-                                is_404 = True
-
-                        if is_404:
-                            logger.warning(
-                                "[%s] PAGE 404 pidx=%d url=%s -> stopping further page scheduling",
-                                run_id, pidx, url
-                            )
-                            stop_after_404 = True
-                            stop_at_page_idx = pidx
-                            # 404 page has 0 videos
-                            page_counts[pidx] = 0
-                            # Flush anything now ready
-                            yield from flush_ready()
-                            # Do NOT schedule any more pages
-                            continue
-
-                        # If we've already hit a 404 and this page index is after it, ignore this page
-                        if stop_after_404 and stop_at_page_idx is not None and pidx > stop_at_page_idx:
-                            logger.info(
-                                "[%s] ignoring PAGE pidx=%d url=%s (after first 404 at pidx=%d)",
-                                run_id, pidx, url, stop_at_page_idx
-                            )
-                            page_counts[pidx] = 0
-                            yield from flush_ready()
-                            continue
-
-                        # Normal path: Extract video URLs
-                        html = html_or_resp
-                        try:
-                            video_urls = extractor(html) or []
-                            logger.debug(
-                                "[%s] extractor ok pidx=%d urls=%d",
-                                run_id, pidx, len(video_urls)
-                            )
-                        except Exception as e:
-                            logger.exception(
-                                "[%s] extractor FAILED pidx=%d url=%s: %s",
-                                run_id, pidx, url, e
-                            )
-                            video_urls = []
-
-                        page_counts[pidx] = len(video_urls)
+            for task in done:
+                # PAGE completed
+                if task in page_in_flight:
+                    pidx, url = page_in_flight.pop(task)
+                    try:
+                        html_or_resp = task.result()
                         logger.info(
-                            "[%s] PAGE indexed pidx=%d video_count=%d",
-                            run_id, pidx, page_counts[pidx]
+                            "[%s] PAGE done pidx=%d url=%s (inflight_page=%d inflight_video=%d)",
+                            run_id, pidx, url, len(page_in_flight), len(video_in_flight)
                         )
-
-                        for vid_idx, vurl in enumerate(video_urls):
-                            pending_videos.append((pidx, vid_idx, vurl))
-                        schedule_videos()
-
-                        yield from flush_ready()
-
-                        # Fetch next page only if we haven't seen a 404
+                    except Exception as e:
+                        logger.exception(
+                            "[%s] PAGE FAILED pidx=%d url=%s: %s",
+                            run_id, pidx, url, e
+                        )
+                        # mark page as having 0 videos so flush/ordering moves on
+                        page_counts[pidx] = 0
+                        # now-ordered items may be ready
+                        for item in flush_ready():
+                            yield item
+                        # schedule next page if available (unless we've already stopped)
                         if not stop_after_404:
                             try:
                                 npidx, nurl = next(page_iter)
-                                nfut = page_executor.submit(self.core.fetch, nurl)
+                                nfut = asyncio.create_task(self.core.fetch(nurl))
                                 page_in_flight[nfut] = (npidx, nurl)
                                 logger.debug(
-                                    "[%s] scheduled NEXT PAGE pidx=%d url=%s (inflight_page=%d)",
-                                    run_id, npidx, nurl, len(page_in_flight)
+                                    "[%s] scheduled NEXT PAGE pidx=%d url=%s after failure",
+                                    run_id, npidx, nurl
                                 )
                             except StopIteration:
-                                logger.debug("[%s] no more pages to schedule", run_id)
+                                pass
+                        continue
 
-                    # VIDEO completed
-                    elif fut in video_in_flight:
-                        pidx, vid_idx = video_in_flight.pop(fut)
+                    # Detect a 404 "page" (Response returned)
+                    is_404 = False
+                    try:
+                        if isinstance(html_or_resp, Response) and html_or_resp.status_code == 404:
+                            is_404 = True
+                    except Exception:
+                        # Fallback duck-typing if import fails for some reason
+                        if getattr(html_or_resp, "status_code", None) == 404 and hasattr(html_or_resp, "headers"):
+                            is_404 = True
+
+                    if is_404:
+                        logger.warning(
+                            "[%s] PAGE 404 pidx=%d url=%s -> stopping further page scheduling",
+                            run_id, pidx, url
+                        )
+                        stop_after_404 = True
+                        stop_at_page_idx = pidx
+                        # 404 page has 0 videos
+                        page_counts[pidx] = 0
+                        # Flush anything now ready
+                        for item in flush_ready():
+                            yield item
+                        # Do NOT schedule any more pages
+                        continue
+
+                    # If we've already hit a 404 and this page index is after it, ignore this page
+                    if stop_after_404 and stop_at_page_idx is not None and pidx > stop_at_page_idx:
+                        logger.info(
+                            "[%s] ignoring PAGE pidx=%d url=%s (after first 404 at pidx=%d)",
+                            run_id, pidx, url, stop_at_page_idx
+                        )
+                        page_counts[pidx] = 0
+                        for item in flush_ready():
+                            yield item
+                        continue
+
+                    # Normal path: Extract video URLs
+                    html = html_or_resp
+                    try:
+                        res = extractor(html)
+                        if asyncio.iscoroutine(res):
+                            video_urls = await res
+                        else:
+                            video_urls = res
+                        video_urls = video_urls or []
+                        logger.debug(
+                            "[%s] extractor ok pidx=%d urls=%d",
+                            run_id, pidx, len(video_urls)
+                        )
+                    except Exception as e:
+                        logger.exception(
+                            "[%s] extractor FAILED pidx=%d url=%s: %s",
+                            run_id, pidx, url, e
+                        )
+                        video_urls = []
+
+                    page_counts[pidx] = len(video_urls)
+                    logger.info(
+                        "[%s] PAGE indexed pidx=%d video_count=%d",
+                        run_id, pidx, page_counts[pidx]
+                    )
+
+                    for vid_idx, vurl in enumerate(video_urls):
+                        pending_videos.append((pidx, vid_idx, vurl))
+                    schedule_videos()
+
+                    for item in flush_ready():
+                        yield item
+
+                    # Fetch next page only if we haven't seen a 404
+                    if not stop_after_404:
                         try:
-                            val = fut.result()
-                            results[(pidx, vid_idx)] = val
+                            npidx, nurl = next(page_iter)
+                            ntask = asyncio.create_task(self.core.fetch(nurl))
+                            page_in_flight[ntask] = (npidx, nurl)
                             logger.debug(
-                                "[%s] VIDEO done pidx=%d vidx=%d (inflight_video=%d results_cached=%d)",
-                                run_id, pidx, vid_idx, len(video_in_flight), len(results)
+                                "[%s] scheduled NEXT PAGE pidx=%d url=%s (inflight_page=%d)",
+                                run_id, npidx, nurl, len(page_in_flight)
                             )
-                        except Exception as e:
-                            logger.exception(
-                                "[%s] VIDEO FAILED pidx=%d vidx=%d: %s",
-                                run_id, pidx, vid_idx, e
-                            )
-                            results[(pidx, vid_idx)] = ErrorVideo(f"<unknown:{pidx}/{vid_idx}>", e)
+                        except StopIteration:
+                            logger.debug("[%s] no more pages to schedule", run_id)
 
-                        # Flush ordered results, then backfill video slots
-                        yield from flush_ready()
-                        schedule_videos()
+                # VIDEO completed
+                elif task in video_in_flight:
+                    pidx, vid_idx = video_in_flight.pop(task)
+                    try:
+                        val = task.result()
+                        results[(pidx, vid_idx)] = val
+                        logger.debug(
+                            "[%s] VIDEO done pidx=%d vidx=%d (inflight_video=%d results_cached=%d)",
+                            run_id, pidx, vid_idx, len(video_in_flight), len(results)
+                        )
+                    except Exception as e:
+                        logger.exception(
+                            "[%s] VIDEO FAILED pidx=%d vidx=%d: %s",
+                            run_id, pidx, vid_idx, e
+                        )
+                        results[(pidx, vid_idx)] = ErrorVideo(f"<unknown:{pidx}/{vid_idx}>", e)
 
-            # Final flush (should be no-ops, but logged for completeness)
-            logger.debug("[%s] final flush start", run_id)
-            yield from flush_ready()
-            total_ms = (time.perf_counter() - t0) * 1000
-            logger.info("[%s] iterator complete in %.2f ms", run_id, total_ms)
+                    # Flush ordered results, then backfill video slots
+                    for item in flush_ready():
+                        yield item
+                    schedule_videos()
+
+        # Final flush (should be no-ops, but logged for completeness)
+        logger.debug("[%s] final flush start", run_id)
+        for item in flush_ready():
+            yield item
+        total_ms = (time.perf_counter() - t0) * 1000
+        logger.info("[%s] iterator complete in %.2f ms", run_id, total_ms)
+
+
+def async_generator_to_sync(async_gen_func, *args, **kwargs):
+    """
+    Safely bridges an async generator to a synchronous generator using
+    a background thread and a Queue.
+    """
+    sync_queue = Queue()
+    sentinel = object()  # Used to signal the generator is finished
+    error_sentinel = object()  # Used to signal an exception occurred
+
+    def _background_runner():
+        # Create a new event loop for this background thread
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+        async def _consume():
+            try:
+                # Instantiate and iterate over the async generator
+                gen = async_gen_func(*args, **kwargs)
+                async for item in gen:
+                    sync_queue.put(item)
+            except Exception as e:
+                # Catch any errors in the scraper and pass them to the sync thread
+                sync_queue.put((error_sentinel, e))
+            finally:
+                # Signal that we are done
+                sync_queue.put(sentinel)
+
+        try:
+            loop.run_until_complete(_consume())
+        finally:
+            loop.close()
+
+    # 1. Start the async execution in a background thread
+    thread = threading.Thread(target=_background_runner, daemon=True)
+    thread.start()
+
+    # 2. Synchronously yield from the queue as items come in
+    while True:
+        item = sync_queue.get()  # This blocks until an item is ready!
+
+        # Check if the async generator finished
+        if item is sentinel:
+            break
+
+        # Check if the async generator threw an exception
+        if isinstance(item, tuple) and len(item) == 2 and item[0] is error_sentinel:
+            raise item[1]
+
+        yield item
+
+    thread.join()
+
 
 class BaseCore:
     """
@@ -713,7 +777,7 @@ class BaseCore:
     def __init__(self, config=config):
         self.last_request_time = time.time()
         self.total_requests = 0  # Tracks how many requests have been made
-        self.session: Optional[httpx.Client] = None
+        self.session: Optional[AsyncSession] = None
         self.kill_switch = False
         self.config = config
         self.cache = Cache(self.config)
@@ -729,82 +793,23 @@ class BaseCore:
         self.logger = setup_logger(name="BASE API - [BaseCore]", log_file=log_file, level=level, http_ip=log_ip, http_port=log_port)
         self.cache.logger = setup_logger(name="BASE API - [Cache]", log_file=log_file, level=level, http_ip=log_ip, http_port=log_port)
 
-    def enable_kill_switch(self):
-        """This will verify your proxy before every request. If the proxy doesn't actually proxy, raise KillSwitch."""
-        self.kill_switch = True
-
-    def check_kill_switch(self):
-        proxy_ip = self.config.proxy  # Needs to be a dictionary or URL string per httpx
-        pattern = re.compile(
-            r'^(?P<scheme>http|socks5)://'
-            r'(?:\w+:\w+@)?'  # optional user:pass@
-            r'(?P<host>[a-zA-Z0-9.-]+)'
-            r':(?P<port>\d{1,5})$'
-        )
-        match = pattern.match(proxy_ip)
-        if match:
-            self.logger.info(f"Proxy has valid scheme: {match.group('scheme')} ")
-        else:
-            self.logger.critical("Proxy is INVALID! Exiting.")
-            raise InvalidProxy("The Proxy is invalid, all requests will be aborted, please check your configuration!")
-
-        self.logger.info("Checking if proxy is working...")
-        self.logger.info("Doing request to httpbin.org to get your real IP to compare it with another request with activated proxy")
-
-        your_ip = httpx.Client().get("https://httpbin.org/ip").json()["origin"]
-        self.logger.info(f"Your IP is: {your_ip}")
-
-        self.logger.info("Doing request with Proxy on...")
-        proxy_ip_ = self.fetch("https://httpbin.org/ip", bypass_kill_switch=True, get_response=True).json()["origin"]
-        self.logger.info(f"Proxy IP is: {proxy_ip_}")
-
-        if your_ip == proxy_ip_:
-            self.logger.critical("IP is the same on both requests... Proxy is not working, exiting!")
-            raise KillSwitch("CRITICAL PROXY ERROR, CHECK LOGS!")
-
     def initialize_session(self):
-        ctx = self.config.ssl_context
+        verify = self.config.verify_ssl
 
-        if not ctx:
-            ctx = ssl.create_default_context(cafile=certifi.where())
-
-        if not self.config.verify_ssl:
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-
-        if not http2_possible and self.config.use_http2:
-            self.logger.error(f"""
-You have chosen to use support HTTP 2.0, but have not installed the dependencies for it.
-Please run uv sync --extra httpx, or pip install httpx[http2] 
-
-Alternatively, set config.use_http2 = False to disable http2. 
-""")
-            self.config.use_http2 = False # Setting false
-
+        proxies = None
         if self.config.proxy:
-            if "socks5" in self.config.proxy and not socks5_possible:
-                self.logger.error(f"""
-    You have chosen to use a socks5 proxy, but have not installed the dependencies for it.
-    Please run uv sync --extra httpx, or pip install httpx[socks5]
-    
-    Alternatively, don't use a socks proxy ;) 
-    
-    I'll abort your request now, because httpx would anyway
-    """)
+            proxies = {"http": self.config.proxy, "https": self.config.proxy, "ws": self.config.proxy, "wss": self.config.proxy}
 
-                raise "You don't have dependencies for socks5 proxy support, see logs for more info"
-
-        self.session = httpx.Client(
-            proxy=self.config.proxy,
-            timeout=self.config.timeout,  # e.g. 5s on good connections
-            http2=self.config.use_http2,
-            verify=ctx,
-            follow_redirects=True,
+        self.session = AsyncSession(
+            proxies=proxies,
+            timeout=self.config.timeout,
+            verify=verify,
+            impersonate="chrome",
         )
         # Ensure our defaults are on the session
         self.session.headers.update(self.default_headers)
 
-    def enforce_delay(self):
+    async def enforce_delay(self):
         """Enforces the specified delay in config.request_delay (only if > 0)."""
         delay = self.config.request_delay
         if delay and delay > 0:
@@ -813,7 +818,7 @@ Alternatively, set config.use_http2 = False to disable http2.
             if time_since_last_request < delay:
                 sleep_time = delay - time_since_last_request
                 self.logger.debug(f"Enforcing delay of {sleep_time:.2f} seconds.")
-                time.sleep(sleep_time)
+                await asyncio.sleep(sleep_time)
         self.last_request_time = time.time()
 
     def _merged_headers(self, override: Optional[Dict[str, str]]) -> None:
@@ -828,7 +833,7 @@ Alternatively, set config.use_http2 = False to disable http2.
         """Same as above, but for cookies"""
         self.session.cookies.update(override)
 
-    def _parse_retry_after(self, response: httpx.Response) -> Optional[float]:
+    def _parse_retry_after(self, response: Response) -> Optional[float]:
         """Parse Retry-After (seconds or http-date) into seconds; None if not present/invalid."""
         v = response.headers.get("Retry-After")
         if not v:
@@ -846,7 +851,7 @@ Alternatively, set config.use_http2 = False to disable http2.
             except Exception:
                 return None
 
-    def _format_headers_for_log(self, headers: httpx.Headers) -> Dict[str, str]:
+    def _format_headers_for_log(self, headers) -> Dict[str, str]:
         """Redact sensitive headers but keep enough signal for debugging."""
         sensitive = {
             "authorization",
@@ -859,35 +864,35 @@ Alternatively, set config.use_http2 = False to disable http2.
             "x-xsrf-token",
         }
         out: Dict[str, str] = {}
-        for key, value in headers.multi_items():
+        for key, value in headers.items():
             lkey = key.lower()
             if lkey in sensitive:
                 if lkey == "cookie":
-                    parts = [p.split("=", 1)[0].strip() for p in value.split(";") if p.strip()]
+                    parts = [p.split("=", 1)[0].strip() for p in str(value).split(";") if p.strip()]
                     value = f"<redacted:{','.join(parts)}>" if parts else "<redacted>"
                 else:
                     value = "<redacted>"
             if key in out:
                 out[key] = f"{out[key]}, {value}"
             else:
-                out[key] = value
+                out[key] = str(value)
         return out
 
-    def _response_body_preview(self, response: httpx.Response, max_bytes: int = 512) -> str:
+    def _response_body_preview(self, response: Response, max_bytes: int = 512) -> str:
         try:
             raw = response.content[:max_bytes]
         except Exception as e:
             return f"<failed to read body: {e}>"
         if not raw:
             return "<empty>"
-        enc = response.encoding or "utf-8"
+        enc = getattr(response, "encoding", None) or "utf-8"
         try:
             text = raw.decode(enc, errors="replace")
         except Exception:
             text = raw.decode("utf-8", errors="replace")
         return text.replace("\r", "\\r").replace("\n", "\\n")
 
-    def _log_precondition_failed(self, response: httpx.Response, attempt: int) -> None:
+    def _log_precondition_failed(self, response: Response, attempt: int) -> None:
         try:
             req_headers = self._format_headers_for_log(response.request.headers)
         except Exception as e:
@@ -898,16 +903,20 @@ Alternatively, set config.use_http2 = False to disable http2.
         except Exception as e:
             resp_headers = {"<error>": f"failed to format response headers: {e}"}
 
-        cond_headers = [
-            k for k in response.request.headers.keys() if k.lower().startswith("if-")
-        ]
+        try:
+            cond_headers = [
+                k for k in response.request.headers.keys() if k.lower().startswith("if-")
+            ]
+        except Exception:
+            cond_headers = []
+
         cond_note = f" conditional_headers={cond_headers}" if cond_headers else ""
         body_preview = self._response_body_preview(response)
 
         self.logger.warning(
             "HTTP 412 precondition failed (attempt %d) for %s %s.%s request_headers=%s response_headers=%s body_preview=%s",
             attempt + 1,
-            response.request.method,
+            getattr(response.request, "method", "UNKNOWN"),
             response.url,
             cond_note,
             req_headers,
@@ -915,7 +924,7 @@ Alternatively, set config.use_http2 = False to disable http2.
             body_preview,
         )
 
-    def fetch(
+    async def fetch(
         self,
         url: str,
         get_bytes: bool = False,
@@ -924,25 +933,24 @@ Alternatively, set config.use_http2 = False to disable http2.
         save_cache: bool = True,
         cookies: Optional[Dict[str, str]] = None,
         allow_redirects: bool = True,
-        bypass_kill_switch: bool = False,  # prevents infinite loop
         data: Optional[Dict] = None,
         method: str = "GET",
         headers: Optional[Dict[str, str]] = None,
         json: Optional[Dict] = None,
         params: Optional[Dict] = None,
-    ) -> Union[bytes, str, httpx.Response]:
+    ) -> Union[bytes, str, Response]:
         """
         Fetch content with retries, optional caching, proxy support, and bandwidth limiting.
 
         Returns:
-            - httpx.Response if get_response=True
+            - Response if get_response=True
             - bytes            if get_bytes=True
             - str (text)       otherwise
 
         Raises:
             - ResourceGone, ProxySSLError, KillSwitch, UnknownError
-            - httpx.HTTPStatusError on unrecoverable HTTP status (e.g., 4xx/5xx after retries, 403/429 exhausted)
-            - httpx.RequestError / Timeout errors may bubble up if not recoverable
+            - RequestsError on unrecoverable HTTP status (e.g., 4xx/5xx after retries, 403/429 exhausted)
+            - RequestsError / Timeout errors may bubble up if not recoverable
         """
         if self.session is None:
             self.initialize_session()
@@ -954,7 +962,7 @@ Alternatively, set config.use_http2 = False to disable http2.
             return cache_hit
 
         req_timeout = timeout or self.config.timeout
-        last_response: Optional[httpx.Response] = None
+        last_response: Optional[Response] = None
 
         max_retries = max(1, int(self.config.max_retries))
         for attempt in range(max_retries):
@@ -963,14 +971,11 @@ Alternatively, set config.use_http2 = False to disable http2.
                 # capped exponential backoff with jitter
                 base = min(5.0, 0.5 * (2 ** attempt))
                 jitter = random.random() * 0.25  # 0-250ms
-                time.sleep(base + jitter)
+                await asyncio.sleep(base + jitter)
 
             try:
                 # Only applies if you explicitly set a delay in config (as you noted)
-                self.enforce_delay()
-
-                if self.kill_switch and not bypass_kill_switch:
-                    self.check_kill_switch()
+                await self.enforce_delay()
 
                 # Recompute headers each attempt so changes (like UA switch) take effect
                 self._merged_headers(headers)
@@ -978,11 +983,11 @@ Alternatively, set config.use_http2 = False to disable http2.
                 self.logger.debug(f"Using Headers: {self.session.headers}")
                 self.logger.debug(f"Using Cookies: {self.session.cookies}")
 
-                response = self.session.request(
+                response = await self.session.request(
                     method=method,
                     url=url,
                     timeout=req_timeout,
-                    follow_redirects=allow_redirects,
+                    allow_redirects=allow_redirects,
                     data=data,
                     json=json,
                     params=params,
@@ -1006,12 +1011,15 @@ Alternatively, set config.use_http2 = False to disable http2.
                         speed_limit = self.config.max_bandwidth_mb * 1024 * 1024
                         min_time_per_chunk = chunk_size / speed_limit
                         start_time = time.time()
-                        for chunk in response.iter_bytes(chunk_size=chunk_size):
+                        
+                        content_bytes = response.content
+                        for i in range(0, len(content_bytes), chunk_size):
+                            chunk = content_bytes[i:i+chunk_size]
                             raw_content.extend(chunk)
                             elapsed = time.time() - start_time
                             sleep_time = min_time_per_chunk - elapsed
                             if sleep_time > 0:
-                                time.sleep(sleep_time)
+                                await asyncio.sleep(sleep_time)
                             start_time = time.time()
                         raw_content = bytes(raw_content)
 
@@ -1023,7 +1031,7 @@ Alternatively, set config.use_http2 = False to disable http2.
 
                     else:
                         # Prefer server-provided/guessed encoding; fallback to utf-8 then latin-1
-                        enc = response.encoding or "utf-8"
+                        enc = getattr(response, "encoding", None) or "utf-8"
                         try:
                             content = raw_content.decode(enc, errors="strict")
                         except UnicodeDecodeError:
@@ -1043,7 +1051,7 @@ Alternatively, set config.use_http2 = False to disable http2.
                 if status == 403:
                     if attempt == 0 or attempt == 1:
                         # sleep briefly then switch UA for the next try
-                        time.sleep(2)
+                        await asyncio.sleep(2)
                         self.session.headers.update({
                             "User-Agent": "AppleWebKit/537.36 (KHTML, like Gecko)"
                         })
@@ -1055,7 +1063,7 @@ Alternatively, set config.use_http2 = False to disable http2.
                         # After at least one retry with new UA, fail
                         msg = f"Forbidden (403) after {attempt+1} attempts for URL: {url}"
                         self.logger.error(msg)
-                        response.raise_for_status()  # raises HTTPStatusError
+                        response.raise_for_status()
 
                 if status == 412:
                     self._log_precondition_failed(response, attempt)
@@ -1081,7 +1089,7 @@ Alternatively, set config.use_http2 = False to disable http2.
                         wait = min(30.0, 0.5 * (2 ** attempt)) + random.random() * 0.5
                     if attempt < max_retries - 1:
                         self.logger.warning(f"Rate limited (429). Waiting {wait:.2f}s then retrying ({attempt+1}/{max_retries}) for {url}.")
-                        time.sleep(wait)
+                        await asyncio.sleep(wait)
                         continue
                     else:
                         self.logger.error(f"Rate limited (429) after {max_retries} attempts for {url}.")
@@ -1090,55 +1098,38 @@ Alternatively, set config.use_http2 = False to disable http2.
                 # 5xx: transient server errors — retry until we run out
                 if 500 <= status < 600:
                     self.logger.warning(f"Server error {status} on {url}. Retrying ({attempt+1}/{max_retries})...")
-                    try:
-                        from fake_useragent import UserAgent
-                        ua = UserAgent().random
-                        self.logger.warning(f"Changed User Agent to: {ua}")
-                        self.session.headers.update({"User-Agent": ua})
-
-                    except ModuleNotFoundError:
-                        self.logger.warning("Couldn't change user agent, because you don't have fake-useragent installed. This is NOT an error.")
-
+                    time.sleep(1)
                     continue
 
-                # Other non-200s: let httpx raise a typed error
+                # Other non-200s: let curl_cffi raise a typed error
                 if status != 200:
                     self.logger.info(f"HTTP {status} for {url} (attempt {attempt+1}/{max_retries}).")
                     if attempt < max_retries - 1:
                         continue
                     return response
 
-            except httpx.CloseError:
-                self.logger.error(f"Attempt {attempt}: The connection has been unexpectedly closed by: {url}. Retrying...")
-                continue
-
-            except (httpx.RequestError, httpx.ConnectError) as e:
+            except RequestsError as e:
+                err_str = str(e).lower()
                 self.logger.error(f"Attempt {attempt}: Request error for URL {url}: {e}")
-                if "CERTIFICATE_VERIFY_FAILED" in str(e):
+                
+                if "certificate verify failed" in err_str:
                     raise ProxySSLError("Proxy has an invalid SSL certificate, set 'verify = False' in config")
-                # retry unless out of attempts
+                elif "cookie conflict" in err_str:
+                    self.logger.error(f"Cookie conflict. Aborting this request. Details: {e}")
+                    raise UnknownError(f"Cookie conflict during request to {url}: {e}") from e
+                elif "proxy" in err_str:
+                    self.logger.error(f"Proxy Error for {url}: {e}")
+                    raise KillSwitch("Proxy error when trying a request, aborting!") from e
+                elif "timeout" in err_str or "read" in err_str:
+                    self.logger.error(
+                        f"Attempt {attempt}: Timeout for URL {url}: {e}. "
+                        f"Consider increasing the timeout or check your connection."
+                    )
+                
                 if attempt < max_retries - 1:
                     self.logger.info(f"Retrying ({attempt+1}/{max_retries}) for URL: {url}")
                     continue
                 raise
-
-            except (httpx.TimeoutException, httpx.ConnectTimeout) as e:
-                self.logger.error(
-                    f"Attempt {attempt}: Timeout for URL {url}: {e}. "
-                    f"Consider increasing the timeout or check your connection."
-                )
-                if attempt < max_retries - 1:
-                    self.logger.info(f"Retrying ({attempt+1}/{max_retries}) for URL: {url}")
-                    continue
-                raise
-
-            except httpx.CookieConflict as e:
-                self.logger.error(f"Cookie conflict. Aborting this request. Details: {e}")
-                raise UnknownError(f"Cookie conflict during request to {url}: {e}") from e
-
-            except httpx.ProxyError as e:
-                self.logger.error(f"Proxy Error for {url}: {e}")
-                raise KillSwitch("Proxy error when trying a request, aborting!") from e
 
             except ResourceGone:
                 # propagate as-is
@@ -1151,13 +1142,13 @@ Alternatively, set config.use_http2 = False to disable http2.
                 )
                 raise UnknownError(f"Unexpected error for URL {url}: {e}") from e
 
-        # If we get here, we exhausted retries without returning or raising a httpx status error.
+        # If we get here, we exhausted retries without returning or raising a status error.
         self.logger.error(f"Failed to fetch URL {url} after {max_retries} attempts.")
         if last_response is not None:
             # Raise a typed error with the last response if we have one.
             try:
                 last_response.raise_for_status()
-            except httpx.HTTPStatusError as e:
+            except Exception as e:
                 raise e
         # Otherwise raise a generic failure
         raise UnknownError(
@@ -1197,7 +1188,7 @@ Alternatively, set config.use_http2 = False to disable http2.
         return sanitized[:max_length]
 
     @lru_cache(maxsize=250)
-    def get_m3u8_by_quality(self, m3u8_url: str, quality: Union[str, int]) -> str:
+    async def get_m3u8_by_quality(self, m3u8_url: str, quality: Union[str, int]) -> str:
         """
         Return the media-playlist URL for the requested quality.
 
@@ -1220,7 +1211,7 @@ a new Python file, import only m3u8 and see what error you get.
             self.logger.debug("Resolved inline/custom m3u8 master content.")
             base_for_join = ""  # URIs should be absolute in inline cases; join will handle if relative
         else:
-            content = self.fetch(url=m3u8_url)
+            content = await self.fetch(url=m3u8_url)
             master = m3u8.loads(content)
             base_for_join = m3u8_url
             self.logger.debug(f"Resolved m3u8 master: {m3u8_url}")
@@ -1232,7 +1223,7 @@ a new Python file, import only m3u8 and see what error you get.
         if not variants:
             raise ValueError("No usable video variants found in master playlist.")
 
-        q = _normalize_quality(quality)
+        q = _normalize_quality_value(quality)
         if isinstance(q, str):  # 'best'/'half'/'worst'
             chosen = _pick_by_label(variants, q)
         else:  # numeric height like 1080, 720, etc.
@@ -1241,14 +1232,14 @@ a new Python file, import only m3u8 and see what error you get.
         full_url = urljoin(base_for_join or m3u8_url, chosen["uri"])
         return full_url
 
-    def list_available_qualities(self, m3u8_url: str) -> List[int]:
+    async def list_available_qualities(self, m3u8_url: str) -> List[int]:
         """
         Inspect the master playlist and return sorted unique heights (e.g., [240, 360, 480, 720, 1080]).
         """
         if not m3u8_url.startswith("https://"):
             master = m3u8.loads(m3u8_url)
         else:
-            content = self.fetch(url=m3u8_url)
+            content = await self.fetch(url=m3u8_url)
             master = m3u8.loads(content)
 
         if not master.is_variant:
@@ -1265,7 +1256,7 @@ a new Python file, import only m3u8 and see what error you get.
         # Return rank numbers instead of heights if we truly can't infer—kept simple:
         return [i for i, _ in enumerate(by_bw, start=1)]
 
-    def get_segments(self, m3u8_url_master: str, quality: Union[str, int]) -> list:
+    async def get_segments(self, m3u8_url_master: str, quality: Union[str, int]) -> list:
         _cache_url = f"{m3u8_url_master}{quality}"
         _segments: list | None = self.cache.get_segments_from_cache(_cache_url)
         if _segments:
@@ -1273,11 +1264,11 @@ a new Python file, import only m3u8 and see what error you get.
             return _segments
 
         # Resolve the quality-specific playlist URL (may still be a master in some edge cases)
-        playlist_url = self.get_m3u8_by_quality(m3u8_url=m3u8_url_master, quality=quality)
+        playlist_url = await self.get_m3u8_by_quality(m3u8_url=m3u8_url_master, quality=quality)
         self.logger.debug(f"Trying to fetch segments from m3u8 -> {playlist_url}")
 
         # M3U8s are volatile → don't cache
-        content = self.fetch(url=playlist_url, save_cache=False)
+        content = await self.fetch(url=playlist_url, save_cache=False)
         parsed = m3u8.loads(content)
 
         # If we accidentally got a master, pick the first media playlist (existing behavior),
@@ -1288,7 +1279,7 @@ a new Python file, import only m3u8 and see what error you get.
             media_rel = parsed.playlists[0].uri
             media_url = urljoin(playlist_url, media_rel)
             self.logger.info(f"Resolved to new URL: {media_url}")
-            content = self.fetch(url=media_url, save_cache=False)
+            content = await self.fetch(url=media_url, save_cache=False)
             parsed = m3u8.loads(content)
             base_url = media_url
 
@@ -1387,7 +1378,7 @@ a new Python file, import only m3u8 and see what error you get.
         }
         return state
 
-    def download_segment(self, url: str, timeout: int, stop_event: Optional[threading.Event] = None) -> tuple[str, bytes, bool]:
+    async def download_segment(self, url: str, timeout: int, stop_event: Optional[threading.Event] = None) -> tuple[str, bytes, bool]:
         """
         Attempt to download a single segment.
         Returns (url, content, success).
@@ -1397,14 +1388,14 @@ a new Python file, import only m3u8 and see what error you get.
                 return url, b"", False # Stopping the download here
 
             # Segments should not be cached (many unique, large, and short-lived).
-            content = self.fetch(url, timeout=timeout, get_bytes=True, save_cache=False)
+            content = await self.fetch(url, timeout=timeout, get_bytes=True, save_cache=False)
             return url, content, True
         except Exception as e:
             # Log and mark failure; the caller will decide whether to retry or abort.
             self.logger.warning(f"Segment download failed: {url} -> {e}")
             return url, b"", False
 
-    def download(
+    async def download(
         self,
         video, # The video object
         quality: str, # Selected quality e.g., 720, 1080 and so on
@@ -1419,7 +1410,8 @@ a new Python file, import only m3u8 and see what error you get.
         segment_dir: Optional[str] = None, # The directory of segments
         return_report: bool = False, # Whether to do a report
         cleanup_on_stop: bool = True,
-        keep_segment_dir: bool = False
+        keep_segment_dir: bool = False,
+        ios_support: bool = False
     ) -> Optional[Union[Dict[str, Any], bool]]:
         """
         :param video:
@@ -1436,6 +1428,7 @@ a new Python file, import only m3u8 and see what error you get.
         :param return_report:
         :param cleanup_on_stop:
         :param keep_segment_dir:
+        :param ios_support:
         :return:
         """
         requested_workers = max_workers_download
@@ -1460,7 +1453,7 @@ a new Python file, import only m3u8 and see what error you get.
 
         threaded_download = self.threaded(max_workers=max_workers_download, timeout=self.config.timeout)
         self.logger.debug(f"download: dispatching to threaded downloader (timeout={self.config.timeout})")
-        return threaded_download(
+        return await threaded_download(
             self,
             video=video,
             quality=quality,
@@ -1475,6 +1468,7 @@ a new Python file, import only m3u8 and see what error you get.
             return_report=return_report,
             cleanup_on_stop=cleanup_on_stop,
             keep_segment_dir=keep_segment_dir,
+            ios_support=ios_support
         )
 
         """
@@ -1489,7 +1483,7 @@ a new Python file, import only m3u8 and see what error you get.
         # ChatGPT cooked so hard, not even wannabe influencers in dubai get that hot when they get exposed to the sun
         # <xD emoji from Hyprland Discord server here>
 
-        def wrapper(
+        async def wrapper(
             self,
             video,
             quality: str,
@@ -1504,6 +1498,7 @@ a new Python file, import only m3u8 and see what error you get.
             return_report: bool = False,
             cleanup_on_stop: bool = True,
             keep_segment_dir: bool = False,
+            ios_support: bool = False
         ):
             """
             Threaded HLS segment downloader with optional resume state and stop flag.
@@ -1574,7 +1569,7 @@ a new Python file, import only m3u8 and see what error you get.
             else:
                 m3u8_master = getattr(video, "m3u8_base_url", None)
                 self.logger.info(f"Fetching segments for quality={quality} m3u8_url_master={m3u8_master}")
-                segments = self.get_segments(quality=quality, m3u8_url_master=m3u8_master)
+                segments = await self.get_segments(quality=quality, m3u8_url_master=m3u8_master)
                 total_before = len(segments)
                 if start_segment > 0:
                     self.logger.debug(
@@ -1667,80 +1662,101 @@ a new Python file, import only m3u8 and see what error you get.
                     self.logger.debug(f"Writing segments to disk. segment_dir={segment_dir} tmp_path={tmp_path}")
 
                 try:
-                    with ThreadPoolExecutor(max_workers=workers) as ex:
-                        pending = {
-                            ex.submit(self.download_segment, segments[i], timeout, stop_event): i
-                            for i in target_indices # Fetches the actual data of the segments
-                        }
-
-                        while pending:
+                    # Use asyncio.gather to fetch segments concurrently instead of ThreadPoolExecutor
+                    
+                    # Create a semaphore to limit concurrent requests
+                    semaphore = asyncio.Semaphore(workers)
+                    
+                    async def fetch_segment_with_semaphore(idx, url):
+                        async with semaphore:
                             if stop_event is not None and stop_event.is_set():
-                                cancelled = True
-                                for fut in list(pending):
-                                    fut.cancel() # Cancels all pending segments
-
-                            done, _ = wait(pending, return_when=FIRST_COMPLETED)
-
-                            for fut in done:
-                                i = pending.pop(fut)
+                                return idx, False, b""
+                            
+                            # Handle retries inside the coroutine
+                            for attempt in range(max_seg_retries + 1):
+                                if stop_event is not None and stop_event.is_set():
+                                    return idx, False, b""
+                                    
                                 try:
-                                    _, data, success = fut.result()
+                                    _, data, success = await self.download_segment(url, timeout, stop_event)
+                                    if success and data:
+                                        return idx, True, data
                                 except Exception as e:
-                                    self.logger.error(f"Worker exception for segment {i}: {e}")
-                                    success, data = False, b""
-
-                                if success and data:
-                                    downloaded[i] = True # Successfully got segment, mark it as done
-                                    downloaded_count += 1
-                                    if segment_dir:
-                                        # Write to a temp path (good for resuming, but not I/O efficient)
-                                        seg_path = self._segment_file_path(segment_dir, i, width)
-                                        tmp_seg = f"{seg_path}.part"
-                                        with open(tmp_seg, "wb") as seg_fp:
-                                            seg_fp.write(data)
-                                        os.replace(tmp_seg, seg_path)
-                                    else:
-                                        parts[i] = data # Keep in memory (I/O efficient)
-
-                                    progressed += 1 # Fetched +1 segment, so we give back callback
-                                    if callback:
-                                        callback(progressed, n)
-                                    if progressed >= next_progress_log or progressed == n:
-                                        remaining = n - downloaded_count
-                                        self.logger.debug(
-                                            f"Segment progress: processed={progressed}/{n} "
-                                            f"downloaded={downloaded_count} remaining={remaining}"
-                                        )
-                                        next_progress_log += progress_log_step
-
+                                    self.logger.error(f"Worker exception for segment {idx}: {e}")
+                                    
+                                if attempt < max_seg_retries:
+                                    self.logger.warning(
+                                        f"Segment {idx} failed; retrying {attempt + 1}/{max_seg_retries}"
+                                    )
+                                    # Optional short backoff delay could go here
                                 else:
-                                    if not cancelled and seg_retries[i] < max_seg_retries: # Retry
-                                        seg_retries[i] += 1
-                                        self.logger.warning(
-                                            f"Segment {i} failed; retrying {seg_retries[i]}/{max_seg_retries}"
-                                        )
-                                        pending[ex.submit(self.download_segment, segments[i], timeout, stop_event)] = i
-                                        continue
-                                    if not cancelled:
-                                        self.logger.error(
-                                            f"Segment {i} failed after {seg_retries[i]} retries."
-                                        )
-                                    progressed += 1
-                                    if callback:
-                                        callback(progressed, n)
-                                    if progressed >= next_progress_log or progressed == n:
-                                        remaining = n - downloaded_count
-                                        self.logger.debug(
-                                            f"Segment progress: processed={progressed}/{n} "
-                                            f"downloaded={downloaded_count} remaining={remaining}"
-                                        )
-                                        next_progress_log += progress_log_step
+                                    self.logger.error(
+                                        f"Segment {idx} failed after {attempt} retries."
+                                    )
+                            return idx, False, b""
+                    
+                    tasks = [fetch_segment_with_semaphore(i, segments[i]) for i in target_indices]
+                    
+                    # Use asyncio.as_completed to process results as they come in, similar to wait(FIRST_COMPLETED)
+                    for coro in asyncio.as_completed(tasks):
+                        if stop_event is not None and stop_event.is_set():
+                            cancelled = True
+                            # The remaining tasks will see the event set and exit quickly
+                            continue
+                            
+                        i, success, data = await coro
+                        
+                        if cancelled:
+                            continue
 
-                                if not segment_dir and parts is not None:
-                                    while next_to_write < n and parts[next_to_write] is not None:
-                                        if parts[next_to_write]:
-                                            out_fp.write(parts[next_to_write])
-                                        next_to_write += 1
+                        if success and data:
+                            downloaded[i] = True # Successfully got segment, mark it as done
+                            downloaded_count += 1
+                            if segment_dir:
+                                # Write to a temp path (good for resuming, but not I/O efficient)
+                                seg_path = self._segment_file_path(segment_dir, i, width)
+                                tmp_seg = f"{seg_path}.part"
+                                # Offload segment file writing to a thread
+                                def write_part(ts_path, t_data):
+                                    with open(ts_path, "wb") as f:
+                                        f.write(t_data)
+                                await asyncio.to_thread(write_part, tmp_seg, data)
+                                os.replace(tmp_seg, seg_path)
+                            else:
+                                parts[i] = data # Keep in memory (I/O efficient)
+
+                            progressed += 1 # Fetched +1 segment, so we give back callback
+                            if callback:
+                                callback(progressed, n)
+                            if progressed >= next_progress_log or progressed == n:
+                                remaining = n - downloaded_count
+                                self.logger.debug(
+                                    f"Segment progress: processed={progressed}/{n} "
+                                    f"downloaded={downloaded_count} remaining={remaining}"
+                                )
+                                next_progress_log += progress_log_step
+
+                        else:
+                            # Handling failure (already retried in fetch_segment_with_semaphore)
+                            progressed += 1
+                            if callback:
+                                callback(progressed, n)
+                            if progressed >= next_progress_log or progressed == n:
+                                remaining = n - downloaded_count
+                                self.logger.debug(
+                                    f"Segment progress: processed={progressed}/{n} "
+                                    f"downloaded={downloaded_count} remaining={remaining}"
+                                )
+                                next_progress_log += progress_log_step
+
+                        if not segment_dir and parts is not None:
+                            while next_to_write < n and parts[next_to_write] is not None:
+                                if parts[next_to_write]:
+                                    # Write memory chunks to thread to prevent IO block
+                                    def write_chunk(fp, c_data):
+                                        fp.write(c_data)
+                                    await asyncio.to_thread(write_chunk, out_fp, parts[next_to_write])
+                                next_to_write += 1
                 finally:
                     if out_fp is not None:
                         out_fp.close()
@@ -1831,14 +1847,20 @@ a new Python file, import only m3u8 and see what error you get.
                 self.logger.info(
                     f"Assembling {n} segments from {segment_dir} into {tmp_path}"
                 )
-                with open(tmp_path, "wb") as out_fp:
-                    for i in range(n):
-                        seg_path = self._segment_file_path(segment_dir, i, width)
-                        if not os.path.exists(seg_path):
-                            missing = [i]
-                            break
-                        with open(seg_path, "rb") as seg_fp:
-                            shutil.copyfileobj(seg_fp, out_fp, length=1024 * 1024)
+                def assemble_segments():
+                    with open(tmp_path, "wb") as out_fp:
+                        for i in range(n):
+                            seg_path = self._segment_file_path(segment_dir, i, width)
+                            if not os.path.exists(seg_path):
+                                return [i]
+                            with open(seg_path, "rb") as seg_fp:
+                                shutil.copyfileobj(seg_fp, out_fp, length=1024 * 1024)
+                    return []
+                
+                # Offload heavy IO segment assembly
+                missing_assemble = await asyncio.to_thread(assemble_segments)
+                if missing_assemble:
+                    missing = missing_assemble
 
                 if missing:
                     self.logger.error(
@@ -1872,7 +1894,8 @@ a new Python file, import only m3u8 and see what error you get.
 
             if remux:
                 self.logger.info(f"Remuxing TS to MP4: input={tmp_path} output={path}")
-                self._convert_ts_to_mp4(tmp_path, path, callback=callback_remux) # Remuxes stuff into valid mp4 container
+                # Offload heavy CPU/IO bound task
+                await asyncio.to_thread(self._convert_ts_to_mp4, tmp_path, path, callback_remux, ios_support)
                 # This is important, because not all players can play MPEG-TS AND I want to write
                 # metadata to the files, and this doesn't work without a container.
                 self._safe_remove(tmp_path)
@@ -1884,9 +1907,11 @@ a new Python file, import only m3u8 and see what error you get.
                     os.replace(tmp_path, path) # If we don't remux, we just rename it to mp4 and treat it as done :)
                 except Exception: # Shouldn't happen and I also don't know what this does lol
                     self.logger.warning("os.replace failed; falling back to manual copy.")
-                    with open(path, "wb") as final_fp, open(tmp_path, "rb") as in_fp: # ?
-                        for chunk in iter(lambda: in_fp.read(1024 * 1024), b""): # ?
-                            final_fp.write(chunk) # Write stuff I guess
+                    def manual_copy():
+                        with open(path, "wb") as final_fp, open(tmp_path, "rb") as in_fp:
+                            for chunk in iter(lambda: in_fp.read(1024 * 1024), b""):
+                                final_fp.write(chunk)
+                    await asyncio.to_thread(manual_copy)
                     self._safe_remove(tmp_path) # Remove stuff I guess
 
             if segment_dir and not keep_segment_dir:
@@ -1903,7 +1928,7 @@ a new Python file, import only m3u8 and see what error you get.
 
         return wrapper # Return the wraper (start stuff)
 
-    def _convert_ts_to_mp4(self, input_path: str, output_path: str, callback=None):
+    def _convert_ts_to_mp4(self, input_path: str, output_path: str, callback=None, ios_support=False):
         start_ts = time.perf_counter()
         self.logger.info(f"Remux start: input={input_path} output={output_path}")
         try:
@@ -1943,7 +1968,7 @@ a new Python file, import only m3u8 and see what error you get.
 
             if in_audio:
                 # Common MP4-safe audio codecs to copy without transcoding.
-                copy_ok = {"aac", "alac", "mp3"}
+                copy_ok = {"aac"} if ios_support else {"aac", "alac", "mp3"}
                 codec_name = (in_audio.codec_context.name or "").lower()
                 sample_rate = in_audio.codec_context.sample_rate or 0
                 layout_name = (
@@ -1985,16 +2010,26 @@ a new Python file, import only m3u8 and see what error you get.
 
             # --- DEMUX both streams so audio is included ---
             demux_streams = [in_video] + ([in_audio] if in_audio else [])
-            packets = list(input_.demux(demux_streams))  # keeps your progress logic
-            total = len(packets)
-            self.logger.info(f"Demuxed packets: total={total}")
+            packets = input_.demux(demux_streams)  # keeps your progress logic but uses a generator
+
+            try:
+                total = os.path.getsize(input_path)
+            except Exception:
+                total = 100
+
+            self.logger.info(f"Demuxing packets: total_bytes={total}")
             progress_step = max(1, total // 10) if total else 0
             next_progress_log = progress_step if progress_step else 0
 
+            current_progress = 0
+
             for idx, packet in enumerate(packets):
+                pkt_size = getattr(packet, "size", 0) or 0
+                current_progress += pkt_size
+
                 if packet.dts is None:
                     if callback:
-                        callback(idx + 1, total)
+                        callback(current_progress, total)
                     continue
 
                 if packet.stream == in_video:
@@ -2017,9 +2052,9 @@ a new Python file, import only m3u8 and see what error you get.
                                     output.mux(enc_pkt)
 
                 if callback:
-                    callback(idx + 1, total)
-                if progress_step and (idx + 1) >= next_progress_log:
-                    self.logger.debug(f"Remux progress: packets={idx + 1}/{total}")
+                    callback(current_progress, total)
+                if progress_step and current_progress >= next_progress_log:
+                    self.logger.debug(f"Remux progress: bytes={current_progress}/{total}")
                     next_progress_log += progress_step
 
             # Flush audio encoder if we transcoded.
@@ -2047,175 +2082,245 @@ a new Python file, import only m3u8 and see what error you get.
             elapsed = time.perf_counter() - start_ts
             self.logger.info(f"Remux skipped; file moved. elapsed={elapsed:.2f}s")
 
-    def legacy_download(self, path: str, url: str, callback=None,
+    async def legacy_download(self, path: str, url: str, callback=None,
                         chunk_size: int = 1 << 20,  # 1 MiB
                         max_retries: int = 5,
                         read_timeout: float = 120.0,
-                        stop_event: Optional[threading.Event] = None) -> bool:
+                        stop_event: Optional[threading.Event] = None,
+                        max_workers: int = 5,
+                        allow_multipart: bool = True) -> bool:
         """
         Download a file using streaming with stall tolerance and resume.
-        Assumes self.session is an httpx.Client.
+        Supports fast concurrent range downloading if the server supports it and allow_multipart is True.
+        Assumes self.session is an AsyncSession.
         """
         self.logger.info(
             f"Legacy download start: url={url} path={path} chunk_size={chunk_size} "
             f"max_retries={max_retries} read_timeout={read_timeout} "
-            f"stop_event_set={bool(stop_event and stop_event.is_set())}"
+            f"stop_event_set={bool(stop_event and stop_event.is_set())} "
+            f"allow_multipart={allow_multipart}"
         )
-        downloaded_so_far = 0
-        try:
-            if stop_event is not None and stop_event.is_set():
-                self.logger.warning("Stop event already set; cancelling legacy download.")
-                raise DownloadCancelled("Download cancelled.")
-            # progress UI fallback
-            progress_bar = None
-            if callback is None:
-                progress_bar = Callback()
-                self.logger.debug("legacy_download: no callback provided, using default progress bar")
+        if stop_event is not None and stop_event.is_set():
+            self.logger.warning("Stop event already set; cancelling legacy download.")
+            raise DownloadCancelled("Download cancelled.")
 
-            # how many bytes we already have (for resume)
-            downloaded_so_far = os.path.getsize(path) if os.path.exists(path) else 0
-            if downloaded_so_far:
-                self.logger.info(f"Resuming legacy download at offset={downloaded_so_far} bytes")
-            else:
-                self.logger.debug("Starting new legacy download with no existing file.")
-            etag = None
-            attempt = 0
+        # Ensure session is initialized
+        if self.session is None:
+            self.initialize_session()
 
-            # prefer a longer read timeout to ride out throttling pauses
-            timeout = httpx.Timeout(connect=10.0, read=read_timeout, write=30.0, pool=30.0)
+        progress_bar = None
+        if callback is None:
+            progress_bar = Callback()
+            self.logger.debug("legacy_download: no callback provided, using default progress bar")
 
-            while True:
-                if stop_event is not None and stop_event.is_set():
-                    self.logger.warning("Stop event set; cancelling legacy download.")
-                    raise DownloadCancelled("Download cancelled.")
-                headers = {
-                }
-                self.logger.debug(
-                    f"Legacy download request: attempt={attempt + 1}/{max_retries} offset={downloaded_so_far}"
-                )
-                if downloaded_so_far:
-                    headers["Range"] = f"bytes={downloaded_so_far}-"
-                    self.logger.debug(f"Using Range header: bytes={downloaded_so_far}-")
+        timeout = read_timeout
 
-                # stream the next segment (or whole file if starting fresh)
-                with self.session.stream("GET", url, headers=headers,
-                                         follow_redirects=True, timeout=timeout) as response:
-                    self.logger.debug(
-                        f"Legacy download response: status={response.status_code} url={url}"
-                    )
-                    # If we asked for a Range and got 200, server ignored it: start over.
-                    if downloaded_so_far and response.status_code == 200:
-                        self.logger.warning(
-                            "Server ignored Range request; restarting download from scratch."
-                        )
-                        downloaded_so_far = 0  # restart from scratch
-                    response.raise_for_status()
+        # 1. Check if the server supports Range requests and get file size (if multipart is allowed)
+        file_size = 0
+        accept_ranges = ""
+        
+        if allow_multipart:
+            # We MUST request uncompressed content for range downloads, otherwise:
+            # 1) Content-Length from HEAD reflects the compressed size, not the real file size.
+            # 2) Mid-file Range requests on compressed streams cause libcurl error 61
+            #    ("incorrect header check") because partial gzip lacks a valid header.
+            no_compress = {"Accept-Encoding": "identity"}
+            try:
+                head_resp = await self.session.head(url, timeout=timeout, allow_redirects=True, headers=no_compress)
+                if head_resp.status_code == 405:  # Method Not Allowed, fallback to streaming GET
+                    head_resp_stream = await self.session.request("GET", url, timeout=timeout, allow_redirects=True, stream=True, headers=no_compress)
+                    file_size = int(head_resp_stream.headers.get("Content-Length", 0))
+                    accept_ranges = head_resp_stream.headers.get("Accept-Ranges", "")
+                else:
+                    file_size = int(head_resp.headers.get("Content-Length", 0))
+                    accept_ranges = head_resp.headers.get("Accept-Ranges", "")
+            except Exception as e:
+                self.logger.warning(f"Failed to fetch HEAD info for concurrent check: {e}. Falling back to linear download.")
 
-                    # track ETag to detect mid-download content changes
-                    etag_cur = response.headers.get("ETag")
-                    if etag is None:
-                        etag = etag_cur
-                    elif etag_cur and etag_cur != etag:
-                        self.logger.error(
-                            f"ETag changed mid-download: previous={etag} current={etag_cur}"
-                        )
-                        raise RuntimeError("Remote content changed during download")
+        # 2. Execute Fast Multipart Download if supported and allowed
+        if allow_multipart and file_size > 0 and accept_ranges == "bytes":
+            self.logger.info(f"Server supports Range requests. Starting fast multipart download for {file_size} bytes.")
+            
+            # Pre-allocate file
+            def allocate_file():
+                if not os.path.exists(path):
+                    with open(path, "wb") as f:
+                        f.truncate(file_size)
+                elif os.path.getsize(path) != file_size:
+                    # File exists but size mismatch, truncate to correct size
+                    with open(path, "r+b") as f:
+                        f.truncate(file_size)
+            await asyncio.to_thread(allocate_file)
 
-                    total = None
-                    # Prefer Content-Range total when resuming; else fall back to Content-Length
-                    cr = response.headers.get("Content-Range")  # e.g., "bytes start-end/total"
-                    if cr and "/" in cr:
-                        try:
-                            total = int(cr.rsplit("/", 1)[1])
-                        except ValueError:
-                            total = None
-                    if total is None:
-                        try:
-                            total = int(response.headers.get("Content-Length", "0")) or None
-                        except ValueError:
-                            total = None
-                    if total:
-                        self.logger.info(f"Legacy download total size: {total} bytes")
-                    else:
-                        self.logger.debug("Legacy download total size unknown.")
+            # We will use an array to track progress of chunks
+            # A chunk map: {chunk_index: bytes_downloaded}
+            chunk_progress = {}
+            total_downloaded = [0]  # List to allow modification in inner func
 
-                    mode = "ab" if downloaded_so_far else "wb"
-                    self.logger.debug(f"Opening output file: mode={mode} path={path}")
-                    with open(path, mode) as file:
-                        try:
-                            log_every_bytes = max(5 * 1024 * 1024, 10 * chunk_size)
-                            next_log_bytes = downloaded_so_far + log_every_bytes
-                            for chunk in response.iter_bytes(chunk_size=chunk_size):
+            # Determine chunk sizes based on file size, but keep reasonable bounds
+            # For massive files, don't create 10,000 workers.
+            target_chunk_size = max(chunk_size, min(10 * 1024 * 1024, file_size // 10)) # Between 1MB and 10MB
+            
+            semaphore = asyncio.Semaphore(max_workers)
+            
+            async def download_chunk(start: int, end: int, chunk_idx: int):
+                nonlocal total_downloaded
+                headers = {"Range": f"bytes={start}-{end}", "Accept-Encoding": "identity"}
+                chunk_progress[chunk_idx] = 0
+                
+                for attempt in range(max_retries + 1):
+                    if stop_event is not None and stop_event.is_set():
+                        return False
+                        
+                    try:
+                        async with semaphore:
+                            resp = await self.session.request("GET", url, headers=headers, timeout=timeout, allow_redirects=True, stream=True)
+                            resp.raise_for_status()
+
+                            # Synchronous file I/O can be offloaded for large writes
+                            def process_and_write(c_data):
+                                with open(path, "rb+") as f:
+                                    f.seek(start + chunk_progress[chunk_idx])
+                                    f.write(c_data)
+
+                            async for data in resp.aiter_content(chunk_size=1024 * 1024):
                                 if stop_event is not None and stop_event.is_set():
-                                    self.logger.warning("Stop event set; cancelling legacy download.")
-                                    raise DownloadCancelled("Download cancelled.")
-                                if not chunk:
-                                    continue
-                                file.write(chunk)
-                                downloaded_so_far += len(chunk)
+                                    return False
 
-                                # update progress
+                                await asyncio.to_thread(process_and_write, data)
+
+                                data_len = len(data)
+                                chunk_progress[chunk_idx] += data_len
+                                total_downloaded[0] += data_len
+                                
                                 if callback:
-                                    callback(downloaded_so_far, total or 0)
+                                    callback(total_downloaded[0], file_size)
+                                elif progress_bar:
+                                    progress_bar.text_progress_bar(downloaded=total_downloaded[0], total=file_size)
+                            
+                            return True # Chunk success
+                                
+                    except Exception as e:
+                        if attempt < max_retries:
+                            self.logger.warning(f"Chunk {chunk_idx} failed (attempt {attempt+1}/{max_retries}): {e}")
+                            # Reset progress for this chunk before retry
+                            total_downloaded[0] -= chunk_progress[chunk_idx]
+                            chunk_progress[chunk_idx] = 0
+                            await asyncio.sleep(1 * attempt)
+                        else:
+                            self.logger.error(f"Chunk {chunk_idx} permanently failed: {e}")
+                            return False
 
-                                else:
-                                    progress_bar.text_progress_bar(downloaded=downloaded_so_far, total=total or 0)
-                                if downloaded_so_far >= next_log_bytes:
-                                    if total:
-                                        pct = (downloaded_so_far / total) * 100
-                                        self.logger.debug(
-                                            f"Legacy download progress: {downloaded_so_far}/{total} bytes ({pct:.1f}%)"
-                                        )
-                                    else:
-                                        self.logger.debug(
-                                            f"Legacy download progress: {downloaded_so_far} bytes"
-                                        )
-                                    next_log_bytes += log_every_bytes
+            tasks = []
+            chunk_idx = 0
+            for start in range(0, file_size, target_chunk_size):
+                end = min(start + target_chunk_size - 1, file_size - 1)
+                tasks.append(download_chunk(start, end, chunk_idx))
+                chunk_idx += 1
 
-                            # finished successfully
-                            if progress_bar:
-                                del progress_bar
-                            self.logger.info(
-                                f"Legacy download complete: bytes={downloaded_so_far} path={path}"
-                            )
-                            return True
+            results = await asyncio.gather(*tasks)
+            
+            if progress_bar:
+                del progress_bar
+                
+            if stop_event is not None and stop_event.is_set():
+                raise DownloadCancelled("Download cancelled.")
+                
+            if not all(results):
+                raise NetworkingError("One or more chunks failed to download completely.")
+                
+            self.logger.info(f"Fast multipart download complete: path={path}")
+            return True
 
-                        except httpx.ReadTimeout:
-                            # stall: back off and retry from current offset
-                            attempt += 1
-                            if attempt > max_retries:
-                                raise
-                            backoff = min(2 ** attempt, 30)
-                            self.logger.warning(
-                                f"Read timeout; retrying {attempt}/{max_retries} in {backoff}s "
-                                f"(offset={downloaded_so_far})"
-                            )
-                            if stop_event is not None:
-                                if stop_event.wait(backoff):
-                                    self.logger.warning("Stop event set; cancelling legacy download.")
-                                    raise DownloadCancelled("Download cancelled.")
-                            else:
-                                time.sleep(backoff)
-                            continue  # loop retries with Range  # let him coook!!!
+        # 3. Fallback to standard linear streaming download
+        if not allow_multipart:
+            self.logger.info("allow_multipart=False. Forcing linear streaming download.")
+        else:
+            self.logger.info("Server does not support Range requests or size is 0. Falling back to linear streaming.")
+            
+        downloaded_so_far = 0
+        attempt = 0
+        etag = None
 
-        except httpx.StreamClosed:
-            self.logger.error(
-                f"Stream for: {url} was closed at offset={downloaded_so_far}. This should not happen..."
-            )
-            raise NetworkingError(f"Stream for: {url} was closed, if this happens again, please report it!")
+        while True:
+            if stop_event is not None and stop_event.is_set():
+                self.logger.warning("Stop event set; cancelling legacy download.")
+                raise DownloadCancelled("Download cancelled.")
+            headers = {}
+            if downloaded_so_far:
+                headers["Range"] = f"bytes={downloaded_so_far}-"
 
-        except DownloadCancelled:
-            self.logger.warning(
-                f"Legacy download cancelled at offset={downloaded_so_far} for url={url}"
-            )
-            raise
+            try:
+                response = await self.session.request("GET", url, headers=headers, allow_redirects=True, timeout=timeout, stream=True)
+                if downloaded_so_far and response.status_code == 200:
+                    self.logger.warning("Server ignored Range request; restarting download from scratch.")
+                    downloaded_so_far = 0
+                response.raise_for_status()
 
-        except Exception:
-            error = traceback.format_exc()
-            self.logger.error(
-                f"Unknown (network) error for: {url} at offset={downloaded_so_far}. Please report this! -->: {error}"
-            )
-            raise NetworkingError(f"Unknown error for: {url}. Please report this! -->: {error}")
+                etag_cur = response.headers.get("ETag")
+                if etag is None:
+                    etag = etag_cur
+                elif etag_cur and etag_cur != etag:
+                    raise RuntimeError("Remote content changed during download")
+
+                total = None
+                cr = response.headers.get("Content-Range")
+                if cr and "/" in cr:
+                    try: total = int(cr.rsplit("/", 1)[1])
+                    except ValueError: pass
+                if total is None:
+                    try: total = int(response.headers.get("Content-Length", "0")) or None
+                    except ValueError: pass
+
+                # Fix fallback if total size is still missing
+                if total is None:
+                    total = 0
+
+                mode = "ab" if downloaded_so_far else "wb"
+
+                def linear_write(l_data):
+                    with open(path, mode) as file:
+                        file.seek(0, 2) # Move to EOF
+                        file.write(l_data)
+
+                async for chunk in response.aiter_content(chunk_size=chunk_size):
+                    if stop_event is not None and stop_event.is_set():
+                        raise DownloadCancelled("Download cancelled.")
+                    if not chunk:
+                        continue
+                    await asyncio.to_thread(linear_write, chunk)
+                    downloaded_so_far += len(chunk)
+
+                    if callback:
+                        callback(downloaded_so_far, total)
+                    elif progress_bar:
+                        progress_bar.text_progress_bar(downloaded=downloaded_so_far, total=total)
+
+                if progress_bar:
+                    del progress_bar
+                self.logger.info(f"Legacy download complete: bytes={downloaded_so_far} path={path}")
+                return True
+
+            except RequestsError as e:
+                err_str = str(e).lower()
+                if "timeout" in err_str or "read" in err_str:
+                    attempt += 1
+                    if attempt > max_retries:
+                        raise
+                    backoff = min(2 ** attempt, 30)
+                    self.logger.warning(f"Read timeout; retrying {attempt}/{max_retries} in {backoff}s")
+                    if stop_event is not None and stop_event.wait(backoff):
+                        raise DownloadCancelled("Download cancelled.")
+                    else:
+                        await asyncio.sleep(backoff)
+                    continue
+                else:
+                    raise NetworkingError(f"Stream for: {url} was closed or failed: {e}")
+            except DownloadCancelled:
+                raise
+            except Exception:
+                error = traceback.format_exc()
+                raise NetworkingError(f"Unknown error for: {url} -->: {error}")
 
 
     def truncate(self, name: str, max_bytes: int = 245) -> str:  # only 245, because we need to append .mp4

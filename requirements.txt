@@ -1,4 +1,4 @@
-httpx
+curl_cffi
 m3u8
 certifi
 anyio
@@ -8,5 +8,4 @@ hpack
 httpcore
 hyperframe
 idna
-m3u8
 sniffio

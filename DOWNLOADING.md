@@ -2,11 +2,14 @@
 
 This guide shows how to stop a download and pick it back up later. It focuses on usage, not internals.
 
+> **Note:** Since version 2.6, all download methods are `async` and must be called with `await` inside an async context.
+
 ## Threaded HLS downloads (m3u8)
 
 Use `BaseCore.download(...)` for HLS streams. Enable resume by providing a state file path:
 
 ```python
+import asyncio
 import threading
 from base_api import BaseCore
 from base_api.modules.errors import DownloadCancelled
@@ -14,17 +17,20 @@ from base_api.modules.errors import DownloadCancelled
 core = BaseCore()
 stop_event = threading.Event()
 
-try:
-    core.download(
-        video=video,
-        quality="720",
-        path="video.mp4",
-        segment_state_path="video.segment-state.json",
-        keep_segment_dir=True,
-        stop_event=stop_event,
-    )
-except DownloadCancelled:
-    print("Cancelled. Run again to resume.")
+async def main():
+    try:
+        await core.download(
+            video=video,
+            quality="720",
+            path="video.mp4",
+            segment_state_path="video.segment-state.json",
+            keep_segment_dir=True,
+            stop_event=stop_event,
+        )
+    except DownloadCancelled:
+        print("Cancelled. Run again to resume.")
+
+asyncio.run(main())
 ```
 
 - Cancel: call `stop_event.set()` from your UI or another thread.
@@ -41,6 +47,7 @@ Notes:
 For a single file URL, use `legacy_download(...)`:
 
 ```python
+import asyncio
 import threading
 from base_api import BaseCore
 from base_api.modules.errors import DownloadCancelled
@@ -48,16 +55,21 @@ from base_api.modules.errors import DownloadCancelled
 core = BaseCore()
 stop_event = threading.Event()
 
-try:
-    core.legacy_download(path="video.mp4", url=direct_url, stop_event=stop_event)
-except DownloadCancelled:
-    print("Cancelled. Run again to resume.")
+async def main():
+    try:
+        await core.legacy_download(path="video.mp4", url=direct_url, stop_event=stop_event)
+    except DownloadCancelled:
+        print("Cancelled. Run again to resume.")
+
+asyncio.run(main())
 ```
 
 - Resume: if `video.mp4` already exists, the downloader continues from where it left off.
 - Cancel: call `stop_event.set()` (or stop the call). The partial file remains, so running it again resumes.
+- By default, `allow_multipart=True` enables fast concurrent range downloading when the server supports it.
+  Set `allow_multipart=False` to force a single linear stream.
 
-If the server does not support ranged downloads, the download restarts automatically.
+If the server does not support ranged downloads, the download falls back to linear streaming automatically.
 
 ## Using the threaded downloader directly
 

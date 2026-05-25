@@ -4,7 +4,7 @@ build-backend = "uv_build"
 
 [project]
 name = "eaf_base_api"
-version = "2.5.4"
+version = "3.0"
 description = "A base API for EchterAlsFake's Porn APIs"
 readme = { file = "README.md", content-type = "text/markdown" }
 requires-python = ">=3.9"
@@ -20,7 +20,7 @@ classifiers = [
 ]
 
 dependencies = [
-  "httpx[brotli]", # Yes brotli is theoreticalyl not necessary but common it's soooo much faster and more lightweight
+  "curl_cffi",
 ]
 
 [project.optional-dependencies]
@@ -29,8 +29,6 @@ hls = [
   # av needs Python >= 3.10, so guard it (otherwise `pip install ...[hls]` fails on 3.8/3.9)
   "av; python_version >= '3.10'",
 ]
-scraping = ["fake-useragent"]
-httpx = ["httpx[socks,http2]"]
 
 [project.urls]
 Homepage = "https://github.com/EchterAlsFake/eaf_base_api"

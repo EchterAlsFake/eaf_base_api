@@ -5,12 +5,22 @@ class Callback:
     @classmethod
     def custom_callback(cls, downloaded, total):
         """This is an example of how you can implement the custom callback"""
-
-        percentage = (downloaded / total) * 100
-        print(f"Downloaded: {downloaded} bytes / {total} bytes ({percentage:.2f}%)")
+        if total and total > 0:
+            percentage = (downloaded / total) * 100
+            print(f"Downloaded: {downloaded} bytes / {total} bytes ({percentage:.2f}%)")
+        else:
+            print(f"Downloaded: {downloaded} bytes")
 
     @classmethod
     def text_progress_bar(cls, downloaded, total, title=False):
+        if not total or total <= 0:
+            # If total is unknown or 0, just show downloaded bytes
+            if title is False:
+                print(f"\r[{downloaded} bytes downloaded]", end='')
+            else:
+                print(f"\r | {title} | -->: [{downloaded} bytes downloaded]", end='')
+            return
+            
         bar_length = 50
         filled_length = int(round(bar_length * downloaded / float(total)))
         percents = round(100.0 * downloaded / float(total), 1)
@@ -23,6 +33,11 @@ class Callback:
 
     @staticmethod
     def update_progress(downloaded, total, animation_phase):
+        if not total or total <= 0:
+            sys.stdout.write(f"\r[{downloaded} bytes downloaded]")
+            sys.stdout.flush()
+            return
+            
         bar_length = 50
         filled_length = int(round(bar_length * downloaded / float(total)))
         percents = round(100.0 * downloaded / float(total), 1)

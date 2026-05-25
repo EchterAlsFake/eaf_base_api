@@ -10,11 +10,9 @@ class RuntimeConfig:
         self.verify_ssl = True
         self.cookies = None
         self.locale = "en-US,en;q=0.9" # If you override this, it could change regexes and thus make stuff not work...
-        self.use_http2 = True
         self.max_workers_download = 20
         self.videos_concurrency = 5
         self.pages_concurrency = 2
-        self.ssl_context = None # Custom SSL context if you want
 
 
 # Singleton instance needed for my Porn Fetch project
