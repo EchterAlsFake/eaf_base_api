@@ -1,3 +1,6 @@
+> [!WARNING]
+> The current release v3.0 breaks ALL existing projects that use this Project. DO NOT update yet, keep your v2.5.4. 
+
 # EAF Base API
 
 # What is this?
