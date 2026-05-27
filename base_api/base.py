@@ -30,6 +30,7 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any, Dict, List, Optional, Union, Callable, Tuple, Iterable
 
+from curl_cffi import CurlOpt # Used for DNS over HTTPS
 from curl_cffi import requests
 from curl_cffi.requests.errors import RequestsError
 from curl_cffi.requests import AsyncSession, Response
@@ -796,15 +797,36 @@ class BaseCore:
     def initialize_session(self):
         verify = self.config.verify_ssl
 
+        curl_options = {}
+        if self.config.dns_over_https:
+            curl_options[CurlOpt.DOH_URL] = str(self.config.dns_over_https).encode("utf-8")
+
         proxies = None
-        if self.config.proxy:
-            proxies = {"http": self.config.proxy, "https": self.config.proxy, "ws": self.config.proxy, "wss": self.config.proxy}
+        if self.config.proxies:
+            proxies = self.config.proxies
+
+        if self.config.max_bandwidth_mb is not None and self.config.max_bandwidth_mb > 0:
+            global_limit_bytes = int(self.config.max_bandwidth_mb * 1024 * 1024)
+            total_concurrent_connections = self.config.max_workers_download * self.config.videos_concurrency
+            per_connection_limit = max(1, int(global_limit_bytes / total_concurrent_connections))
+            curl_options[CurlOpt.MAX_RECV_SPEED_LARGE] = per_connection_limit
+
+        js3 = self.config.custom_ja3
+        impersonation = self.config.impersonation
+        http_version = self.config.http_version
+        proxy_auth = self.config.proxy_auth
+        trust_env = self.config.trust_env
 
         self.session = AsyncSession(
             proxies=proxies,
             timeout=self.config.timeout,
             verify=verify,
-            impersonate="chrome",
+            impersonate=impersonation,
+            curl_options=curl_options,
+            http_version=http_version,
+            ja3=js3,
+            proxy_auth=proxy_auth,
+            trust_env=trust_env
         )
         # Ensure our defaults are on the session
         self.session.headers.update(self.default_headers)
@@ -983,6 +1005,12 @@ class BaseCore:
                 self.logger.debug(f"Using Headers: {self.session.headers}")
                 self.logger.debug(f"Using Cookies: {self.session.cookies}")
 
+                if isinstance(self.config.max_bandwidth_mb, int):
+                    speed_limit = self.config.max_bandwidth_mb * 1024 * 1024 # Convert to bytes
+
+                else:
+                    speed_limit = None
+
                 response = await self.session.request(
                     method=method,
                     url=url,
@@ -991,6 +1019,7 @@ class BaseCore:
                     data=data,
                     json=json,
                     params=params,
+                    max_recv_speed=speed_limit,
                 )
 
                 last_response = response
@@ -1004,27 +1033,7 @@ class BaseCore:
                     if get_response:
                         return response
 
-                    # bandwidth-limited read (optional)
-                    if self.config.max_bandwidth_mb is not None and self.config.max_bandwidth_mb >= 0.2:
-                        raw_content = bytearray()
-                        chunk_size = 64 * 1024  # 64 KB
-                        speed_limit = self.config.max_bandwidth_mb * 1024 * 1024
-                        min_time_per_chunk = chunk_size / speed_limit
-                        start_time = time.time()
-                        
-                        content_bytes = response.content
-                        for i in range(0, len(content_bytes), chunk_size):
-                            chunk = content_bytes[i:i+chunk_size]
-                            raw_content.extend(chunk)
-                            elapsed = time.time() - start_time
-                            sleep_time = min_time_per_chunk - elapsed
-                            if sleep_time > 0:
-                                await asyncio.sleep(sleep_time)
-                            start_time = time.time()
-                        raw_content = bytes(raw_content)
-
-                    else:
-                        raw_content = response.content
+                    raw_content = response.content
 
                     if get_bytes:
                         content = raw_content
