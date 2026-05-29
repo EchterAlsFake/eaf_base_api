@@ -11,6 +11,7 @@ Thanks for understanding :)
 import re
 import os
 import sys
+import math
 import json
 import uuid
 import time
@@ -58,6 +59,56 @@ except (ModuleNotFoundError, ImportError):
 UA_DESKTOP_CHROME = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 loggers = {}
 HEIGHT_FROM_URI = re.compile(r'(?<!\d)(\d{3,4})[pP](?!\d)')  # e.g., 1080p, 720P
+REGEX_CHALLENGE = re.compile(r'var p=(\d+); var s=(\d+);.*?(\d+):1;', re.DOTALL)
+
+
+def eval_flags(flags: list[int]) -> int:
+    '''
+    Evaluate flags.
+
+    Args:
+        flags (list[int]): List of flags arguments.
+
+    Returns:
+        int: The flag(s) value.
+    '''
+
+    if len(flags):
+        return flags[0]
+
+    return 0
+
+
+def subc(*args):
+    '''
+    Compile a substraction regex and apply its replacement to each call.
+
+    Returns:
+        Callable: Wrapped regex callable.
+    '''
+
+    *flags, pattern, repl = args
+    flags = eval_flags(flags)
+
+    regex = re.compile(pattern, flags)
+
+    def wrapper(*args):
+        return regex.sub(repl, *args)
+
+    return wrapper
+
+parse_challenge = subc(re.DOTALL,              r'(?:var )|(?:/\*.*?\*/)|\s|\n|\t|(?:n;)', ''                                 ) # Parse challenge syntax
+ponct_challenge = subc(re.DOTALL,              r'(if.*?&1\)|else)', r'\1:'                                                   ) # Convert challenge syntax
+
+
+
+def least_factors(n: int) -> int:
+    if n <= 0: return 0
+    if n % 2 == 0: return 2
+    for i in range(3, int(math.sqrt(n)) + 1, 2):
+        if n % i == 0: return i
+    return n
+
 
 
 def _normalize_quality_value(quality) -> Union[str, int]:
@@ -349,6 +400,9 @@ class Cache:
             segments = self.cache_dictionary.get(m3u8_url, None)
             return segments
 
+    def delete_cache(self, entry: str):
+        with self.lock:
+            self.cache_dictionary.pop(entry)
 
 class Helper:
     def __init__(
@@ -776,6 +830,9 @@ class BaseCore:
     The base class which has all necessary functions for other API packages
     """
     def __init__(self, config=config):
+        self.lock = asyncio.Lock()
+        self.latest_key = None
+        self.latest_key_time = 0
         self.last_request_time = time.time()
         self.total_requests = 0  # Tracks how many requests have been made
         self.session: Optional[AsyncSession] = None
@@ -1011,6 +1068,11 @@ class BaseCore:
                 else:
                     speed_limit = None
 
+                current_time = asyncio.get_event_loop().time()
+                if "KEY" not in self.session.cookies and getattr(self, "latest_key", None):
+                    if current_time - self.latest_key_time < 10:  # 10-second freshness window
+                        self.session.cookies.set("KEY", self.latest_key, domain=".pornhub.com", path="/")
+
                 response = await self.session.request(
                     method=method,
                     url=url,
@@ -1026,6 +1088,68 @@ class BaseCore:
                 self.total_requests += 1
                 status = response.status_code
 
+                enc = getattr(response, "encoding", None) or "utf-8"
+                resp_text = response.content.decode(enc, errors="replace")
+
+                if 'onload="go()"' in resp_text:
+                    # Snapshot our persistent tracker instead of the volatile cookie jar
+                    local_latest = getattr(self, "latest_key", None)
+
+                    async with self.lock:
+                        # DOUBLE CHECK: If the persistent key changed while we waited,
+                        # another task successfully solved a newer challenge phase!
+                        if getattr(self, "latest_key", None) != local_latest:
+                            self.logger.info(
+                                "Another task already resolved the challenge! Retrying request with the new cookie.")
+                            # Force ensure it's in the jar before looping back
+                            if self.latest_key:
+                                self.session.cookies.set("KEY", self.latest_key, domain=".pornhub.com", path="/")
+                            continue
+
+                        self.logger.info("Challenge page detected! Solving...")
+
+                        get_challenge = re.compile(r'go\(\).*?{(.*?)n=l.*?KEY.*?s\+\":(\d+):', re.DOTALL)
+                        challenge_data = re.search(get_challenge, resp_text)
+
+                        if challenge_data:
+                            try:
+                                challenge_str, token_str = challenge_data.groups()
+
+                                code = parse_challenge(challenge_str)
+                                code = ponct_challenge(code)
+                                code = '\n'.join(code.split(';'))
+
+                                context = dict(p=0, s=0)
+                                exec(code, context)
+
+                                p = context['p']
+                                s = context['s']
+                                n = least_factors(p)
+
+                                cookie_value = f'{n}*{p // n}:{s}:{token_str}:1'
+
+                                # Update BOTH our internal tracker and the global session jar
+                                self.latest_key = cookie_value
+                                self.latest_key_time = asyncio.get_event_loop().time()
+
+                                self.session.cookies.set("KEY", cookie_value, domain=".pornhub.com", path="/")
+                                self.logger.info(f"RESOLVED CHALLENGE! Injected cookie: {cookie_value}")
+
+                                try:
+                                    self.cache.delete_cache(url)
+                                except (KeyError, Exception):
+                                    pass
+
+                                await asyncio.sleep(1.5)
+                                continue
+
+                            except Exception as math_err:
+                                self.logger.error(f"Failed executing math engine: {repr(math_err)}")
+                                continue
+                        else:
+                            self.logger.error("Detected challenge page, but your regex failed to extract data.")
+                            await asyncio.sleep(2)
+                            continue
                 # Fast path
                 if status == 200:
                     self.logger.debug(f"Attempt {attempt}: Successfully fetched URL: {url}")
