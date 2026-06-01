@@ -1135,9 +1135,10 @@ class BaseCore:
                                     code = '\n'.join(code.split(';'))
 
                                     # Sanitizing inputs to prevent possible RCE
-                                    safe_chars = set(string.ascii_letters + string.digits + " \t\n=+-*/().")
+                                    safe_chars = set(string.ascii_letters + string.digits + " \t\n=+-*/().:><&|~^")
                                     if not all(c in safe_chars for c in code):
-                                        self.logger.error("Security Abort: Challenge contains illegal characters.")
+                                        self.logger.error(f"Security Abort: Challenge contains illegal characters. CODE: {code}")
+                                        raise SecurityAbort
                                         await asyncio.sleep(2)
                                         continue
 
@@ -2247,8 +2248,8 @@ a new Python file, import only m3u8 and see what error you get.
             self.logger.info(f"Remux skipped; file moved. elapsed={elapsed:.2f}s")
 
     async def legacy_download(self, path: str, url: str, callback=None,
-                        chunk_size: int = 1 << 20,  # 1 MiB
                         max_retries: int = 5,
+                        chunk_size: int = 1024,
                         read_timeout: float = 120.0,
                         stop_event: Optional[threading.Event] = None,
                         max_workers: int = 5,
@@ -2259,7 +2260,7 @@ a new Python file, import only m3u8 and see what error you get.
         Assumes self.session is an AsyncSession.
         """
         self.logger.info(
-            f"Legacy download start: url={url} path={path} chunk_size={chunk_size} "
+            f"Legacy download start: url={url} path={path}"
             f"max_retries={max_retries} read_timeout={read_timeout} "
             f"stop_event_set={bool(stop_event and stop_event.is_set())} "
             f"allow_multipart={allow_multipart}"
@@ -2320,7 +2321,6 @@ a new Python file, import only m3u8 and see what error you get.
             # A chunk map: {chunk_index: bytes_downloaded}
             chunk_progress = {}
             total_downloaded = [0]  # List to allow modification in inner func
-
             # Determine chunk sizes based on file size, but keep reasonable bounds
             # For massive files, don't create 10,000 workers.
             target_chunk_size = max(chunk_size, min(10 * 1024 * 1024, file_size // 10)) # Between 1MB and 10MB
@@ -2444,7 +2444,7 @@ a new Python file, import only m3u8 and see what error you get.
                 f = await asyncio.to_thread(open, path, mode)
                 try:
                     await asyncio.to_thread(f.seek, 0, 2)  # Move to EOF
-                    async for chunk in response.aiter_content(chunk_size=chunk_size):
+                    async for chunk in response.aiter_content():
                         if stop_event is not None and stop_event.is_set():
                             raise DownloadCancelled("Download cancelled.")
                         if not chunk:
