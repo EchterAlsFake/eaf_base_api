@@ -452,14 +452,17 @@ class Helper:
             raise ValueError("chunk size must be > 0")
         it = iter(iterable)
         idx = 0
+        logger = logging.getLogger("helper.iterator")
+        is_debug = logger.isEnabledFor(logging.DEBUG)
         while True:
             block = list(islice(it, size))
             if not block:
                 return
             # Logging kept staticmethod-safe by using root logger to avoid needing self
-            logging.getLogger("helper.iterator").debug(
-                "chunked: yielding block #%d with %d items", idx, len(block)
-            )
+            if is_debug:
+                logger.debug(
+                    "chunked: yielding block #%d with %d items", idx, len(block)
+                )
             idx += 1
             yield block
 
@@ -611,7 +614,7 @@ class Helper:
             if pending_videos and len(video_in_flight) < videos_concurrency:
                 schedule_videos()
 
-            waiting_on = set(page_in_flight.keys()) | set(video_in_flight.keys())
+            waiting_on = [*page_in_flight, *video_in_flight]
             logger.debug(
                 "[%s] waiting futures page=%d video=%d queued_videos=%d",
                 run_id, len(page_in_flight), len(video_in_flight), len(pending_videos)
@@ -622,7 +625,7 @@ class Helper:
                 schedule_videos()
                 if not (page_in_flight or video_in_flight):
                     break
-                waiting_on = set(page_in_flight.keys()) | set(video_in_flight.keys())
+                waiting_on = [*page_in_flight, *video_in_flight]
 
             done, _ = await asyncio.wait(waiting_on, return_when=asyncio.FIRST_COMPLETED)
 
@@ -900,17 +903,22 @@ class BaseCore:
                 await asyncio.sleep(sleep_time)
         self.last_request_time = time.time()
 
-    def _merged_headers(self, override: Optional[Dict[str, str]]) -> None:
+    def _merged_headers(self, override: Optional[Dict[str, str]]) -> Dict[str, str]:
         """
         Create request headers from current session headers + optional overrides.
         Overrides win, session headers are the base.
         """
-        # Copy to avoid mutating session headers
-        self.session.headers.update(override)
+        headers = dict(self.session.headers)
+        if override:
+            headers.update(override)
+        return headers
 
-    def _merged_cookies(self, override: Optional[Dict[str, str]]) -> None:
+    def _merged_cookies(self, override: Optional[Dict[str, str]]) -> Dict[str, str]:
         """Same as above, but for cookies"""
-        self.session.cookies.update(override)
+        cookies = dict(self.session.cookies)
+        if override:
+            cookies.update(override)
+        return cookies
 
     def _parse_retry_after(self, response: Response) -> Optional[float]:
         """Parse Retry-After (seconds or http-date) into seconds; None if not present/invalid."""
@@ -1057,10 +1065,10 @@ class BaseCore:
                 await self.enforce_delay()
 
                 # Recompute headers each attempt so changes (like UA switch) take effect
-                self._merged_headers(headers)
-                self._merged_cookies(cookies)
-                self.logger.debug(f"Using Headers: {self.session.headers}")
-                self.logger.debug(f"Using Cookies: {self.session.cookies}")
+                req_headers = self._merged_headers(headers)
+                req_cookies = self._merged_cookies(cookies)
+                self.logger.debug(f"Using Headers: {req_headers}")
+                self.logger.debug(f"Using Cookies: {req_cookies}")
 
                 if isinstance(self.config.max_bandwidth_mb, int):
                     speed_limit = self.config.max_bandwidth_mb * 1024 * 1024 # Convert to bytes
@@ -1081,6 +1089,8 @@ class BaseCore:
                     data=data,
                     json=json,
                     params=params,
+                    headers=req_headers,
+                    cookies=req_cookies,
                     max_recv_speed=speed_limit,
                 )
 
@@ -1088,68 +1098,72 @@ class BaseCore:
                 self.total_requests += 1
                 status = response.status_code
 
-                enc = getattr(response, "encoding", None) or "utf-8"
-                resp_text = response.content.decode(enc, errors="replace")
+                content_type = response.headers.get("content-type", "").lower()
+                is_html = "text/html" in content_type if content_type else (not get_bytes)
 
-                if 'onload="go()"' in resp_text:
-                    # Snapshot our persistent tracker instead of the volatile cookie jar
-                    local_latest = getattr(self, "latest_key", None)
+                if is_html:
+                    enc = getattr(response, "encoding", None) or "utf-8"
+                    resp_text = response.content.decode(enc, errors="replace")
 
-                    async with self.lock:
-                        # DOUBLE CHECK: If the persistent key changed while we waited,
-                        # another task successfully solved a newer challenge phase!
-                        if getattr(self, "latest_key", None) != local_latest:
-                            self.logger.info(
-                                "Another task already resolved the challenge! Retrying request with the new cookie.")
-                            # Force ensure it's in the jar before looping back
-                            if self.latest_key:
-                                self.session.cookies.set("KEY", self.latest_key, domain=".pornhub.com", path="/")
-                            continue
+                    if 'onload="go()"' in resp_text:
+                        # Snapshot our persistent tracker instead of the volatile cookie jar
+                        local_latest = getattr(self, "latest_key", None)
 
-                        self.logger.info("Challenge page detected! Solving...")
+                        async with self.lock:
+                            # DOUBLE CHECK: If the persistent key changed while we waited,
+                            # another task successfully solved a newer challenge phase!
+                            if getattr(self, "latest_key", None) != local_latest:
+                                self.logger.info(
+                                    "Another task already resolved the challenge! Retrying request with the new cookie.")
+                                # Force ensure it's in the jar before looping back
+                                if self.latest_key:
+                                    self.session.cookies.set("KEY", self.latest_key, domain=".pornhub.com", path="/")
+                                continue
 
-                        get_challenge = re.compile(r'go\(\).*?{(.*?)n=l.*?KEY.*?s\+\":(\d+):', re.DOTALL)
-                        challenge_data = re.search(get_challenge, resp_text)
+                            self.logger.info("Challenge page detected! Solving...")
 
-                        if challenge_data:
-                            try:
-                                challenge_str, token_str = challenge_data.groups()
+                            get_challenge = re.compile(r'go\(\).*?{(.*?)n=l.*?KEY.*?s\+\":(\d+):', re.DOTALL)
+                            challenge_data = re.search(get_challenge, resp_text)
 
-                                code = parse_challenge(challenge_str)
-                                code = ponct_challenge(code)
-                                code = '\n'.join(code.split(';'))
-
-                                context = dict(p=0, s=0)
-                                exec(code, context)
-
-                                p = context['p']
-                                s = context['s']
-                                n = least_factors(p)
-
-                                cookie_value = f'{n}*{p // n}:{s}:{token_str}:1'
-
-                                # Update BOTH our internal tracker and the global session jar
-                                self.latest_key = cookie_value
-                                self.latest_key_time = asyncio.get_event_loop().time()
-
-                                self.session.cookies.set("KEY", cookie_value, domain=".pornhub.com", path="/")
-                                self.logger.info(f"RESOLVED CHALLENGE! Injected cookie: {cookie_value}")
-
+                            if challenge_data:
                                 try:
-                                    self.cache.delete_cache(url)
-                                except (KeyError, Exception):
-                                    pass
+                                    challenge_str, token_str = challenge_data.groups()
 
-                                await asyncio.sleep(1.5)
-                                continue
+                                    code = parse_challenge(challenge_str)
+                                    code = ponct_challenge(code)
+                                    code = '\n'.join(code.split(';'))
 
-                            except Exception as math_err:
-                                self.logger.error(f"Failed executing math engine: {repr(math_err)}")
+                                    context = dict(p=0, s=0)
+                                    exec(code, context)
+
+                                    p = context['p']
+                                    s = context['s']
+                                    n = least_factors(p)
+
+                                    cookie_value = f'{n}*{p // n}:{s}:{token_str}:1'
+
+                                    # Update BOTH our internal tracker and the global session jar
+                                    self.latest_key = cookie_value
+                                    self.latest_key_time = asyncio.get_event_loop().time()
+
+                                    self.session.cookies.set("KEY", cookie_value, domain=".pornhub.com", path="/")
+                                    self.logger.info(f"RESOLVED CHALLENGE! Injected cookie: {cookie_value}")
+
+                                    try:
+                                        self.cache.delete_cache(url)
+                                    except (KeyError, Exception):
+                                        pass
+
+                                    await asyncio.sleep(1.5)
+                                    continue
+
+                                except Exception as math_err:
+                                    self.logger.error(f"Failed executing math engine: {repr(math_err)}")
+                                    continue
+                            else:
+                                self.logger.error("Detected challenge page, but your regex failed to extract data.")
+                                await asyncio.sleep(2)
                                 continue
-                        else:
-                            self.logger.error("Detected challenge page, but your regex failed to extract data.")
-                            await asyncio.sleep(2)
-                            continue
                 # Fast path
                 if status == 200:
                     self.logger.debug(f"Attempt {attempt}: Successfully fetched URL: {url}")
@@ -1883,13 +1897,17 @@ a new Python file, import only m3u8 and see what error you get.
                                 next_progress_log += progress_log_step
 
                         if not segment_dir and parts is not None:
+                            chunks_to_write = []
                             while next_to_write < n and parts[next_to_write] is not None:
                                 if parts[next_to_write]:
-                                    # Write memory chunks to thread to prevent IO block
-                                    def write_chunk(fp, c_data):
-                                        fp.write(c_data)
-                                    await asyncio.to_thread(write_chunk, out_fp, parts[next_to_write])
+                                    chunks_to_write.append(parts[next_to_write])
                                 next_to_write += 1
+                            if chunks_to_write:
+                                # Write memory chunks to thread to prevent IO block
+                                def write_chunks(fp, list_of_data):
+                                    for c_data in list_of_data:
+                                        fp.write(c_data)
+                                await asyncio.to_thread(write_chunks, out_fp, chunks_to_write)
                 finally:
                     if out_fp is not None:
                         out_fp.close()
@@ -2310,26 +2328,26 @@ a new Python file, import only m3u8 and see what error you get.
                             resp = await self.session.request("GET", url, headers=headers, timeout=timeout, allow_redirects=True, stream=True)
                             resp.raise_for_status()
 
-                            # Synchronous file I/O can be offloaded for large writes
-                            def process_and_write(c_data):
-                                with open(path, "rb+") as f:
-                                    f.seek(start + chunk_progress[chunk_idx])
-                                    f.write(c_data)
+                            # Open file once for this chunk download attempt
+                            f = await asyncio.to_thread(open, path, "rb+")
+                            try:
+                                await asyncio.to_thread(f.seek, start + chunk_progress[chunk_idx])
+                                async for data in resp.aiter_content():
+                                    if stop_event is not None and stop_event.is_set():
+                                        return False
 
-                            async for data in resp.aiter_content(chunk_size=1024 * 1024):
-                                if stop_event is not None and stop_event.is_set():
-                                    return False
+                                    await asyncio.to_thread(f.write, data)
 
-                                await asyncio.to_thread(process_and_write, data)
-
-                                data_len = len(data)
-                                chunk_progress[chunk_idx] += data_len
-                                total_downloaded[0] += data_len
-                                
-                                if callback:
-                                    callback(total_downloaded[0], file_size)
-                                elif progress_bar:
-                                    progress_bar.text_progress_bar(downloaded=total_downloaded[0], total=file_size)
+                                    data_len = len(data)
+                                    chunk_progress[chunk_idx] += data_len
+                                    total_downloaded[0] += data_len
+                                    
+                                    if callback:
+                                        callback(total_downloaded[0], file_size)
+                                    elif progress_bar:
+                                        progress_bar.text_progress_bar(downloaded=total_downloaded[0], total=file_size)
+                            finally:
+                                await asyncio.to_thread(f.close)
                             
                             return True # Chunk success
                                 
@@ -2410,24 +2428,23 @@ a new Python file, import only m3u8 and see what error you get.
                     total = 0
 
                 mode = "ab" if downloaded_so_far else "wb"
+                f = await asyncio.to_thread(open, path, mode)
+                try:
+                    await asyncio.to_thread(f.seek, 0, 2)  # Move to EOF
+                    async for chunk in response.aiter_content(chunk_size=chunk_size):
+                        if stop_event is not None and stop_event.is_set():
+                            raise DownloadCancelled("Download cancelled.")
+                        if not chunk:
+                            continue
+                        await asyncio.to_thread(f.write, chunk)
+                        downloaded_so_far += len(chunk)
 
-                def linear_write(l_data):
-                    with open(path, mode) as file:
-                        file.seek(0, 2) # Move to EOF
-                        file.write(l_data)
-
-                async for chunk in response.aiter_content(chunk_size=chunk_size):
-                    if stop_event is not None and stop_event.is_set():
-                        raise DownloadCancelled("Download cancelled.")
-                    if not chunk:
-                        continue
-                    await asyncio.to_thread(linear_write, chunk)
-                    downloaded_so_far += len(chunk)
-
-                    if callback:
-                        callback(downloaded_so_far, total)
-                    elif progress_bar:
-                        progress_bar.text_progress_bar(downloaded=downloaded_so_far, total=total)
+                        if callback:
+                            callback(downloaded_so_far, total)
+                        elif progress_bar:
+                            progress_bar.text_progress_bar(downloaded=downloaded_so_far, total=total)
+                finally:
+                    await asyncio.to_thread(f.close)
 
                 if progress_bar:
                     del progress_bar
