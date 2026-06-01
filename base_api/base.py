@@ -15,6 +15,7 @@ import math
 import json
 import uuid
 import time
+import string
 import shutil
 import random
 import asyncio
@@ -1133,11 +1134,23 @@ class BaseCore:
                                     code = ponct_challenge(code)
                                     code = '\n'.join(code.split(';'))
 
-                                    context = dict(p=0, s=0)
-                                    exec(code, context)
+                                    # Sanitizing inputs to prevent possible RCE
+                                    safe_chars = set(string.ascii_letters + string.digits + " \t\n=+-*/().")
+                                    if not all(c in safe_chars for c in code):
+                                        self.logger.error("Security Abort: Challenge contains illegal characters.")
+                                        await asyncio.sleep(2)
+                                        continue
 
-                                    p = context['p']
-                                    s = context['s']
+                                    # Additional Sandboxing for exec environment
+                                    safe_globals = {"__builtins__": {}}
+                                    safe_locals = {"p": 0, "s": 0}
+
+                                    # Execute the code in the completely isolated sandbox
+                                    exec(code, safe_globals, safe_locals)
+
+                                    # Safely retrieve the variables using .get() to prevent KeyErrors if the challenge format changes
+                                    p = safe_locals.get('p', 0)
+                                    s = safe_locals.get('s', 0)
                                     n = least_factors(p)
 
                                     cookie_value = f'{n}*{p // n}:{s}:{token_str}:1'
