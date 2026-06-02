@@ -501,6 +501,8 @@ class Helper:
             pages_concurrency: int = 5,
             videos_concurrency: int = 20,
             other_return: bool = False,
+            method_pages = "GET", # Only for very special use cases like xvideos account history
+            method_videos = "GET",
     ):
         """
         Yields Video/ErrorVideo in deterministic (page_idx, vid_idx) order while fetching concurrently.
@@ -602,7 +604,7 @@ class Helper:
                 pidx, url = next(page_iter)
             except StopIteration:
                 break
-            task = asyncio.create_task(self.core.fetch(url))
+            task = asyncio.create_task(self.core.fetch(url, method=method_pages))
             page_in_flight[task] = (pidx, url)
             logger.debug(
                 "[%s] scheduled PAGE pidx=%d url=%s (queue=%d)",
@@ -654,7 +656,7 @@ class Helper:
                         if not stop_after_404:
                             try:
                                 npidx, nurl = next(page_iter)
-                                nfut = asyncio.create_task(self.core.fetch(nurl))
+                                nfut = asyncio.create_task(self.core.fetch(nurl, method=method_pages))
                                 page_in_flight[nfut] = (npidx, nurl)
                                 logger.debug(
                                     "[%s] scheduled NEXT PAGE pidx=%d url=%s after failure",
@@ -737,7 +739,7 @@ class Helper:
                     if not stop_after_404:
                         try:
                             npidx, nurl = next(page_iter)
-                            ntask = asyncio.create_task(self.core.fetch(nurl))
+                            ntask = asyncio.create_task(self.core.fetch(nurl, method=method_videos))
                             page_in_flight[ntask] = (npidx, nurl)
                             logger.debug(
                                 "[%s] scheduled NEXT PAGE pidx=%d url=%s (inflight_page=%d)",
