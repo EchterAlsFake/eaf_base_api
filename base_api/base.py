@@ -1241,11 +1241,6 @@ class BaseCore:
 
                 # 429: rate limited — respect Retry-After if present, else backoff and retry up to cap
                 if status == 429:
-                    if attempt == 0 or attempt == 1:
-                        self.logger.info("Trying 429 bypass (Initializing new session...)")
-                        self.initialize_session()
-                        continue
-
                     wait = self._parse_retry_after(response)
                     if wait is None:
                         # fall back to exponential backoff proportional to attempt
