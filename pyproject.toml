@@ -40,3 +40,9 @@ publish-url = "https://upload.pypi.org/legacy/"
 [tool.uv.build-backend]
 module-root = ""
 module-name = "base_api" # Because I named it differently we need to change here
+
+[dependency-groups]
+dev = [
+    "mypy>=1.19.1",
+    "types-m3u8>=6.0.0.20250708",
+]

@@ -1,9 +1,10 @@
 import sys
+from typing import Union
 
 
 class Callback:
     @classmethod
-    def custom_callback(cls, downloaded, total):
+    def custom_callback(cls, downloaded: int, total: int) -> None:
         """This is an example of how you can implement the custom callback"""
         if total and total > 0:
             percentage = (downloaded / total) * 100
@@ -12,7 +13,7 @@ class Callback:
             print(f"Downloaded: {downloaded} bytes")
 
     @classmethod
-    def text_progress_bar(cls, downloaded, total, title=False):
+    def text_progress_bar(cls, downloaded: int, total: int, title: Union[str, bool] = False) -> None:
         if not total or total <= 0:
             # If total is unknown or 0, just show downloaded bytes
             if title is False:
@@ -32,7 +33,7 @@ class Callback:
             print(f"\r | {title} | -->: [{bar}] {percents}%", end='')
 
     @staticmethod
-    def update_progress(downloaded, total, animation_phase):
+    def update_progress(downloaded: int, total: int, animation_phase: int) -> None:
         if not total or total <= 0:
             sys.stdout.write(f"\r[{downloaded} bytes downloaded]")
             sys.stdout.flush()
@@ -52,7 +53,7 @@ class Callback:
         sys.stdout.flush()
 
     @classmethod
-    def animated_text_progress(cls, downloaded, total_size):
+    def animated_text_progress(cls, downloaded: int, total_size: int) -> None:
         animation_phase = 0
         while downloaded <= total_size:
             cls.update_progress(downloaded, total_size, animation_phase)
