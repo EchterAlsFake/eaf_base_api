@@ -39,16 +39,19 @@ from curl_cffi.requests import AsyncSession, Response
 
 if TYPE_CHECKING:
     from .modules.errors import *
+    from .modules.type_hints import *
     from .modules.config import config, RuntimeConfig
     from .modules.progress_bars import Callback
 
 else:
     try:
         from modules.errors import *
+        from modules.type_hints import *
         from modules.config import config
         from modules.progress_bars import Callback
     except (ModuleNotFoundError, ImportError):
         from .modules.errors import *
+        from .modules.type_hints import *
         from .modules.config import config
         from .modules.progress_bars import Callback
 
@@ -1505,7 +1508,7 @@ a new Python file, import only m3u8 and see what error you get.
     def _segment_index_width(self, total: int) -> int:
         return max(6, len(str(max(0, total - 1))))
 
-    def _segment_file_path(self, segment_dir: str, index: int, width: int) -> str:
+    def _segment_file_path(self, segment_dir, index: int, width: int) -> str:
         return os.path.join(segment_dir, f"seg_{index:0{width}d}.ts")
 
     def _safe_remove(self, path: Optional[str]) -> None:
@@ -1528,7 +1531,7 @@ a new Python file, import only m3u8 and see what error you get.
         except Exception as e:
             self.logger.debug(f"Failed to remove directory {path}: {e}")
 
-    def _write_segment_state(self, state_path: str, state: Dict[str, Any]) -> None:
+    def _write_segment_state(self, state_path: str, state: DownloadState) -> None:
         tmp_path = f"{state_path}.tmp"
         with open(tmp_path, "w", encoding="utf-8") as fp:
             json.dump(state, fp, ensure_ascii=True, indent=2, sort_keys=True)
@@ -1550,22 +1553,22 @@ a new Python file, import only m3u8 and see what error you get.
         start_segment: int,
         m3u8_url: Optional[str],
         created_at: Optional[str] = None
-    ) -> Dict[str, Any]:
+    ) -> DownloadState:
         now = datetime.now(timezone.utc).isoformat()
-        state = {
-            "version": 1,
-            "created_at": created_at or now,
-            "updated_at": now,
-            "m3u8_url": m3u8_url,
-            "quality": quality,
-            "output_path": path,
-            "segment_dir": segment_dir,
-            "segment_index_width": segment_index_width,
-            "start_segment": start_segment,
-            "total": len(segments),
-            "missing": missing,
-            "segments": segments,
-        }
+        state = DownloadState(
+            version=1,
+            created_at=created_at or now,
+            updated_at=None,
+            m3u8_url=m3u8_url,
+            quality=quality,
+            output_path=path,
+            segment_dir=segment_dir,
+            segment_index_width=segment_index_width,
+            start_segment=start_segment,
+            total=len(segments),
+            missing=missing,
+            segments=segments
+        )
         return state
 
     async def download_segment(self, url: str, timeout: int, stop_event: Optional[threading.Event] = None) -> tuple[str, bytes, bool]:
@@ -1976,17 +1979,18 @@ a new Python file, import only m3u8 and see what error you get.
                     f"Missing segments detected: count={len(missing)} sample={sample}"
                 )
 
-            report = { # Generates a detailed report
-                "status": "cancelled" if cancelled else ("failed" if missing else "completed"),
-                "total": n,
-                "downloaded": n - len(missing),
-                "missing": missing,
-                "missing_urls": missing_urls,
-                "segment_dir": segment_dir,
-                "segment_state_path": segment_state_path,
-                "start_segment": start_segment,
-                "quality": state_quality,
-            }
+            report = DownloadReport(
+                status= "cancelled" if cancelled else ("failed" if missing else "completed"),
+                total=n,
+                downloaded= n - len(missing),
+                missing=missing,
+                missing_urls=missing_urls,
+                segment_dir=segment_dir,
+                segment_state_path=segment_state_path,
+                start_segment=start_segment,
+                quality=quality
+
+            )
 
             if cancelled: # If user cancels, we clean up stuff
                 self.logger.warning(
@@ -1998,6 +2002,8 @@ a new Python file, import only m3u8 and see what error you get.
                         self._safe_rmtree(segment_dir)
 
                 if segment_state_path:
+                    # This is the segment state that is saved as a file, this is NOT the returned report!
+
                     self.logger.info(f"Writing segment state to: {segment_state_path}")
                     state = self._build_segment_state(
                         segments=segments,
@@ -2013,8 +2019,9 @@ a new Python file, import only m3u8 and see what error you get.
                     self._write_segment_state(segment_state_path, state)
 
                 if return_report:
+                    missing = report.missing
                     self.logger.debug(
-                        f"Returning cancelled report: downloaded={report['downloaded']} missing={len(report['missing'])}"
+                        f"Returning cancelled report: downloaded={report.downloaded} missing={len(missing)}"
                     )
                     return report
                 raise DownloadCancelled("Download cancelled.")
@@ -2040,7 +2047,7 @@ a new Python file, import only m3u8 and see what error you get.
                     self._write_segment_state(segment_state_path, state)
                 if return_report:
                     self.logger.debug(
-                        f"Returning failed report: downloaded={report['downloaded']} missing={len(report['missing'])}"
+                        f"Returning failed report: downloaded={report.downloaded} missing={len(report.missing)}"
                     )
                     return report
                 raise UnknownError(
@@ -2085,13 +2092,13 @@ a new Python file, import only m3u8 and see what error you get.
                             created_at=created_at,
                         )
                         self._write_segment_state(segment_state_path, state)
-                    report["status"] = "failed"
-                    report["missing"] = missing
-                    report["missing_urls"] = [segments[i] for i in missing]
+                    report.status = "failed"
+                    report.missing = missing
+                    report.missing_urls = [segments[i] for i in missing]
                     if return_report:
                         self.logger.debug(
-                            f"Returning failed report after assemble: downloaded={report['downloaded']} "
-                            f"missing={len(report['missing'])}"
+                            f"Returning failed report after assemble: downloaded={report.downloaded} "
+                            f"missing={len(report.missing)}"
                         )
                         return report
                     raise UnknownError("Missing segment files during assemble.")
@@ -2126,7 +2133,7 @@ a new Python file, import only m3u8 and see what error you get.
 
             if return_report: # Do a report, if user asked to
                 self.logger.debug(
-                    f"Returning completed report: downloaded={report['downloaded']} missing={len(report['missing'])}"
+                    f"Returning completed report: downloaded={report.downloaded} missing={len(report.missing)}"
                 )
                 return report
             return True
