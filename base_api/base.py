@@ -1,18 +1,8 @@
 from __future__ import annotations
-
-"""
-The code in this library is insanely well documented. This was 50/50 by me and AI because this codebase got so complex
-and handles so many edge cases I NEED this much detail in the docs to not get lost when comming back to this
-after 2 weeks. 
-
-Thanks for understanding :)
-"""
-
 import re
 import os
 import sys
 import math
-import json
 import uuid
 import time
 import string
@@ -22,40 +12,50 @@ import asyncio
 import logging
 import traceback
 import threading
-
 from queue import Queue
 from itertools import islice
 from collections import deque
 from functools import lru_cache
 from urllib.parse import urljoin
-from datetime import datetime, timezone
-from email.utils import parsedate_to_datetime
-from typing import Any, Dict, List, cast, Union, Callable, Tuple, Iterable, TYPE_CHECKING, AsyncGenerator, Coroutine
-
+from typing import Union, Callable, Tuple, Iterable, TYPE_CHECKING, AsyncGenerator, Coroutine, cast, List, Dict, Any
 from curl_cffi import CurlOpt # Used for DNS over HTTPS
 from curl_cffi import requests
 from curl_cffi.requests.errors import RequestsError
 from curl_cffi.requests import AsyncSession, Response
 
 if TYPE_CHECKING:
-    from .modules.errors import *
-    from .modules.type_hints import *
+    import m3u8
+    from .modules.errors import (SecurityAbort, ResourceGone, ProxySSLError, UnknownError, InvalidProxy,
+                                 DownloadCancelled, NetworkingError)
+    from .modules.type_hints import DownloadReport
+    from .modules.static_functions import (load_segment_state, parse_retry_after, log_precondition_failed,
+                                           write_segment_state, build_segment_state, get_segment_index_width,
+                                           segment_file_path)
     from .modules.config import config, RuntimeConfig
     from .modules.progress_bars import Callback
+    from av.audio.codeccontext import AudioCodecContext
 
 else:
     try:
-        from modules.errors import *
-        from modules.type_hints import *
+        from modules.errors import (SecurityAbort, ResourceGone, ProxySSLError, UnknownError, InvalidProxy,
+                                     DownloadCancelled, NetworkingError)
+        from modules.type_hints import DownloadReport
+        from modules.static_functions import (load_segment_state, parse_retry_after, log_precondition_failed,
+                                               write_segment_state, build_segment_state, get_segment_index_width,
+                                               segment_file_path)
         from modules.config import config
         from modules.progress_bars import Callback
     except (ModuleNotFoundError, ImportError):
-        from .modules.errors import *
-        from .modules.type_hints import *
+        from .modules.errors import (SecurityAbort, ResourceGone, ProxySSLError, UnknownError, InvalidProxy,
+                                     DownloadCancelled, NetworkingError)
+        from .modules.type_hints import DownloadReport
+        from .modules.static_functions import (load_segment_state, parse_retry_after, log_precondition_failed,
+                                               write_segment_state, build_segment_state, get_segment_index_width,
+                                               segment_file_path)
         from .modules.config import config
         from .modules.progress_bars import Callback
 
-# The following imports are optional, because they depend on per API and I want to be as memory efficient as possible :)
+# The following imports are optional, because they depend on per API and I want to be as memory efficient as possible
 
 try:
     import m3u8
@@ -64,7 +64,8 @@ except (ModuleNotFoundError, ImportError):
     m3u8 = None  # type: ignore
 
 
-UA_DESKTOP_CHROME = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+UA_DESKTOP_CHROME = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+                     "Chrome/122.0.0.0 Safari/537.36")
 loggers: Dict[str, logging.Logger] = {}
 HEIGHT_FROM_URI = re.compile(r'(?<!\d)(\d{3,4})[pP](?!\d)')  # e.g., 1080p, 720P
 REGEX_CHALLENGE = re.compile(r'var p=(\d+); var s=(\d+);.*?(\d+):1;', re.DOTALL)
@@ -100,23 +101,28 @@ def subc(*args: Any) -> Callable[..., Any]:
 
     regex = re.compile(pattern, flags_val)
 
-    def wrapper(*args: Any) -> Any:
-        return regex.sub(repl, *args)
+    def wrapper(*args_: Any) -> Any:
+        return regex.sub(repl, *args_)
 
     return wrapper
 
-parse_challenge = subc(re.DOTALL,              r'(?:var )|(?:/\*.*?\*/)|\s|\n|\t|(?:n;)', ''                                 ) # Parse challenge syntax
-ponct_challenge = subc(re.DOTALL,              r'(if.*?&1\)|else)', r'\1:'                                                   ) # Convert challenge syntax
+parse_challenge = subc(re.DOTALL, r'(?:var )|(?:/\*.*?\*/)|\s|\n|\t|(?:n;)', '') # Parse challenge syntax
+other_challenge = subc(re.DOTALL, r'(if.*?&1\)|else)', r'\1:'                  ) # Convert challenge syntax
 
 
 
 def least_factors(n: int) -> int:
-    if n <= 0: return 0
-    if n % 2 == 0: return 2
+    """
+    Returns the least factor of a number.
+    """
+    if n <= 0:
+        return 0
+    if n % 2 == 0:
+        return 2
     for i in range(3, int(math.sqrt(n)) + 1, 2):
-        if n % i == 0: return i
+        if n % i == 0:
+            return i
     return n
-
 
 
 def _normalize_quality_value(quality: Union[str, int]) -> Union[str, int]:
@@ -131,7 +137,7 @@ def _normalize_quality_value(quality: Union[str, int]) -> Union[str, int]:
     if quality in {"best", "half", "worst"}:
         return quality # best, half and worst are also accepted values and will be further resolved in other functions
 
-    m = re.search(r'(\d{3,4})', quality) # Search for int values that fit 144p-2160p values. if found: return as int
+    m = re.search(r'(\d{3,4})', quality) # Search for int values that fit 144p-2160p values. return as int
     if m:
         return int(m.group(1))
     raise ValueError(f"Invalid quality: {quality}")
@@ -142,21 +148,18 @@ def _choose_quality_from_list(available: List[str | int], target: Union[str, int
     available_ints = sorted({int(x) for x in available}) # -> [144, 240, etc...]
     if isinstance(target, str):
         if target == "best":
-            return available_ints[-1] # Return the last index, as this represents the best quality [144,360,720] -1 = 720
+            return available_ints[-1] # Return the last index, this represents the best quality [144,360,720] -1 = 720
         if target == "worst":
-            return available_ints[0] # Return the first index, as this represents the worst quality [144,360,720] 0 = 144
+            return available_ints[0] # Return the first index, this represents the worst quality [144,360,720] 0 = 144
         if target == "half":
-            return available_ints[len(available_ints) // 2] # Divides all options by 2 to find the middle, will round up though
+            return available_ints[len(available_ints) // 2] # Divides all options by 2 to find the middle, rounds up
         raise ValueError("Invalid label.")
 
     # numeric: highest ≤ target, else closest
     le = [h for h in available_ints if h <= target]
-
-    """
-    This works by iterating over the available qualities until the target is reached. It creates a new list with these
-    qualities and returns the last index, as the last index in this case must be maximum best quality before we go over
-    the specified one.
-    """
+    # This works by iterating over the available qualities until the target is reached. It creates a new list with these
+    # qualities and returns the last index, as the last index in this case must be maximum best quality before we go over
+    # the specified one.
 
     if le:
         return le[-1] # Returns the stuff
@@ -182,14 +185,14 @@ class ErrorVideo:
         raise self._err
 
 
-def _height_from_variant(variant: Any) -> Optional[int]:
+def _height_from_variant(variant: Any) -> int | None:
     """Extract height from a variant:
     1) stream_info.resolution (w, h)
     2) URI pattern like .../720p/...
     """
     if getattr(variant, "stream_info", None) and variant.stream_info.resolution:
         _, h = variant.stream_info.resolution  # (width, height)
-        return int(h) # -> returns the height of a variant of an m3u8 master playlist
+        return int(h) # -> returns the height of a variant of a m3u8 master playlist
 
     # Fallback to search with a regex pattern
     if variant.uri:
@@ -206,7 +209,7 @@ def _is_video_playlist(variant: Any) -> bool:
     if getattr(variant, "is_iframe", False):
         return False
 
-    # If codecs known and contain only audio (mp4a, ac-3, ec-3, etc.)
+    # If codecs known and contain only audio (mp4-a, ac-3, ec-3, etc.)
     codecs = getattr(variant.stream_info, "codecs", None) if getattr(variant, "stream_info", None) else False
     if codecs:
         # very light heuristic: if no video codec substring, probably audio-only.
@@ -247,7 +250,7 @@ def _pick_by_label(variants: List[Dict[str, Any]], label: str) -> Dict[str, Any]
     if not ordered:
         raise ValueError("No video variants available in master playlist.")
 
-    if label == "worst":
+    elif label == "worst":
         return ordered[0]
     elif label == "half":
         return ordered[len(ordered)//2]
@@ -313,7 +316,8 @@ class HTTPLogHandler(logging.Handler):
         send_log_message(self.ip, self.port, log_entry)
 
 
-def setup_logger(name: str, log_file: Optional[str] = None, level: int = logging.CRITICAL, http_ip: Optional[str] = None, http_port: Optional[Union[int, str]] = None) -> logging.Logger:
+def setup_logger(name: str, log_file: str | None = None, level: int = logging.CRITICAL,
+                 http_ip: str | None = None, http_port: str | int | None = None) -> logging.Logger:
     """Creates or updates a logger for a specific module."""
     format_ = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 
@@ -376,13 +380,15 @@ class Cache:
         self.logger = setup_logger("BASE API - [Cache]", level=logging.CRITICAL)
         self.configuration = configuration
 
-    def enable_logging(self, log_file: Optional[str] = None, level: int = logging.DEBUG, log_ip: Optional[str] = None, log_port: Optional[Union[int, str]] = None) -> None:
+    def enable_logging(self, log_file: str | None = None, level: int = logging.DEBUG,
+                       log_ip: str | None = None, log_port: str | int | None = None) -> None:
         """
         Enables logging dynamically for this module.
         """
-        self.logger = setup_logger(name="BASE API - [Cache]", log_file=log_file, level=level, http_ip=log_ip, http_port=log_port)
+        self.logger = setup_logger(name="BASE API - [Cache]", log_file=log_file, level=level,
+                                   http_ip=log_ip, http_port=log_port)
 
-    def handle_cache(self, url: Optional[str]) -> Any:
+    def handle_cache(self, url: str | None) -> Any:
         if url is None:
             return None
 
@@ -396,7 +402,7 @@ class Cache:
                 first_key = next(iter(self.cache_dictionary))
                 # Delete the first item
                 del self.cache_dictionary[first_key]
-                self.logger.info(f"Deleting: {first_key} from cache, due to caching limits...")
+                self.logger.info("Deleting: %s from cache, due to caching limits...", first_key)
 
             self.cache_dictionary[url] = content
 
@@ -404,7 +410,7 @@ class Cache:
         with self.lock:
             self.cache_dictionary[m3u8_url] = segments
 
-    def get_segments_from_cache(self, m3u8_url: str) -> Optional[List[Any]]:
+    def get_segments_from_cache(self, m3u8_url: str) -> List[str] | None:
         with self.lock:
             segments = self.cache_dictionary.get(m3u8_url, None)
             return segments
@@ -419,17 +425,17 @@ class Helper:
         core: Any,
         video: Callable[..., Any],
         *,
-        logger: Optional[logging.Logger] = None,
+        logger: logging.Logger | None = None,
         log_name: str = "helper.iterator",
-        log_file: Optional[str] = None,
+        log_file: str | None = None,
         log_level: int = logging.INFO,
-        http_ip: Optional[str] = None,
-        http_port: Optional[Union[int, str]] = None,
-        other: Optional[Callable[..., Any]] = None
+        http_ip: str | None = None,
+        http_port: int | str | None = None,
+        other: Callable[..., Any] | None = None
     ) -> None:
         """
         Args:
-            core: object with .fetch(url) -> html
+            core: object with .fetch(url) -> HTML
             video: callable Video(url, core=...)
             logger: optional pre-configured logger (if not provided, one is created via setup_logger)
             log_name/log_file/log_level/http_*: used only when `logger` is None
@@ -505,8 +511,8 @@ class Helper:
 
     async def iterator(
             self,
-            page_urls: Optional[List[str]] = None,
-            extractor: Optional[Callable[..., Any]] = None,
+            page_urls: List[str] | None = None,
+            extractor: Callable[..., Any] | None = None,
             pages_concurrency: int = 5,
             videos_concurrency: int = 20,
             other_return: bool = False,
@@ -546,7 +552,7 @@ class Helper:
 
         # NEW: stop paging after first 404
         stop_after_404 = False
-        stop_at_page_idx: Optional[int] = None
+        stop_at_page_idx: int | None = None
 
         def flush_ready() -> List[Any]:
             nonlocal next_page_idx, next_video_idx
@@ -598,17 +604,17 @@ class Helper:
         def schedule_videos() -> int:
             scheduled = 0
             while pending_videos and len(video_in_flight) < videos_concurrency:
-                pidx, vid_idx, vurl = pending_videos.popleft()
+                page_idx, video_idx, video_xurl = pending_videos.popleft()
                 if other_return:
-                    task = asyncio.create_task(self._other_return(vurl))
+                    task_temp = asyncio.create_task(self._other_return(video_xurl))
                 else:
-                    task = asyncio.create_task(self._make_video_safe(vurl))
-                video_in_flight[task] = (pidx, vid_idx)
+                    task_temp = asyncio.create_task(self._make_video_safe(video_xurl))
+                video_in_flight[task_temp] = (page_idx, video_idx)
                 scheduled += 1
                 logger.debug(
                     "[%s] scheduled VIDEO pidx=%d vidx=%d vurl=%s "
                     "(inflight_video=%d queued=%d)",
-                    run_id, pidx, vid_idx, vurl, len(video_in_flight), len(pending_videos)
+                    run_id, page_idx, video_idx, video_xurl, len(video_in_flight), len(pending_videos)
                 )
             return scheduled
 
@@ -669,12 +675,12 @@ class Helper:
                         # schedule next page if available (unless we've already stopped)
                         if not stop_after_404:
                             try:
-                                npidx, nurl = next(page_iter)
-                                nfut = asyncio.create_task(self.core.fetch(nurl, method=method_pages))
-                                page_in_flight[nfut] = (npidx, nurl)
+                                n_pidx, n_url = next(page_iter)
+                                n_fut = asyncio.create_task(self.core.fetch(n_url, method=method_pages))
+                                page_in_flight[n_fut] = (n_pidx, n_url)
                                 logger.debug(
                                     "[%s] scheduled NEXT PAGE pidx=%d url=%s after failure",
-                                    run_id, npidx, nurl
+                                    run_id, n_pidx, n_url
                                 )
                             except StopIteration:
                                 pass
@@ -685,7 +691,8 @@ class Helper:
                     try:
                         if isinstance(html_or_resp, Response) and html_or_resp.status_code == 404:
                             is_404 = True
-                    except Exception:
+                    except Exception as exc:
+                        logger.info("Possible error while trying to detect 404 error, falling back. %s", exc)
                         # Fallback duck-typing if import fails for some reason
                         if getattr(html_or_resp, "status_code", None) == 404 and hasattr(html_or_resp, "headers"):
                             is_404 = True
@@ -742,8 +749,8 @@ class Helper:
                         run_id, pidx, page_counts[pidx]
                     )
 
-                    for vid_idx, vurl in enumerate(video_urls):
-                        pending_videos.append((pidx, vid_idx, vurl))
+                    for vid_idx, video_url in enumerate(video_urls):
+                        pending_videos.append((pidx, vid_idx, video_url))
                     schedule_videos()
 
                     for item in flush_ready():
@@ -752,12 +759,12 @@ class Helper:
                     # Fetch next page only if we haven't seen a 404
                     if not stop_after_404:
                         try:
-                            npidx, nurl = next(page_iter)
-                            ntask = asyncio.create_task(self.core.fetch(nurl, method=method_videos))
-                            page_in_flight[ntask] = (npidx, nurl)
+                            np_idx, n_url = next(page_iter)
+                            ntask = asyncio.create_task(self.core.fetch(n_url, method=method_videos))
+                            page_in_flight[ntask] = (np_idx, n_url)
                             logger.debug(
                                 "[%s] scheduled NEXT PAGE pidx=%d url=%s (inflight_page=%d)",
-                                run_id, npidx, nurl, len(page_in_flight)
+                                run_id, np_idx, n_url, len(page_in_flight)
                             )
                         except StopIteration:
                             logger.debug("[%s] no more pages to schedule", run_id)
@@ -810,8 +817,8 @@ def async_generator_to_sync(async_gen_func: Callable[..., Any], *args: Any, **kw
             try:
                 # Instantiate and iterate over the async generator
                 gen = async_gen_func(*args, **kwargs)
-                async for item in gen:
-                    sync_queue.put(item)
+                async for _item in gen:
+                    sync_queue.put(_item)
             except Exception as e:
                 # Catch any errors in the scraper and pass them to the sync thread
                 sync_queue.put((error_sentinel, e))
@@ -849,72 +856,77 @@ class BaseCore:
     """
     The base class which has all necessary functions for other API packages
     """
-    def __init__(self, config: "RuntimeConfig" = config) -> None:
+    def __init__(self, configuration: "RuntimeConfig" = config) -> None:
         self.lock = asyncio.Lock()
-        self.latest_key: Optional[str] = None
+        self.latest_key: str | None = None
         self.latest_key_time: float = 0.0
         self.last_request_time = time.time()
         self.total_requests: int = 0  # Tracks how many requests have been made
-        self.session: Optional[AsyncSession] = None
-        self.config = config
-        self.cache = Cache(self.config)
+        self.session: AsyncSession | None = None
+        self.configuration = configuration
+        self.cache = Cache(self.configuration)
         self.logger = setup_logger("BASE API - [BaseCore]", log_file=None, level=logging.ERROR)
         self.default_headers = {
             "User-Agent": UA_DESKTOP_CHROME,
-            "Accept-Language": self.config.locale,
+            "Accept-Language": self.configuration.locale,
             "Accept-Encoding": "gzip, deflate, br"
         }
 
-    def enable_logging(self, log_file: Optional[str] = None, level: int = logging.DEBUG, log_ip: Optional[str] = None, log_port: Optional[Union[int, str]] = None) -> None:
+    def enable_logging(self, log_file: str | None = None, level: int = logging.DEBUG, log_ip:
+    str | None = None, log_port: int | str | None = None) -> None:
         """Enables logging dynamically for this module."""
-        self.logger = setup_logger(name="BASE API - [BaseCore]", log_file=log_file, level=level, http_ip=log_ip, http_port=log_port)
-        self.cache.logger = setup_logger(name="BASE API - [Cache]", log_file=log_file, level=level, http_ip=log_ip, http_port=log_port)
+        self.logger = setup_logger(name="BASE API - [BaseCore]", log_file=log_file, level=level, http_ip=log_ip,
+                                   http_port=log_port)
+        self.cache.logger = setup_logger(name="BASE API - [Cache]", log_file=log_file, level=level, http_ip=log_ip,
+                                         http_port=log_port)
 
     def initialize_session(self) -> None:
-        verify = self.config.verify_ssl
+        verify = self.configuration.verify_ssl
 
         curl_options: Dict[CurlOpt, Union[bytes, int]] = {}
-        if self.config.dns_over_https:
-            curl_options[CurlOpt.DOH_URL] = str(self.config.dns_over_https).encode("utf-8")
+        if self.configuration.dns_over_https:
+            curl_options[CurlOpt.DOH_URL] = str(self.configuration.dns_over_https).encode("utf-8")
 
         proxies = None
-        if self.config.proxies:
-            proxies = self.config.proxies
+        if self.configuration.proxies:
+            proxies = self.configuration.proxies
 
-        if self.config.max_bandwidth_mb is not None and self.config.max_bandwidth_mb > 0:
-            global_limit_bytes = int(self.config.max_bandwidth_mb * 1024 * 1024)
-            total_concurrent_connections = self.config.max_workers_download * self.config.videos_concurrency
+        if self.configuration.max_bandwidth_mb is not None and self.configuration.max_bandwidth_mb > 0:
+            global_limit_bytes = int(self.configuration.max_bandwidth_mb * 1024 * 1024)
+            total_concurrent_connections = (self.configuration.max_workers_download *
+                                            self.configuration.videos_concurrency)
             per_connection_limit = max(1, int(global_limit_bytes / total_concurrent_connections))
             curl_options[CurlOpt.MAX_RECV_SPEED_LARGE] = per_connection_limit
 
-        js3 = self.config.custom_ja3
-        impersonation = self.config.impersonation
-        http_version = self.config.http_version
-        proxy_auth_str = self.config.proxy_auth
-        trust_env = self.config.trust_env
+        js3 = self.configuration.custom_ja3
+        impersonation = self.configuration.impersonation
+        http_version = self.configuration.http_version
+        proxy_auth_str = self.configuration.proxy_auth
+        trust_env = self.configuration.trust_env
 
-        p_auth: Optional[Tuple[str, str]] = None
+        p_auth: Tuple[str, str] | None = None
         if proxy_auth_str and ":" in proxy_auth_str:
             u, p = proxy_auth_str.split(":", 1)
             p_auth = (u, p)
 
         self.session = cast(Any, AsyncSession)(
-            proxies=cast(Any, proxies),
-            timeout=self.config.timeout,
+            proxies=proxies,
+            timeout=self.configuration.timeout,
             verify=verify,
-            impersonate=cast(Any, impersonation),
+            impersonate=impersonation,
             curl_options=curl_options,
-            http_version=cast(Any, http_version),
+            http_version=http_version,
             ja3=js3,
             proxy_auth=p_auth,
             trust_env=trust_env
         )
         # Ensure our defaults are on the session
+        assert self.session is not None
         self.session.headers.update(self.default_headers)
 
     async def enforce_delay(self) -> None:
         """Enforces the specified delay in config.request_delay (only if > 0)."""
-        delay = self.config.request_delay
+        delay = self.configuration.request_delay
         if delay and delay > 0:
             time_since_last_request = time.time() - self.last_request_time
             self.logger.debug(f"Time since last request: {time_since_last_request:.2f} seconds.")
@@ -924,7 +936,7 @@ class BaseCore:
                 await asyncio.sleep(sleep_time)
         self.last_request_time = time.time()
 
-    def _merged_headers(self, override: Optional[Dict[str, str]]) -> Dict[str, Any]:
+    def _merged_headers(self, override: Dict[str, str] | None) -> Dict[str, Any]:
         """
         Create request headers from current session headers + optional overrides.
         Overrides win, session headers are the base.
@@ -938,7 +950,7 @@ class BaseCore:
             headers.update(override)
         return headers
 
-    def _merged_cookies(self, override: Optional[Dict[str, str]]) -> Dict[str, Any]:
+    def _merged_cookies(self, override: Dict[str, str] | None) -> Dict[str, Any]:
         """Same as above, but for cookies"""
         if self.session is None:
             self.initialize_session()
@@ -949,119 +961,27 @@ class BaseCore:
             cookies.update(override)
         return cookies
 
-    def _parse_retry_after(self, response: Response) -> Optional[float]:
-        """Parse Retry-After (seconds or http-date) into seconds; None if not present/invalid."""
-        v = response.headers.get("Retry-After")
-        if not v:
-            return None
-        try:
-            # numeric seconds
-            return float(v)
-        except ValueError:
-            try:
-                dt = parsedate_to_datetime(v)
-                # Convert to seconds from now
-                delta = (dt - dt.now(dt.tzinfo)).total_seconds()
-                # clamp: negative -> 0
-                return max(0.0, delta)
-            except Exception:
-                return None
-
-    def _format_headers_for_log(self, headers: Any) -> Dict[str, str]:
-        """Redact sensitive headers but keep enough signal for debugging."""
-        sensitive = {
-            "authorization",
-            "proxy-authorization",
-            "cookie",
-            "set-cookie",
-            "x-api-key",
-            "x-auth-token",
-            "x-csrf-token",
-            "x-xsrf-token",
-        }
-        out: Dict[str, str] = {}
-        for key, value in headers.items():
-            lkey = key.lower()
-            if lkey in sensitive:
-                if lkey == "cookie":
-                    parts = [p.split("=", 1)[0].strip() for p in str(value).split(";") if p.strip()]
-                    value = f"<redacted:{','.join(parts)}>" if parts else "<redacted>"
-                else:
-                    value = "<redacted>"
-            if key in out:
-                out[key] = f"{out[key]}, {value}"
-            else:
-                out[key] = str(value)
-        return out
-
-    def _response_body_preview(self, response: Response, max_bytes: int = 512) -> str:
-        try:
-            raw = response.content[:max_bytes]
-        except Exception as e:
-            return f"<failed to read body: {e}>"
-        if not raw:
-            return "<empty>"
-        enc = getattr(response, "encoding", None) or "utf-8"
-        try:
-            text = cast(bytes, cast(Any, raw)).decode(enc, errors="replace")
-        except Exception:
-            text = cast(bytes, cast(Any, raw)).decode("utf-8", errors="replace")
-        return text.replace("\r", "\\r").replace("\n", "\\n")
-
-    def _log_precondition_failed(self, response: Response, attempt: int) -> None:
-        req = response.request
-        try:
-            req_headers = self._format_headers_for_log(req.headers) if req is not None else {}
-        except Exception as e:
-            req_headers = {"<error>": f"failed to format request headers: {e}"}
-
-        try:
-            resp_headers = self._format_headers_for_log(response.headers)
-        except Exception as e:
-            resp_headers = {"<error>": f"failed to format response headers: {e}"}
-
-        try:
-            cond_headers = [
-                k for k in req.headers.keys() if k.lower().startswith("if-")
-            ] if req is not None else []
-        except Exception:
-            cond_headers = []
-
-        cond_note = f" conditional_headers={cond_headers}" if cond_headers else ""
-        body_preview = self._response_body_preview(response)
-
-        self.logger.warning(
-            "HTTP 412 precondition failed (attempt %d) for %s %s.%s request_headers=%s response_headers=%s body_preview=%s",
-            attempt + 1,
-            getattr(req, "method", "UNKNOWN") if req is not None else "UNKNOWN",
-            response.url,
-            cond_note,
-            req_headers,
-            resp_headers,
-            body_preview,
-        )
-
     async def fetch(
         self,
         url: str,
         get_bytes: bool = False,
-        timeout: Optional[int] = None,
+        timeout: int | None = None,
         get_response: bool = False,
         save_cache: bool = True,
-        cookies: Optional[Dict[str, str]] = None,
+        cookies: Dict[str, str] | None = None,
         allow_redirects: bool = True,
-        data: Optional[Dict[str, Any]] = None,
+        data: Dict[str, Any] | None = None,
         method: str = "GET",
-        headers: Optional[Dict[str, str]] = None,
-        json: Optional[Dict[str, Any]] = None,
-        params: Optional[Dict[str, Any]] = None,
+        headers: Dict[str, str] | None = None,
+        json_data: Dict[str, Any] | None = None,
+        params: Dict[str, Any] | None = None,
     ) -> Union[bytes, str, Response]:
         """
         Fetch content with retries, optional caching, proxy support, and bandwidth limiting.
 
         Returns:
-            - Response if get_response=True
-            - bytes            if get_bytes=True
+            - Response if the get_response=True
+            - bytes            if the get_bytes=True
             - str (text)       otherwise
 
         Raises:
@@ -1077,13 +997,13 @@ class BaseCore:
         # Cache (only for text mode)
         cache_hit = self.cache.handle_cache(url)
         if cache_hit is not None and not get_bytes and not get_response:
-            self.logger.info(f"Fetched content for: {url} from cache!")
+            self.logger.info(f"Fetched content for: %s from cache!", url)
             return cache_hit
 
-        req_timeout = timeout or self.config.timeout
-        last_response: Optional[Response] = None
+        req_timeout = timeout or self.configuration.timeout
+        last_response: Response | None = None
 
-        max_retries = max(1, int(self.config.max_retries))
+        max_retries = max(1, int(self.configuration.max_retries))
         for attempt in range(max_retries):
             # backoff (attempt 0 has no extra sleep)
             if attempt >= 1:
@@ -1099,11 +1019,11 @@ class BaseCore:
                 # Recompute headers each attempt so changes (like UA switch) take effect
                 req_headers = self._merged_headers(headers)
                 req_cookies = self._merged_cookies(cookies)
-                self.logger.debug(f"Using Headers: {req_headers}")
-                self.logger.debug(f"Using Cookies: {req_cookies}")
+                self.logger.debug("Using Headers: %s", req_headers)
+                self.logger.debug("Using Cookies: %s", req_cookies)
 
-                if isinstance(self.config.max_bandwidth_mb, int):
-                    speed_limit = self.config.max_bandwidth_mb * 1024 * 1024 # Convert to bytes
+                if isinstance(self.configuration.max_bandwidth_mb, int):
+                    speed_limit = self.configuration.max_bandwidth_mb * 1024 * 1024 # Convert to bytes
 
                 else:
                     speed_limit = None
@@ -1120,7 +1040,7 @@ class BaseCore:
                     timeout=req_timeout,
                     allow_redirects=allow_redirects,
                     data=data,
-                    json=json,
+                    json=json_data,
                     params=params,
                     headers=req_headers,
                     cookies=req_cookies,
@@ -1136,7 +1056,7 @@ class BaseCore:
 
                 if is_html:
                     enc = getattr(response, "encoding", None) or "utf-8"
-                    resp_text = cast(bytes, cast(Any, response.content)).decode(enc, errors="replace")
+                    resp_text = cast(bytes, response.content).decode(enc, errors="replace")
 
                     if 'onload="go()"' in resp_text:
                         # Snapshot our persistent tracker instead of the volatile cookie jar
@@ -1147,7 +1067,7 @@ class BaseCore:
                             # another task successfully solved a newer challenge phase!
                             if getattr(self, "latest_key", None) != local_latest:
                                 self.logger.info(
-                                    "Another task already resolved the challenge! Retrying request with the new cookie.")
+                                "Another task already resolved the challenge! Retrying request with the new cookie.")
                                 # Force ensure it's in the jar before looping back
                                 if self.latest_key:
                                     session.cookies.set("KEY", self.latest_key, domain=".pornhub.com", path="/")
@@ -1163,13 +1083,13 @@ class BaseCore:
                                     challenge_str, token_str = challenge_data.groups()
 
                                     code = parse_challenge(challenge_str)
-                                    code = ponct_challenge(code)
+                                    code = other_challenge(code)
                                     code = '\n'.join(code.split(';'))
 
                                     # Sanitizing inputs to prevent possible RCE
                                     safe_chars = set(string.ascii_letters + string.digits + " \t\n=+-*/().:><&|~^")
                                     if not all(c in safe_chars for c in code):
-                                        self.logger.error(f"Security Abort: Challenge contains illegal characters. CODE: {code}")
+                                        self.logger.error("Security Abort: Illegal chars in challenge, CODE: %s", code)
                                         raise SecurityAbort
 
                                     # Additional Sandboxing for exec environment
@@ -1179,7 +1099,8 @@ class BaseCore:
                                     # Execute the code in the completely isolated sandbox
                                     exec(code, safe_globals, safe_locals)
 
-                                    # Safely retrieve the variables using .get() to prevent KeyErrors if the challenge format changes
+                                    # Safely retrieve the variables using .get() to prevent KeyErrors if the challenge
+                                    # format changes
                                     p = safe_locals.get('p', 0)
                                     s = safe_locals.get('s', 0)
                                     n = least_factors(p)
@@ -1191,7 +1112,7 @@ class BaseCore:
                                     self.latest_key_time = asyncio.get_event_loop().time()
 
                                     session.cookies.set("KEY", cookie_value, domain=".pornhub.com", path="/")
-                                    self.logger.info(f"RESOLVED CHALLENGE! Injected cookie: {cookie_value}")
+                                    self.logger.info(f"RESOLVED CHALLENGE! Injected cookie: %s", cookie_value)
 
                                     try:
                                         self.cache.delete_cache(url)
@@ -1202,7 +1123,7 @@ class BaseCore:
                                     continue
 
                                 except Exception as math_err:
-                                    self.logger.error(f"Failed executing math engine: {repr(math_err)}")
+                                    self.logger.error("Failed executing math engine: %s", repr(math_err))
                                     continue
                             else:
                                 self.logger.error("Detected challenge page, but your regex failed to extract data.")
@@ -1210,7 +1131,7 @@ class BaseCore:
                                 continue
                 # Fast path
                 if status == 200:
-                    self.logger.debug(f"Attempt {attempt}: Successfully fetched URL: {url}")
+                    self.logger.debug("Attempt %s: Successfully fetched URL: %s", attempt, url)
 
                     if get_response:
                         return response
@@ -1225,12 +1146,13 @@ class BaseCore:
                         # Prefer server-provided/guessed encoding; fallback to utf-8 then latin-1
                         enc = getattr(response, "encoding", None) or "utf-8"
                         try:
-                            content = cast(bytes, cast(Any, raw_content)).decode(enc, errors="strict")
+                            content = cast(bytes, raw_content).decode(enc, errors="strict")
                         except UnicodeDecodeError:
-                            self.logger.warning(f"Content could not be decoded as {enc} ({url}), decoding in 'latin1' instead!")
-                            content = cast(bytes, cast(Any, raw_content)).decode("latin1", errors="replace")
+                            self.logger.warning("Content could not be decoded as %s (%s), "
+                                                "decoding 'latin1' instead!", enc, url)
+                            content = cast(bytes, raw_content).decode("latin1", errors="replace")
                         if save_cache:
-                            self.logger.debug(f"Saving content of {url} to local cache.")
+                            self.logger.debug("Saving content of %s to local cache.", url)
                             self.cache.save_cache(url, content)
 
                     return content
@@ -1246,7 +1168,7 @@ class BaseCore:
                         session.headers.update({
                             "User-Agent": "AppleWebKit/537.36 (KHTML, like Gecko)"
                         })
-                        self.logger.warning(f"Switched User-Agent to: {session.headers.get('User-Agent')}")
+                        self.logger.warning("Switched User-Agent to: %s", session.headers.get('User-Agent'))
                         # continue to retry with new UA
                         continue
 
@@ -1257,61 +1179,63 @@ class BaseCore:
                         response.raise_for_status()
 
                 if status == 412:
-                    self._log_precondition_failed(response, attempt)
+                    log_precondition_failed(logger=self.logger, attempt=attempt, response=response)
 
                 # 404: usually not recoverable, but we try once (if attempt==0) in case of transient CDN
                 if status == 404:
-                    return response # Immediately returning response, because 404 usually means no more content when searching
+                    return response # Immediately returning response, because 404 usually means no more content
 
                 # 410: permanent gone
                 if status == 410:
-                    raise ResourceGone(f"Resource gone (HTTP 410) for URL: {url}") # Not gonna fix that, bro just reinitialize video and that's it lmao
+                    raise ResourceGone(f"Resource gone (HTTP 410) for URL: {url}") # if tokens are expired mostly
 
                 # 429: rate limited — respect Retry-After if present, else backoff and retry up to cap
                 if status == 429:
-                    wait = self._parse_retry_after(response)
+                    wait = parse_retry_after(logger=self.logger, response=response)
                     if wait is None:
                         # fall back to exponential backoff proportional to attempt
                         wait = min(30.0, 0.5 * (2 ** attempt)) + random.random() * 0.5
                     if attempt < max_retries - 1:
-                        self.logger.warning(f"Rate limited (429). Waiting {wait:.2f}s then retrying ({attempt+1}/{max_retries}) for {url}.")
+                        self.logger.warning(f"Rate limited (429). Waiting {wait:.2f}s then retrying "
+                                            f"({attempt+1}/{max_retries}) for {url}.")
                         await asyncio.sleep(wait)
                         continue
                     else:
-                        self.logger.error(f"Rate limited (429) after {max_retries} attempts for {url}.")
+                        self.logger.error("Rate limited (429) after %s attempts for %s.", max_retries, url)
                         return response
 
                 # 5xx: transient server errors — retry until we run out
                 if 500 <= status < 600:
-                    self.logger.warning(f"Server error {status} on {url}. Retrying ({attempt+1}/{max_retries})...")
+                    self.logger.warning("Server error %s on %s. Retrying (%s/%s)...",
+                                        status, url, attempt+1, max_retries)
                     time.sleep(1)
                     continue
 
                 # Other non-200s: let curl_cffi raise a typed error
                 if status != 200:
-                    self.logger.info(f"HTTP {status} for {url} (attempt {attempt+1}/{max_retries}).")
+                    self.logger.info("HTTP %s for %s (attempt %s/%s).", status, url, attempt+1, max_retries)
                     if attempt < max_retries - 1:
                         continue
                     return response
 
             except RequestsError as e:
                 err_str = str(e).lower()
-                self.logger.error(f"Attempt {attempt}: Request error for URL {url}: {e}")
-                
+                self.logger.error("Attempt %s: Request error for URL %s: %s", attempt, url, e)
+
                 if "certificate verify failed" in err_str:
                     raise ProxySSLError("Proxy has an invalid SSL certificate, set 'verify = False' in config")
                 elif "cookie conflict" in err_str:
-                    self.logger.error(f"Cookie conflict. Aborting this request. Details: {e}")
+                    self.logger.error(f"Cookie conflict. Aborting this request. Details: %s", e)
                     raise UnknownError(f"Cookie conflict during request to {url}: {e}") from e
                 elif "proxy" in err_str:
                     self.logger.error(f"Proxy Error for {url}: {e}")
-                    raise KillSwitch("Proxy error when trying a request, aborting!") from e
+                    raise InvalidProxy("Proxy error when trying a request, aborting!") from e
                 elif "timeout" in err_str or "read" in err_str:
                     self.logger.error(
                         f"Attempt {attempt}: Timeout for URL {url}: {e}. "
                         f"Consider increasing the timeout or check your connection."
                     )
-                
+
                 if attempt < max_retries - 1:
                     self.logger.info(f"Retrying ({attempt+1}/{max_retries}) for URL: {url}")
                     continue
@@ -1449,7 +1373,7 @@ a new Python file, import only m3u8 and see what error you get.
     async def get_segments(self, m3u8_url_master: str, quality: Union[str, int]) -> List[str]:
         assert m3u8 is not None
         _cache_url = f"{m3u8_url_master}{quality}"
-        _segments: Optional[List[str]] = cast(Optional[List[str]], self.cache.get_segments_from_cache(_cache_url))
+        _segments: List[str] | None = self.cache.get_segments_from_cache(_cache_url)
         if _segments is not None:
             self.logger.info(f"Received: {len(_segments)} from cache!")
             return _segments
@@ -1481,11 +1405,13 @@ a new Python file, import only m3u8 and see what error you get.
         # Robust init segment handling (EXT-X-MAP)
         # Older m3u8 lib: .segment_map; newer: .init_section
         init_url = None
-        segmap = getattr(parsed, "segment_map", None)
-        if segmap:
+        segments_map = getattr(parsed, "segment_map", None)
+        if segments_map:
+            assert isinstance(segments_map, list)
             try:
-                init_url = urljoin(base_url, segmap[0].uri)
-            except Exception:
+                init_url = urljoin(base_url, segments_map[0].uri)
+            except Exception as exc:
+                self.logger.info(f"Couldn't get init url, this is probably not an issue: {exc}")
                 pass
         if init_url is None:
             init_section = getattr(parsed, "init_section", None)
@@ -1505,13 +1431,8 @@ a new Python file, import only m3u8 and see what error you get.
         self.cache.save_segments_to_cache(_cache_url, segments)
         return segments
 
-    def _segment_index_width(self, total: int) -> int:
-        return max(6, len(str(max(0, total - 1))))
 
-    def _segment_file_path(self, segment_dir, index: int, width: int) -> str:
-        return os.path.join(segment_dir, f"seg_{index:0{width}d}.ts")
-
-    def _safe_remove(self, path: Optional[str]) -> None:
+    def _safe_remove(self, path: str | None) -> None:
         if not path:
             return
         try:
@@ -1521,7 +1442,7 @@ a new Python file, import only m3u8 and see what error you get.
         except Exception as e:
             self.logger.debug(f"Failed to remove file {path}: {e}")
 
-    def _safe_rmtree(self, path: Optional[str]) -> None:
+    def _safe_rmtree(self, path: str | None) -> None:
         if not path:
             return
         try:
@@ -1531,47 +1452,8 @@ a new Python file, import only m3u8 and see what error you get.
         except Exception as e:
             self.logger.debug(f"Failed to remove directory {path}: {e}")
 
-    def _write_segment_state(self, state_path: str, state: DownloadState) -> None:
-        tmp_path = f"{state_path}.tmp"
-        with open(tmp_path, "w", encoding="utf-8") as fp:
-            json.dump(state, fp, ensure_ascii=True, indent=2, sort_keys=True)
-        os.replace(tmp_path, state_path)
-
-    def _load_segment_state(self, state_path: str) -> Dict[str, Any]:
-        with open(state_path, "r", encoding="utf-8") as fp:
-            return cast(Dict[str, Any], json.load(fp))
-
-    def _build_segment_state(
-        self,
-        *,
-        segments: List[str],
-        missing: List[int],
-        segment_dir: Optional[str],
-        segment_index_width: int,
-        path: str,
-        quality: str,
-        start_segment: int,
-        m3u8_url: Optional[str],
-        created_at: Optional[str] = None
-    ) -> DownloadState:
-        now = datetime.now(timezone.utc).isoformat()
-        state = DownloadState(
-            version=1,
-            created_at=created_at or now,
-            updated_at=None,
-            m3u8_url=m3u8_url,
-            quality=quality,
-            output_path=path,
-            segment_dir=segment_dir,
-            segment_index_width=segment_index_width,
-            start_segment=start_segment,
-            total=len(segments),
-            missing=missing,
-            segments=segments
-        )
-        return state
-
-    async def download_segment(self, url: str, timeout: int, stop_event: Optional[threading.Event] = None) -> tuple[str, bytes, bool]:
+    async def download_segment(self, url: str, timeout: int, stop_event:
+                                threading.Event | None = None) -> tuple[str, bytes, bool]:
         """
         Attempt to download a single segment.
         Returns (url, content, success).
@@ -1593,19 +1475,19 @@ a new Python file, import only m3u8 and see what error you get.
         video: Any, # The video object
         quality: str, # Selected quality e.g., 720, 1080 and so on
         path: str, # Output Path
-        callback: Optional[Callable[[int, int], None]] = None, # The callback (function that accepts pos and total)
+        callback: Callable[[int, int], None] | None,
         remux: bool = False, # Whether to remux the video from MPEG-TS to mp4 container
-        callback_remux: Optional[Callable[[int, int], None]] = None, # Callback for the remuxing process
+        callback_remux: Callable[[int, int], None] | None = None, # Callback for the remuxing process
         max_workers_download: int = 20, # The maximum amount of workers that fetch segments at the same time
         start_segment: int = 0, # The start segment to work on (only relevant for resuming)
-        stop_event: Optional[threading.Event] = None, # Stop event to exit the download
-        segment_state_path: Optional[str] = None, # The path for the segment state (json), for resuming
-        segment_dir: Optional[str] = None, # The directory of segments
+        stop_event: threading.Event | None = None, # Stop event to exit the download
+        segment_state_path: str | None = None, # The path for the segment state (json), for resuming
+        segment_dir: str | None = None, # The directory of segments
         return_report: bool = False, # Whether to do a report
         cleanup_on_stop: bool = True,
         keep_segment_dir: bool = False,
         ios_support: bool = False
-    ) -> Optional[Union[Dict[str, Any], bool]]:
+    ) -> DownloadReport | bool | None:
         """
         :param video:
         :param callback:
@@ -1625,7 +1507,7 @@ a new Python file, import only m3u8 and see what error you get.
         :return:
         """
         requested_workers = max_workers_download
-        max_workers_download = max_workers_download or self.config.max_workers_download # Get max workers from config (fallback)
+        max_workers_download = max_workers_download or self.configuration.max_workers_download # Get max workers
         if not requested_workers:
             self.logger.debug(f"download: using config max_workers_download={max_workers_download}")
 
@@ -1644,8 +1526,8 @@ a new Python file, import only m3u8 and see what error you get.
         if m3u8_url:
             self.logger.debug(f"Download m3u8_base_url={m3u8_url}")
 
-        threaded_download = self.threaded(max_workers=max_workers_download, timeout=self.config.timeout)
-        self.logger.debug(f"download: dispatching to threaded downloader (timeout={self.config.timeout})")
+        threaded_download = self.threaded(max_workers=max_workers_download, timeout=self.configuration.timeout)
+        self.logger.debug(f"download: dispatching to threaded downloader (timeout={self.configuration.timeout})")
         return await threaded_download(
             self,
             video=video,
@@ -1664,13 +1546,8 @@ a new Python file, import only m3u8 and see what error you get.
             ios_support=ios_support
         )
 
-        # I removed ffmpeg and default download because you can configure the treaded downloader to behave exactly as the
-        # default download by setting max workers to one and ffmpeg as not used by Porn Fetch anymore and I don't wanna
-        # say to much, but I think that this implementation is way faster and more **reliable** then FFmpeg. (Yeah PyCharm no shit this code is unreachable, bro it's not even code lol) 
-        #
-        # *hopefully
-
-    def threaded(self, max_workers: int, timeout: int) -> Callable[..., Coroutine[Any, Any, Optional[Union[Dict[str, Any], bool]]]]:
+    def threaded(self, max_workers: int,
+                 timeout: int) -> Callable[..., Coroutine[Any, Any, bool | None | DownloadReport]]:
         # ChatGPT cooked so hard, not even wannabe influencers in dubai get that hot when they get exposed to the sun
         # <xD emoji from Hyprland Discord server here>
 
@@ -1678,19 +1555,19 @@ a new Python file, import only m3u8 and see what error you get.
             self: "BaseCore",
             video: Any,
             quality: str,
-            callback: Optional[Callable[[int, int], None]],
+            callback: Callable[[int, int], None] | None,
             path: str,
             remux: bool = True,
-            callback_remux: Optional[Callable[[int, int], None]] = None,
+            callback_remux: Callable[[int, int], None] | None = None,
             start_segment: int = 0,
-            stop_event: Optional[threading.Event] = None,
-            segment_state_path: Optional[str] = None,
-            segment_dir: Optional[str] = None,
+            stop_event: threading.Event | None = None,
+            segment_state_path: str | None = None,
+            segment_dir: str | None = None,
             return_report: bool = False,
             cleanup_on_stop: bool = True,
             keep_segment_dir: bool = False,
             ios_support: bool = False
-        ) -> Optional[Union[Dict[str, Any], bool]]:
+        ) -> DownloadReport | None | bool:
             """
             Threaded HLS segment downloader with optional resume state and stop flag.
             """
@@ -1710,11 +1587,8 @@ a new Python file, import only m3u8 and see what error you get.
             resume_state = None
             resume_mode = False
             created_at = None
-            
-            # Help type checker with initial types
-            segments: List[str] = []
-            m3u8_url: str = ""
 
+            # Help type checker with initial types
             if segment_state_path:
                 if os.path.exists(segment_state_path):
                     self.logger.info(f"Found segment state file: {segment_state_path}. Attempting resume.")
@@ -1723,7 +1597,7 @@ a new Python file, import only m3u8 and see what error you get.
 
             if segment_state_path and os.path.exists(segment_state_path):
                 try: # This starts resuming from previous download
-                    resume_state = self._load_segment_state(segment_state_path)
+                    resume_state = load_segment_state(segment_state_path)
                     resume_mode = True
                 except Exception as e: # Shouldn't happen, but if it does, we just do a new download
                     self.logger.warning(f"Failed to load segment state {segment_state_path}: {e}. Starting fresh.")
@@ -1732,7 +1606,7 @@ a new Python file, import only m3u8 and see what error you get.
 
             if resume_mode:
                 assert resume_state is not None
-                segments = cast(List[str], resume_state.get("segments") or []) # This fetches the list of segments from the resume state
+                segments = resume_state.get("segments") or []  # This fetches the list of segments from the resume state
                 if not segments:
                     raise UnknownError("Segment state is invalid or empty.") # Shouldn't happen ;)
 
@@ -1741,15 +1615,15 @@ a new Python file, import only m3u8 and see what error you get.
                     raise UnknownError("Segment state is missing segment_dir.")
 
                 created_at = resume_state.get("created_at")
-                width = int(resume_state.get("segment_index_width") or self._segment_index_width(len(segments)))
-                state_start = int(resume_state.get("start_segment", 0) or 0) # Where we start writing segments
+                width = int(resume_state.get("segment_index_width") or get_segment_index_width(len(segments)))
+                state_start = int(resume_state.get("start_segment", 0) or 0) # Where we start segments
 
                 """
-                Because every segment has a different binary offset, we can't just inject specific segments into specific
-                parts of the file. That's why I can only start after xx successful segments.
-                
-                So, let's say 0-12 segments were successful, but 13 was not and from 14-17 everything went smooth.
-                In this case, I need to start from 13 and STILL override 14-17.
+            Because every segment has a different binary offset, we can't just inject specific segments into specific
+            parts of the file. That's why I can only start after xx successful segments.
+            
+            So, let's say 0-12 segments were successful, but 13 was not and from 14-17 everything went smooth.
+            In this case, I need to start from 13 and STILL override 14-17.
                 """
 
                 if start_segment and state_start != start_segment:
@@ -1758,7 +1632,7 @@ a new Python file, import only m3u8 and see what error you get.
                     )
 
                 start_segment = state_start
-                m3u8_url = cast(str, resume_state.get("m3u8_url") or "")
+                m3u8_url = resume_state.get("m3u8_url") or ""
                 state_quality = resume_state.get("quality", quality)
                 self.logger.info(
                     f"Resume state loaded: segments={len(segments)} start_segment={start_segment} "
@@ -1780,7 +1654,7 @@ a new Python file, import only m3u8 and see what error you get.
                 if segment_state_path and segment_dir is None:
                     segment_dir = f"{path}.segments"
                     self.logger.debug(f"segment_dir set from state path: {segment_dir}")
-                width = self._segment_index_width(len(segments)) if segment_dir else 0
+                width = get_segment_index_width(len(segments)) if segment_dir else 0
                 m3u8_url = m3u8_master
                 state_quality = quality
                 self.logger.info(
@@ -1803,20 +1677,21 @@ a new Python file, import only m3u8 and see what error you get.
             """
             We write a list with [False, False, n] where n is the value of the total amount of segments.
             This creates a lit with as many False entries as segments. Since `self.download_segment` returns a bool
-            along with the data, we can use that to keep track, since we just change the bool to True for every downloaded
-            segments.
+            along with the data, we can use that to keep track, since we just change the bool to True for every 
+            downloaded segments.
             """
 
             if segment_dir: # Tries to find existing segments that we already downloaded
                 existing_segments = 0
                 for i in range(n): # Does that for every segment
-                    seg_path = self._segment_file_path(segment_dir, i, width) # Gets the file path
+                    seg_path = segment_file_path(segment_dir, i, width) # Gets the file path
                     try:
                         if os.path.exists(seg_path) and os.path.getsize(seg_path) > 0:
                             # if it exists, we treat it as already downloaded (makes sense)
                             downloaded[i] = True
                             existing_segments += 1
-                    except Exception:
+                    except Exception as exc:
+                        self.logger.warning(f"Couldn't download segment: {i}, retrying later.  ->: {exc}")
                         # If something goes wrong, we treat it as not downloaded and re-fetch it later
                         downloaded[i] = False
                 self.logger.info(
@@ -1837,7 +1712,6 @@ a new Python file, import only m3u8 and see what error you get.
             tmp_path = f"{path}.tmp" # Creates a temporary path where we write stuff to
             cancelled = False # This is the cancellation event that stops the download
             max_seg_retries = 2 # Maximum retries to get segments
-            seg_retries = [0] * n
             progress_log_step = max(1, n // 20)
             next_progress_log = ((progressed // progress_log_step) + 1) * progress_log_step
 
@@ -1848,7 +1722,7 @@ a new Python file, import only m3u8 and see what error you get.
 
             if target_indices:
                 workers = max(1, min(max_workers, len(target_indices)))
-                parts: Optional[List[Optional[bytes]]] = None
+                parts: List[bytes | None] | None = None
                 next_to_write = 0
                 out_fp = None
                 self.logger.info(
@@ -1864,27 +1738,27 @@ a new Python file, import only m3u8 and see what error you get.
 
                 try:
                     # Use asyncio.gather to fetch segments concurrently instead of ThreadPoolExecutor
-                    
+
                     # Create a semaphore to limit concurrent requests
                     semaphore = asyncio.Semaphore(workers)
-                    
+
                     async def fetch_segment_with_semaphore(idx: int, url: str) -> Tuple[int, bool, bytes]:
                         async with semaphore:
                             if stop_event is not None and stop_event.is_set():
                                 return idx, False, b""
-                            
+
                             # Handle retries inside the coroutine
                             for attempt in range(max_seg_retries + 1):
                                 if stop_event is not None and stop_event.is_set():
                                     return idx, False, b""
-                                    
+
                                 try:
-                                    _, data, success = await self.download_segment(url, timeout, stop_event)
-                                    if success and data:
-                                        return idx, True, data
-                                except Exception as e:
-                                    self.logger.error(f"Worker exception for segment {idx}: {e}")
-                                    
+                                    _, segment_data, is_success = await self.download_segment(url, timeout, stop_event)
+                                    if is_success and data:
+                                        return idx, True, segment_data
+                                except Exception as exception:
+                                    self.logger.error(f"Worker exception for segment {idx}: {exception}")
+
                                 if attempt < max_seg_retries:
                                     self.logger.warning(
                                         f"Segment {idx} failed; retrying {attempt + 1}/{max_seg_retries}"
@@ -1895,18 +1769,18 @@ a new Python file, import only m3u8 and see what error you get.
                                         f"Segment {idx} failed after {attempt} retries."
                                     )
                             return idx, False, b""
-                    
+
                     tasks = [fetch_segment_with_semaphore(i, segments[i]) for i in target_indices]
-                    
+
                     # Use asyncio.as_completed to process results as they come in, similar to wait(FIRST_COMPLETED)
                     for coro in asyncio.as_completed(tasks):
                         if stop_event is not None and stop_event.is_set():
                             cancelled = True
                             # The remaining tasks will see the event set and exit quickly
                             continue
-                            
+
                         i, success, data = await coro
-                        
+
                         if cancelled:
                             continue
 
@@ -1915,7 +1789,7 @@ a new Python file, import only m3u8 and see what error you get.
                             downloaded_count += 1
                             if segment_dir:
                                 # Write to a temp path (good for resuming, but not I/O efficient)
-                                seg_path = self._segment_file_path(segment_dir, i, width)
+                                seg_path = segment_file_path(segment_dir, i, width)
                                 tmp_seg = f"{seg_path}.part"
                                 # Offload segment file writing to a thread
                                 def write_part(ts_path: str, t_data: bytes) -> None:
@@ -1962,7 +1836,7 @@ a new Python file, import only m3u8 and see what error you get.
                                 def write_chunks(fp: Any, list_of_data: List[bytes]) -> None:
                                     for c_data in list_of_data:
                                         fp.write(c_data)
-                                await asyncio.to_thread(write_chunks, cast(Any, out_fp), cast(List[bytes], chunks_to_write))
+                                await asyncio.to_thread(write_chunks, cast(Any, out_fp), chunks_to_write)
 
                 finally:
                     if out_fp is not None:
@@ -1971,12 +1845,12 @@ a new Python file, import only m3u8 and see what error you get.
             missing = [i for i, ok in enumerate(downloaded) if not ok] # Missing segments
             missing_urls = [segments[i] for i in missing] # Missing URLs of segments
             self.logger.info(
-                f"Segment download finished: downloaded={downloaded_count}/{n} missing={len(missing)} cancelled={cancelled}"
-            )
+                "Segment download finished: downloaded=%s/%s missing=%s cancelled=%s",
+            downloaded_count, n, len(missing), cancelled)
             if missing:
                 sample = missing[:10]
                 self.logger.error(
-                    f"Missing segments detected: count={len(missing)} sample={sample}"
+                    "Missing segments detected: count=%s sample=%s", len(missing), sample
                 )
 
             report = DownloadReport(
@@ -2003,9 +1877,9 @@ a new Python file, import only m3u8 and see what error you get.
 
                 if segment_state_path:
                     # This is the segment state that is saved as a file, this is NOT the returned report!
-
+                    assert  isinstance(segment_state_path, str)
                     self.logger.info(f"Writing segment state to: {segment_state_path}")
-                    state = self._build_segment_state(
+                    state = build_segment_state(
                         segments=segments,
                         missing=missing,
                         segment_dir=segment_dir,
@@ -2016,7 +1890,7 @@ a new Python file, import only m3u8 and see what error you get.
                         m3u8_url=m3u8_url,
                         created_at=created_at,
                     )
-                    self._write_segment_state(segment_state_path, state)
+                    write_segment_state(segment_state_path, state)
 
                 if return_report:
                     missing = report.missing
@@ -2033,7 +1907,7 @@ a new Python file, import only m3u8 and see what error you get.
                 self._safe_remove(tmp_path)
                 if segment_state_path:
                     self.logger.info(f"Writing segment state to: {segment_state_path}")
-                    state = self._build_segment_state(
+                    state = build_segment_state(
                         segments=segments,
                         missing=missing,
                         segment_dir=segment_dir,
@@ -2044,7 +1918,7 @@ a new Python file, import only m3u8 and see what error you get.
                         m3u8_url=m3u8_url,
                         created_at=created_at,
                     )
-                    self._write_segment_state(segment_state_path, state)
+                    write_segment_state(segment_state_path, state)
                 if return_report:
                     self.logger.debug(
                         f"Returning failed report: downloaded={report.downloaded} missing={len(report.missing)}"
@@ -2059,15 +1933,15 @@ a new Python file, import only m3u8 and see what error you get.
                     f"Assembling {n} segments from {segment_dir} into {tmp_path}"
                 )
                 def assemble_segments() -> List[int]:
-                    with open(tmp_path, "wb") as out_fp:
-                        for i in range(n):
-                            seg_path = self._segment_file_path(segment_dir, i, width)
-                            if not os.path.exists(seg_path):
-                                return [i]
-                            with open(seg_path, "rb") as seg_fp:
-                                shutil.copyfileobj(seg_fp, out_fp, length=1024 * 1024)
+                    with open(tmp_path, "wb") as out_file_path:
+                        for idx in range(n):
+                            segment_path = segment_file_path(segment_dir, idx, width)
+                            if not os.path.exists(segment_path):
+                                return [idx]
+                            with open(segment_path, "rb") as seg_fp:
+                                shutil.copyfileobj(seg_fp, out_file_path, length=1024 * 1024) # type: ignore[arg-type]
                     return []
-                
+
                 # Offload heavy IO segment assembly
                 missing_assemble = await asyncio.to_thread(assemble_segments)
                 if missing_assemble:
@@ -2080,7 +1954,7 @@ a new Python file, import only m3u8 and see what error you get.
                     self._safe_remove(tmp_path)
                     if segment_state_path:
                         self.logger.info(f"Writing segment state to: {segment_state_path}")
-                        state = self._build_segment_state(
+                        state = build_segment_state(
                             segments=segments,
                             missing=missing,
                             segment_dir=segment_dir,
@@ -2091,7 +1965,7 @@ a new Python file, import only m3u8 and see what error you get.
                             m3u8_url=m3u8_url,
                             created_at=created_at,
                         )
-                        self._write_segment_state(segment_state_path, state)
+                        write_segment_state(segment_state_path, state)
                     report.status = "failed"
                     report.missing = missing
                     report.missing_urls = [segments[i] for i in missing]
@@ -2116,8 +1990,8 @@ a new Python file, import only m3u8 and see what error you get.
                 self.logger.debug("Remux disabled; moving temporary file into place.")
                 try:
                     os.replace(tmp_path, path) # If we don't remux, we just rename it to mp4 and treat it as done :)
-                except Exception: # Shouldn't happen and I also don't know what this does lol
-                    self.logger.warning("os.replace failed; falling back to manual copy.")
+                except Exception as exc: # Shouldn't happen and I also don't know what this does lol
+                    self.logger.warning(f"os.replace failed: {exc}, falling back to manual copy.")
                     def manual_copy() -> None:
                         with open(path, "wb") as final_fp, open(tmp_path, "rb") as in_fp:
                             for chunk in iter(lambda: in_fp.read(1024 * 1024), b""):
@@ -2138,11 +2012,13 @@ a new Python file, import only m3u8 and see what error you get.
                 return report
             return True
 
-        return wrapper # Return the wraper (start stuff)
+        return wrapper # Return the wrapper (start stuff)
 
-    def _convert_ts_to_mp4(self, input_path: str, output_path: str, callback: Optional[Callable[[int, int], None]] = None, ios_support: bool = False) -> None:
+    def _convert_ts_to_mp4(self, input_path: str, output_path: str,
+                           callback: Callable[[int, int], None] | None = None, ios_support: bool = False) -> None:
         start_ts = time.perf_counter()
         self.logger.info(f"Remux start: input={input_path} output={output_path}")
+
         try:
             input_size = os.path.getsize(input_path)
             self.logger.debug(f"Remux input size: {input_size} bytes")
@@ -2152,19 +2028,23 @@ a new Python file, import only m3u8 and see what error you get.
         try:
             from av import open as av_open  # type: ignore[import-not-found]
             from av.audio.resampler import AudioResampler  # type: ignore[import-not-found]
-
+            import av.audio.frame  # Used for runtime isinstance check
         except (ModuleNotFoundError, ImportError) as e:
             self.logger.error(f"PyAV import failed for remux: {e}")
-            raise ModuleNotFoundError(f"PyAV is required for remuxing. Install with pip install av. Not supported on Termux! {e}")
+            raise ModuleNotFoundError(
+                f"PyAV is required for remuxing. Install with pip install av. Not supported on Termux! {e}")
 
         self.logger.debug(f"Opening input for remux: {input_path}")
         input_ = av_open(input_path)
         fmt_name = (input_.format.name or "").lower()
         self.logger.info(f"Input format detected: {fmt_name or '<unknown>'}")
-        if fmt_name == "mpegts":
-            output = av_open(output_path, mode="w", format="mp4", options={"movflags": "faststart"})
 
-            # --- VIDEO: keep your exact remux approach ---
+        if fmt_name == "mpegts":
+            # Fix 1: Suppress the stub mismatch for av.open
+            output = av_open(output_path, mode="w", format="mp4",
+                             options={"movflags": "faststart"})  # type: ignore[arg-type]
+
+            # --- VIDEO ---
             in_video = input_.streams.video[0]
             out_video = output.add_stream_from_template(template=in_video)
             self.logger.debug(
@@ -2172,22 +2052,24 @@ a new Python file, import only m3u8 and see what error you get.
                 f"bit_rate={getattr(in_video.codec_context, 'bit_rate', None)}"
             )
 
-            # --- AUDIO: copy if MP4-compatible; else transcode to AAC ---
+            # --- AUDIO ---
             in_audio = next((s for s in input_.streams if s.type == "audio"), None)
             out_audio = None
             transcode_audio = False
             resampler = None
 
             if in_audio:
-                # Common MP4-safe audio codecs to copy without transcoding.
+                # Fix 3: Explicitly narrow out None
+                assert in_audio is not None
+
+                # Fix 2: Cast context to AudioCodecContext so IDE knows about sample_rate and layout
+                audio_ctx = cast('AudioCodecContext', in_audio.codec_context)
+
                 copy_ok = {"aac"} if ios_support else {"aac", "alac", "mp3"}
-                codec_name = (in_audio.codec_context.name or "").lower()
-                sample_rate = in_audio.codec_context.sample_rate or 0
-                layout_name = (
-                    in_audio.codec_context.layout.name
-                    if getattr(in_audio.codec_context, "layout", None)
-                    else "unknown"
-                )
+                codec_name = (audio_ctx.name or "").lower()
+                sample_rate = audio_ctx.sample_rate or 0
+                layout_name = audio_ctx.layout.name if getattr(audio_ctx, "layout", None) else "unknown"
+
                 self.logger.debug(
                     f"Audio stream: codec={codec_name} sample_rate={sample_rate} layout={layout_name}"
                 )
@@ -2196,43 +2078,36 @@ a new Python file, import only m3u8 and see what error you get.
                     out_audio = output.add_stream_from_template(template=in_audio)
                     self.logger.info("Audio codec MP4-compatible; remuxing without transcoding.")
                 else:
-                    # Build an AAC encoder stream. Match input rate/layout where possible.
                     transcode_audio = True
-                    sample_rate = in_audio.codec_context.sample_rate or 48000
-                    layout = (
-                        in_audio.codec_context.layout.name
-                        if getattr(in_audio.codec_context, "layout", None)
-                        else "stereo"
-                    )
+                    sample_rate = audio_ctx.sample_rate or 48000
+                    layout = audio_ctx.layout.name if getattr(audio_ctx, "layout", None) else "stereo"
+
                     out_audio = output.add_stream("aac", rate=sample_rate)
-                    self.logger.info(
-                        f"Transcoding audio to AAC: sample_rate={sample_rate} layout={layout}"
-                    )
-                    # Setting layout/channels helps encoder pick sensible defaults.
+                    self.logger.info(f"Transcoding audio to AAC: sample_rate={sample_rate} layout={layout}")
+
                     try:
                         out_audio.layout = layout
-                    except Exception:
+                    except Exception as exc:
+                        self.logger.warning(f"Exception in getting audio layout (doesn't matter): {exc}")
                         pass
 
-                    # Ensure frames handed to the AAC encoder are in a compatible sample format.
-                    # ('fltp' is the usual format for AAC encoders.)
                     resampler = AudioResampler(format="fltp", layout=layout, rate=sample_rate)
             else:
                 self.logger.info("No audio stream detected; remuxing video only.")
 
-            # --- DEMUX both streams so audio is included ---
+            # --- DEMUX ---
             demux_streams = [in_video] + ([in_audio] if in_audio else [])
-            packets = input_.demux(demux_streams)  # keeps your progress logic but uses a generator
+            packets = input_.demux(demux_streams)
 
             try:
                 total = os.path.getsize(input_path)
-            except Exception:
+            except Exception as exc:
+                self.logger.warning(f"Exception while getting path size for demuxing progress??? {exc}")
                 total = 100
 
             self.logger.info(f"Demuxing packets: total_bytes={total}")
             progress_step = max(1, total // 10) if total else 0
             next_progress_log = progress_step if progress_step else 0
-
             current_progress = 0
 
             for idx, packet in enumerate(packets):
@@ -2245,20 +2120,20 @@ a new Python file, import only m3u8 and see what error you get.
                     continue
 
                 if packet.stream == in_video:
-                    # Your original video remux path (no explicit rescale).
                     packet.stream = out_video
                     output.mux(packet)
 
                 elif in_audio and packet.stream == in_audio:
                     if not transcode_audio:
-                        # Audio is already MP4-compatible; just remux.
                         packet.stream = out_audio
                         output.mux(packet)
                     else:
                         assert out_audio is not None
-                        # Decode -> (optionally resample) -> encode AAC -> mux.
                         for frame in packet.decode():
-                            # Resample to match encoder expectations.
+                            # Fix 4: Ensure the frame is recognized as an AudioFrame
+                            if not isinstance(frame, av.audio.frame.AudioFrame):
+                                continue
+
                             frames = resampler.resample(frame) if resampler else [frame]
                             for f in frames:
                                 for enc_pkt in out_audio.encode(f):
@@ -2270,7 +2145,6 @@ a new Python file, import only m3u8 and see what error you get.
                     self.logger.debug(f"Remux progress: bytes={current_progress}/{total}")
                     next_progress_log += progress_step
 
-            # Flush audio encoder if we transcoded.
             if transcode_audio and out_audio:
                 self.logger.debug("Flushing AAC encoder.")
                 for enc_pkt in out_audio.encode(None):
@@ -2279,15 +2153,12 @@ a new Python file, import only m3u8 and see what error you get.
             input_.close()
             output.close()
             elapsed = time.perf_counter() - start_ts
+
             try:
                 out_size = os.path.getsize(output_path)
-                self.logger.info(
-                    f"Remux complete: output={output_path} size={out_size} bytes elapsed={elapsed:.2f}s"
-                )
+                self.logger.info(f"Remux complete: output={output_path} size={out_size} bytes elapsed={elapsed:.2f}s")
             except Exception as e:
-                self.logger.info(
-                    f"Remux complete: output={output_path} elapsed={elapsed:.2f}s (size unavailable: {e})"
-                )
+                self.logger.info(f"Remux complete: output={output_path} elapsed={elapsed:.2f}s (size unavailable: {e})")
 
         else:
             self.logger.info("Stream seems to be already in MP4! Skipping remux...")
@@ -2295,11 +2166,11 @@ a new Python file, import only m3u8 and see what error you get.
             elapsed = time.perf_counter() - start_ts
             self.logger.info(f"Remux skipped; file moved. elapsed={elapsed:.2f}s")
 
-    async def legacy_download(self, path: str, url: str, callback: Optional[Callable[[int, int], None]] = None,
+    async def legacy_download(self, path: str, url: str, callback: Callable[[int, int], None] | None = None,
                         max_retries: int = 5,
                         chunk_size: int = 1024,
                         read_timeout: float = 120.0,
-                        stop_event: Optional[threading.Event] = None,
+                        stop_event: threading.Event | None = None,
                         max_workers: int = 5,
                         allow_multipart: bool = True) -> bool:
         """
@@ -2333,7 +2204,7 @@ a new Python file, import only m3u8 and see what error you get.
         # 1. Check if the server supports Range requests and get file size (if multipart is allowed)
         file_size = 0
         accept_ranges = ""
-        
+
         if allow_multipart:
             # We MUST request uncompressed content for range downloads, otherwise:
             # 1) Content-Length from HEAD reflects the compressed size, not the real file size.
@@ -2343,28 +2214,29 @@ a new Python file, import only m3u8 and see what error you get.
             try:
                 head_resp = await session.head(url, timeout=timeout, allow_redirects=True, headers=no_compress)
                 if head_resp.status_code == 405:  # Method Not Allowed, fallback to streaming GET
-                    head_resp_stream = await session.request("GET", url, timeout=timeout, allow_redirects=True, stream=True, headers=no_compress)
+                    head_resp_stream = await session.request("GET", url, timeout=timeout, allow_redirects=True,
+                                                             stream=True, headers=no_compress)
                     file_size = int(head_resp_stream.headers.get("Content-Length", 0))
                     accept_ranges = head_resp_stream.headers.get("Accept-Ranges", "")
                 else:
                     file_size = int(head_resp.headers.get("Content-Length", 0))
                     accept_ranges = head_resp.headers.get("Accept-Ranges", "")
             except Exception as e:
-                self.logger.warning(f"Failed to fetch HEAD info for concurrent check: {e}. Falling back to linear download.")
+                self.logger.warning(f"Failed to fetch HEAD info for concurrent check: {e}.")
 
         # 2. Execute Fast Multipart Download if supported and allowed
         if allow_multipart and file_size > 0 and accept_ranges == "bytes":
             self.logger.info(f"Server supports Range requests. Starting fast multipart download for {file_size} bytes.")
-            
+
             # Pre-allocate file
             def allocate_file() -> None:
                 if not os.path.exists(path):
-                    with open(path, "wb") as f:
-                        f.truncate(file_size)
+                    with open(path, "wb") as file_alloc:
+                        file_alloc.truncate(file_size)
                 elif os.path.getsize(path) != file_size:
                     # File exists but size mismatch, truncate to correct size
-                    with open(path, "r+b") as f:
-                        f.truncate(file_size)
+                    with open(path, "r+b") as file_alloc_size:
+                        file_alloc_size.truncate(file_size)
             await asyncio.to_thread(allocate_file)
 
             # We will use an array to track progress of chunks
@@ -2374,37 +2246,37 @@ a new Python file, import only m3u8 and see what error you get.
             # Determine chunk sizes based on file size, but keep reasonable bounds
             # For massive files, don't create 10,000 workers.
             target_chunk_size = max(chunk_size, min(10 * 1024 * 1024, file_size // 10)) # Between 1MB and 10MB
-            
+
             semaphore = asyncio.Semaphore(max_workers)
-            
-            async def download_chunk(start: int, end: int, chunk_idx: int) -> bool:
+
+            async def download_chunk(start_chunk: int, end_chunk: int, chunk_idx_now: int) -> bool:
                 nonlocal total_downloaded
-                headers = {"Range": f"bytes={start}-{end}", "Accept-Encoding": "identity"}
+                headers_chunk = {"Range": f"bytes={start}-{end_chunk}", "Accept-Encoding": "identity"}
                 chunk_progress[chunk_idx] = 0
-                
-                for attempt in range(max_retries + 1):
+
+                for attempt_chunk in range(max_retries + 1):
                     if stop_event is not None and stop_event.is_set():
                         return False
-                        
+
                     try:
                         async with semaphore:
                             resp = await cast(Any, session).request(
-                                "GET", url, headers=headers, timeout=timeout, allow_redirects=True, stream=True
+                                "GET", url, headers=headers_chunk, timeout=timeout, allow_redirects=True, stream=True
                             )
                             resp.raise_for_status()
 
                             # Open file once for this chunk download attempt
-                            f = await asyncio.to_thread(open, path, "rb+")
+                            file = await asyncio.to_thread(lambda: open(path, "rb+"))
                             try:
-                                await asyncio.to_thread(f.seek, start + chunk_progress[chunk_idx])
+                                await asyncio.to_thread(file.seek, start_chunk + chunk_progress[chunk_idx_now])
                                 async for data in resp.aiter_content():
                                     if stop_event is not None and stop_event.is_set():
                                         return False
 
-                                    await asyncio.to_thread(cast(Any, f).write, data)
+                                    await asyncio.to_thread(cast(Any, file).write, data)
 
                                     data_len = len(data)
-                                    chunk_progress[chunk_idx] += data_len
+                                    chunk_progress[chunk_idx_now] += data_len
                                     total_downloaded[0] += data_len
 
                                     if callback:
@@ -2416,15 +2288,16 @@ a new Python file, import only m3u8 and see what error you get.
 
                             return True # Chunk success
 
-                    except Exception as e:
+                    except Exception as exc:
                         if attempt < max_retries:
-                            self.logger.warning(f"Chunk {chunk_idx} failed (attempt {attempt+1}/{max_retries}): {e}")
+                            self.logger.warning(f"Chunk %s failed (attempt %s/%s): %s",
+                                                chunk_idx_now, attempt + 1, max_retries, exc)
                             # Reset progress for this chunk before retry
-                            total_downloaded[0] -= chunk_progress[chunk_idx]
-                            chunk_progress[chunk_idx] = 0
+                            total_downloaded[0] -= chunk_progress[chunk_idx_now]
+                            chunk_progress[chunk_idx_now] = 0
                             await asyncio.sleep(1 * attempt)
                         else:
-                            self.logger.error(f"Chunk {chunk_idx} permanently failed: {e}")
+                            self.logger.error(f"Chunk %s permanently failed: %s", chunk_idx_now, exc)
                             return False
                 return False
 
@@ -2436,17 +2309,17 @@ a new Python file, import only m3u8 and see what error you get.
                 chunk_idx += 1
 
             results = await asyncio.gather(*tasks)
-            
+
             if progress_bar:
-                # We set it to None instead of del to avoid analyzer confusion about potential unassigned reference later
+                # We set it to None instead of del to avoid analyzer confusion about potential unassigned reference
                 progress_bar = None
-                
+
             if stop_event is not None and stop_event.is_set():
                 raise DownloadCancelled("Download cancelled.")
-                
+
             if not all(results):
                 raise NetworkingError("One or more chunks failed to download completely.")
-                
+
             self.logger.info(f"Fast multipart download complete: path={path}")
             return True
 
@@ -2455,7 +2328,7 @@ a new Python file, import only m3u8 and see what error you get.
             self.logger.info("allow_multipart=False. Forcing linear streaming download.")
         else:
             self.logger.info("Server does not support Range requests or size is 0. Falling back to linear streaming.")
-            
+
         downloaded_so_far = 0
         attempt = 0
         etag = None
@@ -2467,7 +2340,7 @@ a new Python file, import only m3u8 and see what error you get.
             headers = {}
             if downloaded_so_far:
                 headers["Range"] = f"bytes={downloaded_so_far}-"
-                
+
             try:
                 response = await cast(Any, session).request(
                     "GET", url, headers=headers, allow_redirects=True, timeout=timeout, stream=True
@@ -2505,7 +2378,7 @@ a new Python file, import only m3u8 and see what error you get.
                             raise DownloadCancelled("Download cancelled.")
                         if not chunk:
                             continue
-                        await asyncio.to_thread(cast(Any, f).write, chunk)
+                        await asyncio.to_thread(f.write, chunk)
                         downloaded_so_far += len(chunk)
 
                         if callback:
@@ -2540,31 +2413,4 @@ a new Python file, import only m3u8 and see what error you get.
                 error = traceback.format_exc()
                 raise NetworkingError(f"Unknown error for: {url} -->: {error}")
 
-
-    def truncate(self, name: str, max_bytes: int = 245) -> str:  # only 245, because we need to append .mp4
-        """
-        Some websites have titles that are so long (lookint at you missav.ws) that you can't name a file like
-        that and thus we need to make sure the file name doesn't exceed the OS limits lol
-        """
-        encoded = name.encode("utf-8")
-        if len(encoded) > max_bytes:
-            encoded = encoded[:max_bytes]
-            # Ensure not to cut in middle of a UTF-8 sequence
-            while encoded[-1] & 0b11000000 == 0b10000000:
-                encoded = encoded[:-1]
-            return cast(bytes, cast(Any, encoded)).decode("utf-8", errors="ignore")
-        return name
-
-    @staticmethod
-    def str_to_bool(value: str) -> bool:
-        # Some function that I have for some reason idk if this has ever been used lmao
-        """
-        This function is needed for the ArgumentParser for the CLI version of my APIs. It basically maps the
-        booleans for the --no-title option to valid Python boolean values.
-        """
-        val = value.lower()
-        if val in ("true", "1", "yes"):
-            return True
-        if val in ("false", "0", "no"):
-            return False
-        raise ValueError(f"Invalid boolean value: {value}")
+        return False

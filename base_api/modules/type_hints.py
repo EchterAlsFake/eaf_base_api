@@ -1,6 +1,5 @@
 from dataclasses import dataclass
 from pathlib import Path
-from os import PathLike
 from typing import Any
 
 # Download Report is the report the function returns
@@ -11,8 +10,8 @@ class DownloadState:
     updated_at: Any
     m3u8_url: str | None
     quality: str
-    output_path: Path | PathLike | str
-    segment_dir: Path | PathLike | str | None
+    output_path: Path | str
+    segment_dir: Path | str | None
     segment_index_width: int
     start_segment: int
     total: int
@@ -28,11 +27,8 @@ class DownloadReport:
     downloaded: int
     missing: list[int]
     missing_urls: list[str]
-    segment_dir: Path | PathLike | str | None
-    segment_state_path: Path | PathLike | str | None
+    segment_dir: Path | str | None
+    segment_state_path: Path | str | None
     start_segment: int
     quality: str
-
-
-
 

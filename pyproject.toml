@@ -21,6 +21,7 @@ classifiers = [
 
 dependencies = [
   "curl_cffi",
+  "pylint>=3.3.9",
 ]
 
 [project.optional-dependencies]

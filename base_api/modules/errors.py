@@ -1,5 +1,4 @@
 # This file contains all custom exceptions for base api. They should be handled by each API individually.
-from typing import Optional
 message_security = """
 Hey, please stop before proceeding and READ this text:
 
@@ -41,15 +40,6 @@ I take this absolutely serious!
 When it comes to your security I take ZERO risks."""
 
 
-class KillSwitch(Exception):
-    """
-    Raised when a kill switch is triggered due to an IP Leak.
-    """
-    def __init__(self, message: str) -> None:
-        self.message = message
-
-
-
 class InvalidProxy(Exception):
     """
     Raised when a proxy set by the user is invalid. A basic scheme with regular expressions will check for possible
@@ -70,7 +60,7 @@ class UnknownError(Exception):
 
 class DownloadCancelled(Exception):
     """
-    Raised when a download is cancelled via a stop flag/event.
+    Raised when a download is canceled via a stop flag/event.
     """
     def __init__(self, message: str) -> None:
         self.message = message
@@ -114,5 +104,5 @@ class BotProtectionDetected(Exception):
 
 
 class SecurityAbort(Exception):
-    def __init__(self, message: Optional[str] = None) -> None:
+    def __init__(self) -> None:
         self.message = message_security
