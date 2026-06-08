@@ -929,10 +929,10 @@ class BaseCore:
         delay = self.configuration.request_delay
         if delay and delay > 0:
             time_since_last_request = time.time() - self.last_request_time
-            self.logger.debug(f"Time since last request: {time_since_last_request:.2f} seconds.")
+            self.logger.debug("Time since last request: {:.2f seconds}.".format(time_since_last_request))
             if time_since_last_request < delay:
                 sleep_time = delay - time_since_last_request
-                self.logger.debug(f"Enforcing delay of {sleep_time:.2f} seconds.")
+                self.logger.debug("Enforcing delay of {:.2f} seconds.".format(sleep_time))
                 await asyncio.sleep(sleep_time)
         self.last_request_time = time.time()
 
@@ -997,7 +997,7 @@ class BaseCore:
         # Cache (only for text mode)
         cache_hit = self.cache.handle_cache(url)
         if cache_hit is not None and not get_bytes and not get_response:
-            self.logger.info(f"Fetched content for: %s from cache!", url)
+            self.logger.info("Fetched content for: %s from cache!", url)
             return cache_hit
 
         req_timeout = timeout or self.configuration.timeout
@@ -1112,7 +1112,7 @@ class BaseCore:
                                     self.latest_key_time = asyncio.get_event_loop().time()
 
                                     session.cookies.set("KEY", cookie_value, domain=".pornhub.com", path="/")
-                                    self.logger.info(f"RESOLVED CHALLENGE! Injected cookie: %s", cookie_value)
+                                    self.logger.info("RESOLVED CHALLENGE! Injected cookie: %s", cookie_value)
 
                                     try:
                                         self.cache.delete_cache(url)
@@ -1196,8 +1196,8 @@ class BaseCore:
                         # fall back to exponential backoff proportional to attempt
                         wait = min(30.0, 0.5 * (2 ** attempt)) + random.random() * 0.5
                     if attempt < max_retries - 1:
-                        self.logger.warning(f"Rate limited (429). Waiting {wait:.2f}s then retrying "
-                                            f"({attempt+1}/{max_retries}) for {url}.")
+                        self.logger.warning("Rate limited (429). Waiting {:.2f}s then retrying ".format(wait),
+                                            "({}/{}) for {}.".format(attempt + 1, max_retries, url))
                         await asyncio.sleep(wait)
                         continue
                     else:
@@ -1225,19 +1225,19 @@ class BaseCore:
                 if "certificate verify failed" in err_str:
                     raise ProxySSLError("Proxy has an invalid SSL certificate, set 'verify = False' in config")
                 elif "cookie conflict" in err_str:
-                    self.logger.error(f"Cookie conflict. Aborting this request. Details: %s", e)
+                    self.logger.error("Cookie conflict. Aborting this request. Details: %s", e)
                     raise UnknownError(f"Cookie conflict during request to {url}: {e}") from e
                 elif "proxy" in err_str:
-                    self.logger.error(f"Proxy Error for {url}: {e}")
+                    self.logger.error("Proxy Error for %s: %s", url, e)
                     raise InvalidProxy("Proxy error when trying a request, aborting!") from e
                 elif "timeout" in err_str or "read" in err_str:
                     self.logger.error(
-                        f"Attempt {attempt}: Timeout for URL {url}: {e}. "
-                        f"Consider increasing the timeout or check your connection."
+                        """Attempt %s: Timeout for URL %s: %s.
+                        Consider increasing the timeout or check your connection.""",  attempt, url, e
                     )
 
                 if attempt < max_retries - 1:
-                    self.logger.info(f"Retrying ({attempt+1}/{max_retries}) for URL: {url}")
+                    self.logger.info("Retrying (%s/%s) for URL: %s", attempt+1, max_retries, url)
                     continue
                 raise
 
@@ -1248,12 +1248,11 @@ class BaseCore:
             except Exception as e:
                 # Preserve original exception context
                 self.logger.error(
-                    f"Attempt {attempt}: Unexpected error for {url}: {e}\n{traceback.format_exc()}"
-                )
+                    "Attempt %s: Unexpected error for %s: %s\n%s", attempt, url, e, traceback.format_exc())
                 raise UnknownError(f"Unexpected error for URL {url}: {e}") from e
 
         # If we get here, we exhausted retries without returning or raising a status error.
-        self.logger.error(f"Failed to fetch URL {url} after {max_retries} attempts.")
+        self.logger.error("Failed to fetch URL %s after %s attempts.", url, max_retries)
         if last_response is not None:
             # Raise a typed error with the last response if we have one.
             try:
@@ -1326,7 +1325,7 @@ a new Python file, import only m3u8 and see what error you get.
             assert isinstance(content, str)
             master = m3u8.loads(content)
             base_for_join = m3u8_url
-            self.logger.debug(f"Resolved m3u8 master: {m3u8_url}")
+            self.logger.debug("Resolved m3u8 master: %s", m3u8_url)
 
         if not master.is_variant:
             raise ValueError("Provided URL/content is not a master playlist.")
@@ -1375,12 +1374,12 @@ a new Python file, import only m3u8 and see what error you get.
         _cache_url = f"{m3u8_url_master}{quality}"
         _segments: List[str] | None = self.cache.get_segments_from_cache(_cache_url)
         if _segments is not None:
-            self.logger.info(f"Received: {len(_segments)} from cache!")
+            self.logger.info("Received: %s from cache!", len(_segments))
             return _segments
 
         # Resolve the quality-specific playlist URL (may still be a master in some edge cases)
         playlist_url = await self.get_m3u8_by_quality(m3u8_url=m3u8_url_master, quality=quality)
-        self.logger.debug(f"Trying to fetch segments from m3u8 -> {playlist_url}")
+        self.logger.debug("Trying to fetch segments from m3u8 -> %s", playlist_url)
 
         # M3U8s are volatile → don't cache
         content = await self.fetch(url=playlist_url, save_cache=False)
@@ -1394,7 +1393,7 @@ a new Python file, import only m3u8 and see what error you get.
             self.logger.warning("Media playlist expected; got variant. Resolving to first sub-playlist...")
             media_rel = parsed.playlists[0].uri
             media_url = urljoin(playlist_url, media_rel)
-            self.logger.info(f"Resolved to new URL: {media_url}")
+            self.logger.info("Resolved to new URL: %s", media_url)
             content = await self.fetch(url=media_url, save_cache=False)
             assert isinstance(content, str)
             parsed = m3u8.loads(content)
@@ -1411,7 +1410,7 @@ a new Python file, import only m3u8 and see what error you get.
             try:
                 init_url = urljoin(base_url, segments_map[0].uri)
             except Exception as exc:
-                self.logger.info(f"Couldn't get init url, this is probably not an issue: {exc}")
+                self.logger.info("Couldn't get init url, this is probably not an issue: %s", exc)
                 pass
         if init_url is None:
             init_section = getattr(parsed, "init_section", None)
@@ -1420,14 +1419,14 @@ a new Python file, import only m3u8 and see what error you get.
 
         if init_url:
             segments.append(init_url)
-            self.logger.debug(f"Found init segment: {init_url}")
+            self.logger.debug("Found init segment: %s", init_url)
 
         # Build absolute URLs for all media segments
         for seg in parsed.segments:
             segments.append(urljoin(base_url, seg.uri))
 
-        self.logger.debug(f"Fetched {len(segments)} segments from m3u8 URL (including init if present)")
-        self.logger.info(f"Saving segments to cache....")
+        self.logger.debug("Fetched %s segments from m3u8 URL (including init if present)", len(segments))
+        self.logger.info("Saving segments to cache....")
         self.cache.save_segments_to_cache(_cache_url, segments)
         return segments
 
@@ -1440,7 +1439,7 @@ a new Python file, import only m3u8 and see what error you get.
         except FileNotFoundError:
             return
         except Exception as e:
-            self.logger.debug(f"Failed to remove file {path}: {e}")
+            self.logger.debug("Failed to remove file %s: %s", path, e)
 
     def _safe_rmtree(self, path: str | None) -> None:
         if not path:
@@ -1450,7 +1449,7 @@ a new Python file, import only m3u8 and see what error you get.
         except FileNotFoundError:
             return
         except Exception as e:
-            self.logger.debug(f"Failed to remove directory {path}: {e}")
+            self.logger.debug("Failed to remove directory %s: %s", path, e)
 
     async def download_segment(self, url: str, timeout: int, stop_event:
                                 threading.Event | None = None) -> tuple[str, bytes, bool]:
@@ -1467,7 +1466,7 @@ a new Python file, import only m3u8 and see what error you get.
             return url, content, True
         except Exception as e:
             # Log and mark failure; the caller will decide whether to retry or abort.
-            self.logger.warning(f"Segment download failed: {url} -> {e}")
+            self.logger.warning("Segment download failed: %s -> %s", url, e)
             return url, b"", False
 
     async def download(
@@ -1509,7 +1508,7 @@ a new Python file, import only m3u8 and see what error you get.
         requested_workers = max_workers_download
         max_workers_download = max_workers_download or self.configuration.max_workers_download # Get max workers
         if not requested_workers:
-            self.logger.debug(f"download: using config max_workers_download={max_workers_download}")
+            self.logger.debug("download: using config max_workers_download=%s", max_workers_download)
 
         if callback is None:
             # Use a terminal text progressbar by default
@@ -1518,16 +1517,19 @@ a new Python file, import only m3u8 and see what error you get.
 
         m3u8_url = getattr(video, "m3u8_base_url", None)
         self.logger.info(
-            f"Download requested: quality={quality} path={path} remux={remux} max_workers={max_workers_download} "
-            f"start_segment={start_segment} segment_state_path={segment_state_path} segment_dir={segment_dir} "
-            f"return_report={return_report} cleanup_on_stop={cleanup_on_stop} keep_segment_dir={keep_segment_dir} "
-            f"stop_event_set={bool(stop_event and stop_event.is_set())}"
+"""
+Download requested: quality=%s path=%s remux=%s max_workers=%s
+start_segment=%s segment_state_path=%s segment_dir=%s
+return_report=%s cleanup_on_stop=%s keep_segment_dir=%s
+stop_event_set=%s""",
+            quality, path, remux, max_workers_download, start_segment, segment_state_path, segment_dir,
+            return_report, cleanup_on_stop, keep_segment_dir, bool(stop_event and stop_event.is_set())
         )
         if m3u8_url:
-            self.logger.debug(f"Download m3u8_base_url={m3u8_url}")
+            self.logger.debug("Download m3u8_base_url=%s", m3u8_url)
 
         threaded_download = self.threaded(max_workers=max_workers_download, timeout=self.configuration.timeout)
-        self.logger.debug(f"download: dispatching to threaded downloader (timeout={self.configuration.timeout})")
+        self.logger.debug("download: dispatching to threaded downloader (timeout=%s)", self.configuration.timeout)
         return await threaded_download(
             self,
             video=video,
@@ -2017,27 +2019,27 @@ a new Python file, import only m3u8 and see what error you get.
     def _convert_ts_to_mp4(self, input_path: str, output_path: str,
                            callback: Callable[[int, int], None] | None = None, ios_support: bool = False) -> None:
         start_ts = time.perf_counter()
-        self.logger.info(f"Remux start: input={input_path} output={output_path}")
+        self.logger.info("Remux start: input=%s output=%s", input_path, output_path)
 
         try:
             input_size = os.path.getsize(input_path)
-            self.logger.debug(f"Remux input size: {input_size} bytes")
+            self.logger.debug("Remux input size: %s bytes", input_size)
         except Exception as e:
-            self.logger.debug(f"Remux input size unavailable: {e}")
+            self.logger.debug("Remux input size unavailable: %s", e)
 
         try:
             from av import open as av_open  # type: ignore[import-not-found]
             from av.audio.resampler import AudioResampler  # type: ignore[import-not-found]
             import av.audio.frame  # Used for runtime isinstance check
         except (ModuleNotFoundError, ImportError) as e:
-            self.logger.error(f"PyAV import failed for remux: {e}")
+            self.logger.error("PyAV import failed for remux: %s", e)
             raise ModuleNotFoundError(
                 f"PyAV is required for remuxing. Install with pip install av. Not supported on Termux! {e}")
 
-        self.logger.debug(f"Opening input for remux: {input_path}")
+        self.logger.debug("Opening input for remux: %s", input_path)
         input_ = av_open(input_path)
         fmt_name = (input_.format.name or "").lower()
-        self.logger.info(f"Input format detected: {fmt_name or '<unknown>'}")
+        self.logger.info("Input format detected: %s", fmt_name or '<unknown>')
 
         if fmt_name == "mpegts":
             # Fix 1: Suppress the stub mismatch for av.open
@@ -2048,8 +2050,8 @@ a new Python file, import only m3u8 and see what error you get.
             in_video = input_.streams.video[0]
             out_video = output.add_stream_from_template(template=in_video)
             self.logger.debug(
-                f"Video stream: codec={getattr(in_video.codec_context, 'name', None)} "
-                f"bit_rate={getattr(in_video.codec_context, 'bit_rate', None)}"
+                "Video stream: codec=%s bit_rate=%s",
+                getattr(in_video.codec_context, 'name', None), getattr(in_video.codec_context, 'bit_rate', None)
             )
 
             # --- AUDIO ---
@@ -2071,7 +2073,7 @@ a new Python file, import only m3u8 and see what error you get.
                 layout_name = audio_ctx.layout.name if getattr(audio_ctx, "layout", None) else "unknown"
 
                 self.logger.debug(
-                    f"Audio stream: codec={codec_name} sample_rate={sample_rate} layout={layout_name}"
+                    "Audio stream: codec=%s sample_rate=%s layout=%s", codec_name, sample_rate, layout_name
                 )
 
                 if codec_name in copy_ok:
@@ -2083,12 +2085,12 @@ a new Python file, import only m3u8 and see what error you get.
                     layout = audio_ctx.layout.name if getattr(audio_ctx, "layout", None) else "stereo"
 
                     out_audio = output.add_stream("aac", rate=sample_rate)
-                    self.logger.info(f"Transcoding audio to AAC: sample_rate={sample_rate} layout={layout}")
+                    self.logger.info("Transcoding audio to AAC: sample_rate=%s layout=%s"), sample_rate, layout
 
                     try:
                         out_audio.layout = layout
                     except Exception as exc:
-                        self.logger.warning(f"Exception in getting audio layout (doesn't matter): {exc}")
+                        self.logger.warning("Exception in getting audio layout (doesn't matter): %s", exc)
                         pass
 
                     resampler = AudioResampler(format="fltp", layout=layout, rate=sample_rate)
@@ -2102,10 +2104,10 @@ a new Python file, import only m3u8 and see what error you get.
             try:
                 total = os.path.getsize(input_path)
             except Exception as exc:
-                self.logger.warning(f"Exception while getting path size for demuxing progress??? {exc}")
+                self.logger.warning("Exception while getting path size for demuxing progress??? %s", exc)
                 total = 100
 
-            self.logger.info(f"Demuxing packets: total_bytes={total}")
+            self.logger.info("Demuxing packets: total_bytes=%s", total)
             progress_step = max(1, total // 10) if total else 0
             next_progress_log = progress_step if progress_step else 0
             current_progress = 0
@@ -2142,7 +2144,7 @@ a new Python file, import only m3u8 and see what error you get.
                 if callback:
                     callback(current_progress, total)
                 if progress_step and current_progress >= next_progress_log:
-                    self.logger.debug(f"Remux progress: bytes={current_progress}/{total}")
+                    self.logger.debug("Remux progress: bytes=%s/%s", current_progress, total)
                     next_progress_log += progress_step
 
             if transcode_audio and out_audio:
@@ -2156,15 +2158,17 @@ a new Python file, import only m3u8 and see what error you get.
 
             try:
                 out_size = os.path.getsize(output_path)
-                self.logger.info(f"Remux complete: output={output_path} size={out_size} bytes elapsed={elapsed:.2f}s")
+                self.logger.info("Remux complete: output=%s size=%s bytes elapsed=%s.2f", output_path, out_size,
+                                 elapsed)
             except Exception as e:
-                self.logger.info(f"Remux complete: output={output_path} elapsed={elapsed:.2f}s (size unavailable: {e})")
+                self.logger.info("Remux complete: output=%s elapsed=%s.2fs (size unavailable: %s)", output_path,
+                                 elapsed, e)
 
         else:
             self.logger.info("Stream seems to be already in MP4! Skipping remux...")
             os.rename(input_path, output_path)
             elapsed = time.perf_counter() - start_ts
-            self.logger.info(f"Remux skipped; file moved. elapsed={elapsed:.2f}s")
+            self.logger.info("Remux skipped; file moved. elapsed=%s.2f", elapsed)
 
     async def legacy_download(self, path: str, url: str, callback: Callable[[int, int], None] | None = None,
                         max_retries: int = 5,
@@ -2179,11 +2183,12 @@ a new Python file, import only m3u8 and see what error you get.
         Assumes self.session is an AsyncSession.
         """
         self.logger.info(
-            f"Legacy download start: url={url} path={path}"
-            f"max_retries={max_retries} read_timeout={read_timeout} "
-            f"stop_event_set={bool(stop_event and stop_event.is_set())} "
-            f"allow_multipart={allow_multipart}"
-        )
+"""Legacy download start: url=%s path=%s
+max_retries=%s read_timeout=%s
+stop_event_set=%s
+allow_multipart=%s""", url, path, max_retries, read_timeout, bool(stop_event and stop_event.is_set()),
+        allow_multipart)
+
         if stop_event is not None and stop_event.is_set():
             self.logger.warning("Stop event already set; cancelling legacy download.")
             raise DownloadCancelled("Download cancelled.")
@@ -2222,11 +2227,12 @@ a new Python file, import only m3u8 and see what error you get.
                     file_size = int(head_resp.headers.get("Content-Length", 0))
                     accept_ranges = head_resp.headers.get("Accept-Ranges", "")
             except Exception as e:
-                self.logger.warning(f"Failed to fetch HEAD info for concurrent check: {e}.")
+                self.logger.warning("Failed to fetch HEAD info for concurrent check: %S.", e)
 
         # 2. Execute Fast Multipart Download if supported and allowed
         if allow_multipart and file_size > 0 and accept_ranges == "bytes":
-            self.logger.info(f"Server supports Range requests. Starting fast multipart download for {file_size} bytes.")
+            self.logger.info("Server supports Range requests. Starting fast multipart download"
+                             "or %s bytes.", file_size)
 
             # Pre-allocate file
             def allocate_file() -> None:
@@ -2290,14 +2296,14 @@ a new Python file, import only m3u8 and see what error you get.
 
                     except Exception as exc:
                         if attempt < max_retries:
-                            self.logger.warning(f"Chunk %s failed (attempt %s/%s): %s",
+                            self.logger.warning("Chunk %s failed (attempt %s/%s): %s",
                                                 chunk_idx_now, attempt + 1, max_retries, exc)
                             # Reset progress for this chunk before retry
                             total_downloaded[0] -= chunk_progress[chunk_idx_now]
                             chunk_progress[chunk_idx_now] = 0
                             await asyncio.sleep(1 * attempt)
                         else:
-                            self.logger.error(f"Chunk %s permanently failed: %s", chunk_idx_now, exc)
+                            self.logger.error("Chunk %s permanently failed: %s", chunk_idx_now, exc)
                             return False
                 return False
 
@@ -2320,7 +2326,7 @@ a new Python file, import only m3u8 and see what error you get.
             if not all(results):
                 raise NetworkingError("One or more chunks failed to download completely.")
 
-            self.logger.info(f"Fast multipart download complete: path={path}")
+            self.logger.info("Fast multipart download complete: path=%s", path)
             return True
 
         # 3. Fallback to standard linear streaming download
@@ -2390,7 +2396,7 @@ a new Python file, import only m3u8 and see what error you get.
 
                 if progress_bar:
                     progress_bar = None
-                self.logger.info(f"Legacy download complete: bytes={downloaded_so_far} path={path}")
+                self.logger.info("Legacy download complete: bytes=%s path=%s", downloaded_so_far, path)
                 return True
             except RequestsError as e:
                 err_str = str(e).lower()
@@ -2399,7 +2405,7 @@ a new Python file, import only m3u8 and see what error you get.
                     if attempt > max_retries:
                         raise
                     backoff = min(2 ** attempt, 30)
-                    self.logger.warning(f"Read timeout; retrying {attempt}/{max_retries} in {backoff}s")
+                    self.logger.warning("Read timeout; retrying %s/%s in %s", attempt, max_retries,  backoff)
                     if stop_event is not None and stop_event.wait(backoff):
                         raise DownloadCancelled("Download cancelled.")
                     else:
