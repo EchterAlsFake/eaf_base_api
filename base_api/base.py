@@ -140,7 +140,7 @@ class Helper:
     """
     def __init__(
         self,
-        fetch_core: Any,
+        core: BaseCore,
         video_constructor: Callable[..., Any],
         *,
         logger: logging.Logger | None = None,
@@ -166,7 +166,7 @@ class Helper:
             alternative_constructor: An optional factory for non-standard results (e.g., when a page doesn't yield videos).
         """
         super().__init__()
-        self.fetch_core = fetch_core
+        self.fetch_core = core
         self.video_factory = video_constructor
         self.alternative_factory = alternative_constructor
 
