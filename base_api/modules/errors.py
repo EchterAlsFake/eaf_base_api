@@ -106,3 +106,17 @@ class BotProtectionDetected(Exception):
 class SecurityAbort(Exception):
     def __init__(self) -> None:
         self.message = message_security
+class VideoFetchError(Exception):
+    """
+    Raised or yielded when a video fails to fetch during concurrent fetching.
+    """
+    def __init__(self, url: str, original_error: Exception) -> None:
+        self.url = url
+        self.original_error = original_error
+        super().__init__(f"Failed to fetch video at {url}: {original_error}")
+
+class PageFetchError(Exception):
+    def __init__(self, url: str, original_error: Exception) -> None:
+        self.url = url
+        self.original_error = original_error
+        super().__init__(f"Failed to fetch page at {url}: {original_error}")
