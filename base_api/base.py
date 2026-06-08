@@ -1163,7 +1163,7 @@ a new Python file, import only m3u8 and see what error you get.
         cleanup_on_stop: bool = True,
         keep_segment_dir: bool = False,
         ios_support: bool = False
-    ) -> DownloadReport | bool | None:
+    ) -> DownloadReport | bool:
         """
         :param video:
         :param callback:
@@ -1194,11 +1194,11 @@ a new Python file, import only m3u8 and see what error you get.
 
         m3u8_url = getattr(video, "m3u8_base_url", None)
         self.logger.info(
-"""
-Download requested: quality=%s path=%s remux=%s max_workers=%s
-start_segment=%s segment_state_path=%s segment_dir=%s
-return_report=%s cleanup_on_stop=%s keep_segment_dir=%s
-stop_event_set=%s""",
+    """
+    Download requested: quality=%s path=%s remux=%s max_workers=%s
+    start_segment=%s segment_state_path=%s segment_dir=%s
+    return_report=%s cleanup_on_stop=%s keep_segment_dir=%s
+    stop_event_set=%s""",
             quality, path, remux, max_workers_download, start_segment, segment_state_path, segment_dir,
             return_report, cleanup_on_stop, keep_segment_dir, bool(stop_event and stop_event.is_set())
         )
@@ -1226,7 +1226,7 @@ stop_event_set=%s""",
         )
 
     def threaded(self, max_workers: int,
-                 timeout: int) -> Callable[..., Coroutine[Any, Any, bool | None | DownloadReport]]:
+                 timeout: int) -> Callable[..., Coroutine[Any, Any, bool | DownloadReport]]:
         # ChatGPT cooked so hard, not even wannabe influencers in dubai get that hot when they get exposed to the sun
         # <xD emoji from Hyprland Discord server here>
 
@@ -1246,389 +1246,343 @@ stop_event_set=%s""",
             cleanup_on_stop: bool = True,
             keep_segment_dir: bool = False,
             ios_support: bool = False
-        ) -> DownloadReport | None | bool:
+        ) -> DownloadReport | bool:
             """
             Threaded HLS segment downloader with optional resume state and stop flag.
             """
-            # Cast these to satisfy type checker if they come in as Optional
-            cleanup_on_stop = bool(cleanup_on_stop)
-            keep_segment_dir = bool(keep_segment_dir)
+            try:
+                # Cast these to satisfy type checker if they come in as Optional
+                cleanup_on_stop = bool(cleanup_on_stop)
+                keep_segment_dir = bool(keep_segment_dir)
 
-            self.logger.info(
-                f"Threaded download start: quality={quality} path={path} remux={remux} start_segment={start_segment} "
-                f"segment_state_path={segment_state_path} segment_dir={segment_dir} return_report={return_report} "
-                f"cleanup_on_stop={cleanup_on_stop} keep_segment_dir={keep_segment_dir} max_workers={max_workers} "
-                f"timeout={timeout} stop_event_set={bool(stop_event and stop_event.is_set())}"
-            )
-            self.logger.debug(
-                f"Threaded download callbacks: callback_set={bool(callback)} callback_remux_set={bool(callback_remux)}"
-            )
-            resume_state = None
-            resume_mode = False
-            created_at = None
+                self.logger.info(
+                    f"Threaded download start: quality={quality} path={path} remux={remux} start_segment={start_segment} "
+                    f"segment_state_path={segment_state_path} segment_dir={segment_dir} return_report={return_report} "
+                    f"cleanup_on_stop={cleanup_on_stop} keep_segment_dir={keep_segment_dir} max_workers={max_workers} "
+                    f"timeout={timeout} stop_event_set={bool(stop_event and stop_event.is_set())}"
+                )
+                self.logger.debug(
+                    f"Threaded download callbacks: callback_set={bool(callback)} callback_remux_set={bool(callback_remux)}"
+                )
+                resume_state = None
+                resume_mode = False
+                created_at = None
 
-            # Help type checker with initial types
-            if segment_state_path:
-                if os.path.exists(segment_state_path):
-                    self.logger.info(f"Found segment state file: {segment_state_path}. Attempting resume.")
+                # Help type checker with initial types
+                if segment_state_path:
+                    if os.path.exists(segment_state_path):
+                        self.logger.info(f"Found segment state file: {segment_state_path}. Attempting resume.")
+                    else:
+                        self.logger.debug(f"No segment state file found at: {segment_state_path}. Starting fresh.")
+
+                if segment_state_path and os.path.exists(segment_state_path):
+                    try: # This starts resuming from previous download
+                        resume_state = load_segment_state(segment_state_path)
+                        resume_mode = True
+                    except Exception as e: # Shouldn't happen, but if it does, we just do a new download
+                        self.logger.warning(f"Failed to load segment state {segment_state_path}: {e}. Starting fresh.")
+                        resume_state = None
+                        resume_mode = False
+
+                if resume_mode:
+                    assert resume_state is not None
+                    segments = resume_state.get("segments") or []  # This fetches the list of segments from the resume state
+                    if not segments:
+                        raise UnknownError("Segment state is invalid or empty.") # Shouldn't happen ;)
+
+                    segment_dir = resume_state.get("segment_dir") or segment_dir
+                    if not segment_dir:
+                        raise UnknownError("Segment state is missing segment_dir.")
+
+                    created_at = resume_state.get("created_at")
+                    width = int(resume_state.get("segment_index_width") or get_segment_index_width(len(segments)))
+                    state_start = int(resume_state.get("start_segment", 0) or 0) # Where we start segments
+
+                    """
+                Because every segment has a different binary offset, we can't just inject specific segments into specific
+                parts of the file. That's why I can only start after xx successful segments.
+
+                So, let's say 0-12 segments were successful, but 13 was not and from 14-17 everything went smooth.
+                In this case, I need to start from 13 and STILL override 14-17.
+                    """
+
+                    if start_segment and state_start != start_segment:
+                        self.logger.warning(
+                            f"start_segment={start_segment} ignored; resuming from state start_segment={state_start}."
+                        )
+
+                    start_segment = state_start
+                    m3u8_url = resume_state.get("m3u8_url") or ""
+                    state_quality = resume_state.get("quality", quality)
+                    self.logger.info(
+                        f"Resume state loaded: segments={len(segments)} start_segment={start_segment} "
+                        f"segment_dir={segment_dir} segment_index_width={width} created_at={created_at} "
+                        f"quality={state_quality} m3u8_url={m3u8_url}"
+                    )
+
                 else:
-                    self.logger.debug(f"No segment state file found at: {segment_state_path}. Starting fresh.")
-
-            if segment_state_path and os.path.exists(segment_state_path):
-                try: # This starts resuming from previous download
-                    resume_state = load_segment_state(segment_state_path)
-                    resume_mode = True
-                except Exception as e: # Shouldn't happen, but if it does, we just do a new download
-                    self.logger.warning(f"Failed to load segment state {segment_state_path}: {e}. Starting fresh.")
-                    resume_state = None
-                    resume_mode = False
-
-            if resume_mode:
-                assert resume_state is not None
-                segments = resume_state.get("segments") or []  # This fetches the list of segments from the resume state
-                if not segments:
-                    raise UnknownError("Segment state is invalid or empty.") # Shouldn't happen ;)
-
-                segment_dir = resume_state.get("segment_dir") or segment_dir
-                if not segment_dir:
-                    raise UnknownError("Segment state is missing segment_dir.")
-
-                created_at = resume_state.get("created_at")
-                width = int(resume_state.get("segment_index_width") or get_segment_index_width(len(segments)))
-                state_start = int(resume_state.get("start_segment", 0) or 0) # Where we start segments
-
-                """
-            Because every segment has a different binary offset, we can't just inject specific segments into specific
-            parts of the file. That's why I can only start after xx successful segments.
-            
-            So, let's say 0-12 segments were successful, but 13 was not and from 14-17 everything went smooth.
-            In this case, I need to start from 13 and STILL override 14-17.
-                """
-
-                if start_segment and state_start != start_segment:
-                    self.logger.warning(
-                        f"start_segment={start_segment} ignored; resuming from state start_segment={state_start}."
+                    m3u8_master = getattr(video, "m3u8_base_url")
+                    assert m3u8_master is not None, "m3u8_base_url is missing from video object"
+                    self.logger.info(f"Fetching segments for quality={quality} m3u8_url_master={m3u8_master}")
+                    segments = await self.get_segments(quality=quality, m3u8_url_master=m3u8_master)
+                    total_before = len(segments)
+                    if start_segment > 0:
+                        self.logger.debug(
+                            f"Applying start_segment offset: {start_segment} (from total={total_before})"
+                        )
+                        segments = segments[start_segment:]
+                    if segment_state_path and segment_dir is None:
+                        segment_dir = f"{path}.segments"
+                        self.logger.debug(f"segment_dir set from state path: {segment_dir}")
+                    width = get_segment_index_width(len(segments)) if segment_dir else 0
+                    m3u8_url = m3u8_master
+                    state_quality = quality
+                    self.logger.info(
+                        f"Segments ready: count={len(segments)} segment_dir={segment_dir} "
+                        f"segment_index_width={width} m3u8_url={m3u8_url}"
                     )
 
-                start_segment = state_start
-                m3u8_url = resume_state.get("m3u8_url") or ""
-                state_quality = resume_state.get("quality", quality)
-                self.logger.info(
-                    f"Resume state loaded: segments={len(segments)} start_segment={start_segment} "
-                    f"segment_dir={segment_dir} segment_index_width={width} created_at={created_at} "
-                    f"quality={state_quality} m3u8_url={m3u8_url}"
-                )
+                n = len(segments) # Total amount of segments
+                if n == 0:
+                    raise UnknownError("No segments found for this playlist.")
+                    # Shouldn't happen
 
-            else:
-                m3u8_master = getattr(video, "m3u8_base_url")
-                assert m3u8_master is not None, "m3u8_base_url is missing from video object"
-                self.logger.info(f"Fetching segments for quality={quality} m3u8_url_master={m3u8_master}")
-                segments = await self.get_segments(quality=quality, m3u8_url_master=m3u8_master)
-                total_before = len(segments)
-                if start_segment > 0:
-                    self.logger.debug(
-                        f"Applying start_segment offset: {start_segment} (from total={total_before})"
+                if segment_dir:
+                    os.makedirs(segment_dir, exist_ok=True) # Creates the segment directory for later resuming
+                    self.logger.debug(f"Segment directory ready: {segment_dir}")
+                self.logger.info(f"Segment plan: total={n} segment_dir={segment_dir}")
+
+                downloaded = [False] * n # Keeps track of total downloaded segments
+
+                """
+                We write a list with [False, False, n] where n is the value of the total amount of segments.
+                This creates a lit with as many False entries as segments. Since `self.download_segment` returns a bool
+                along with the data, we can use that to keep track, since we just change the bool to True for every 
+                downloaded segments.
+                """
+
+                if segment_dir: # Tries to find existing segments that we already downloaded
+                    existing_segments = 0
+                    for i in range(n): # Does that for every segment
+                        seg_path = segment_file_path(segment_dir, i, width) # Gets the file path
+                        try:
+                            if os.path.exists(seg_path) and os.path.getsize(seg_path) > 0:
+                                # if it exists, we treat it as already downloaded (makes sense)
+                                downloaded[i] = True
+                                existing_segments += 1
+                        except Exception as exc:
+                            self.logger.warning(f"Couldn't download segment: {i}, retrying later.  ->: {exc}")
+                            # If something goes wrong, we treat it as not downloaded and re-fetch it later
+                            downloaded[i] = False
+                    self.logger.info(
+                        f"Existing segments detected: {existing_segments}/{n} in {segment_dir}"
                     )
-                    segments = segments[start_segment:]
-                if segment_state_path and segment_dir is None:
-                    segment_dir = f"{path}.segments"
-                    self.logger.debug(f"segment_dir set from state path: {segment_dir}")
-                width = get_segment_index_width(len(segments)) if segment_dir else 0
-                m3u8_url = m3u8_master
-                state_quality = quality
-                self.logger.info(
-                    f"Segments ready: count={len(segments)} segment_dir={segment_dir} "
-                    f"segment_index_width={width} m3u8_url={m3u8_url}"
-                )
 
-            n = len(segments) # Total amount of segments
-            if n == 0:
-                raise UnknownError("No segments found for this playlist.")
-                # Shouldn't happen
+                progressed = sum(downloaded) # Amount of already downloaded segments
+                downloaded_count = progressed
+                if progressed and callback: # Does an initial callback, so that Porn Fetch can start showing the user how
+                    # many segments have already been downloaded
+                    callback(progressed, n)
+                if progressed:
+                    self.logger.info(f"Resume progress: already_downloaded={progressed}/{n}")
 
-            if segment_dir:
-                os.makedirs(segment_dir, exist_ok=True) # Creates the segment directory for later resuming
-                self.logger.debug(f"Segment directory ready: {segment_dir}")
-            self.logger.info(f"Segment plan: total={n} segment_dir={segment_dir}")
+                target_indices = [i for i in range(n) if not downloaded[i]] # The segments we still need to fetch
+                self.logger.info(f"Target segments to download: {len(target_indices)}/{n}")
 
-            downloaded = [False] * n # Keeps track of total downloaded segments
+                tmp_path = f"{path}.tmp" # Creates a temporary path where we write stuff to
+                cancelled = False # This is the cancellation event that stops the download
+                max_seg_retries = 2 # Maximum retries to get segments
+                progress_log_step = max(1, n // 20)
+                next_progress_log = ((progressed // progress_log_step) + 1) * progress_log_step
 
-            """
-            We write a list with [False, False, n] where n is the value of the total amount of segments.
-            This creates a lit with as many False entries as segments. Since `self.download_segment` returns a bool
-            along with the data, we can use that to keep track, since we just change the bool to True for every 
-            downloaded segments.
-            """
+                if stop_event is not None and stop_event.is_set():
+                    cancelled = True
+                    target_indices = [] # Empty list stops the download :)
+                    self.logger.warning("Stop event already set; cancelling before scheduling segments.")
 
-            if segment_dir: # Tries to find existing segments that we already downloaded
-                existing_segments = 0
-                for i in range(n): # Does that for every segment
-                    seg_path = segment_file_path(segment_dir, i, width) # Gets the file path
+                if target_indices:
+                    workers = max(1, min(max_workers, len(target_indices)))
+                    parts: List[bytes | None] | None = None
+                    next_to_write = 0
+                    out_fp = None
+                    self.logger.info(
+                        f"Starting segment download pool: workers={workers} targets={len(target_indices)}"
+                    )
+
+                    if not segment_dir:
+                        parts = [None] * n
+                        out_fp = cast(Any, open(tmp_path, "wb"))
+                        self.logger.debug(f"Using in-memory segment assembly. tmp_path={tmp_path}")
+                    else:
+                        self.logger.debug(f"Writing segments to disk. segment_dir={segment_dir} tmp_path={tmp_path}")
+
                     try:
-                        if os.path.exists(seg_path) and os.path.getsize(seg_path) > 0:
-                            # if it exists, we treat it as already downloaded (makes sense)
-                            downloaded[i] = True
-                            existing_segments += 1
-                    except Exception as exc:
-                        self.logger.warning(f"Couldn't download segment: {i}, retrying later.  ->: {exc}")
-                        # If something goes wrong, we treat it as not downloaded and re-fetch it later
-                        downloaded[i] = False
-                self.logger.info(
-                    f"Existing segments detected: {existing_segments}/{n} in {segment_dir}"
-                )
+                        # Use asyncio.gather to fetch segments concurrently instead of ThreadPoolExecutor
 
-            progressed = sum(downloaded) # Amount of already downloaded segments
-            downloaded_count = progressed
-            if progressed and callback: # Does an initial callback, so that Porn Fetch can start showing the user how
-                # many segments have already been downloaded
-                callback(progressed, n)
-            if progressed:
-                self.logger.info(f"Resume progress: already_downloaded={progressed}/{n}")
+                        # Create a semaphore to limit concurrent requests
+                        semaphore = asyncio.Semaphore(workers)
 
-            target_indices = [i for i in range(n) if not downloaded[i]] # The segments we still need to fetch
-            self.logger.info(f"Target segments to download: {len(target_indices)}/{n}")
-
-            tmp_path = f"{path}.tmp" # Creates a temporary path where we write stuff to
-            cancelled = False # This is the cancellation event that stops the download
-            max_seg_retries = 2 # Maximum retries to get segments
-            progress_log_step = max(1, n // 20)
-            next_progress_log = ((progressed // progress_log_step) + 1) * progress_log_step
-
-            if stop_event is not None and stop_event.is_set():
-                cancelled = True
-                target_indices = [] # Empty list stops the download :)
-                self.logger.warning("Stop event already set; cancelling before scheduling segments.")
-
-            if target_indices:
-                workers = max(1, min(max_workers, len(target_indices)))
-                parts: List[bytes | None] | None = None
-                next_to_write = 0
-                out_fp = None
-                self.logger.info(
-                    f"Starting segment download pool: workers={workers} targets={len(target_indices)}"
-                )
-
-                if not segment_dir:
-                    parts = [None] * n
-                    out_fp = cast(Any, open(tmp_path, "wb"))
-                    self.logger.debug(f"Using in-memory segment assembly. tmp_path={tmp_path}")
-                else:
-                    self.logger.debug(f"Writing segments to disk. segment_dir={segment_dir} tmp_path={tmp_path}")
-
-                try:
-                    # Use asyncio.gather to fetch segments concurrently instead of ThreadPoolExecutor
-
-                    # Create a semaphore to limit concurrent requests
-                    semaphore = asyncio.Semaphore(workers)
-
-                    async def fetch_segment_with_semaphore(idx: int, url: str) -> Tuple[int, bool, bytes]:
-                        async with semaphore:
-                            if stop_event is not None and stop_event.is_set():
-                                return idx, False, b""
-
-                            # Handle retries inside the coroutine
-                            for attempt in range(max_seg_retries + 1):
+                        async def fetch_segment_with_semaphore(idx: int, url: str) -> Tuple[int, bool, bytes]:
+                            async with semaphore:
                                 if stop_event is not None and stop_event.is_set():
                                     return idx, False, b""
 
-                                try:
-                                    _, segment_data, is_success = await self.download_segment(url, timeout, stop_event)
-                                    if is_success and data:
-                                        return idx, True, segment_data
-                                except Exception as exception:
-                                    self.logger.error(f"Worker exception for segment {idx}: {exception}")
+                                # Handle retries inside the coroutine
+                                for attempt in range(max_seg_retries + 1):
+                                    if stop_event is not None and stop_event.is_set():
+                                        return idx, False, b""
 
-                                if attempt < max_seg_retries:
-                                    self.logger.warning(
-                                        f"Segment {idx} failed; retrying {attempt + 1}/{max_seg_retries}"
-                                    )
-                                    # Optional short backoff delay could go here
+                                    try:
+                                        _, segment_data, is_success = await self.download_segment(url, timeout, stop_event)
+                                        if is_success and data:
+                                            return idx, True, segment_data
+                                    except Exception as exception:
+                                        self.logger.error(f"Worker exception for segment {idx}: {exception}")
+
+                                    if attempt < max_seg_retries:
+                                        self.logger.warning(
+                                            f"Segment {idx} failed; retrying {attempt + 1}/{max_seg_retries}"
+                                        )
+                                        # Optional short backoff delay could go here
+                                    else:
+                                        self.logger.error(
+                                            f"Segment {idx} failed after {attempt} retries."
+                                        )
+                                return idx, False, b""
+
+                        tasks = [fetch_segment_with_semaphore(i, segments[i]) for i in target_indices]
+
+                        # Use asyncio.as_completed to process results as they come in, similar to wait(FIRST_COMPLETED)
+                        for coro in asyncio.as_completed(tasks):
+                            if stop_event is not None and stop_event.is_set():
+                                cancelled = True
+                                # The remaining tasks will see the event set and exit quickly
+                                continue
+
+                            i, success, data = await coro
+
+                            if cancelled:
+                                continue
+
+                            if success and data:
+                                downloaded[i] = True # Successfully got segment, mark it as done
+                                downloaded_count += 1
+                                if segment_dir:
+                                    # Write to a temp path (good for resuming, but not I/O efficient)
+                                    seg_path = segment_file_path(segment_dir, i, width)
+                                    tmp_seg = f"{seg_path}.part"
+                                    # Offload segment file writing to a thread
+                                    def write_part(ts_path: str, t_data: bytes) -> None:
+                                        with open(ts_path, "wb") as f:
+                                            f.write(t_data)
+                                    await asyncio.to_thread(write_part, tmp_seg, data)
+                                    os.replace(tmp_seg, seg_path)
                                 else:
-                                    self.logger.error(
-                                        f"Segment {idx} failed after {attempt} retries."
+                                    assert parts is not None
+                                    parts[i] = data # Keep in memory (I/O efficient)
+
+                                progressed += 1 # Fetched +1 segment, so we give back callback
+                                if callback:
+                                    callback(progressed, n)
+                                if progressed >= next_progress_log or progressed == n:
+                                    remaining = n - downloaded_count
+                                    self.logger.debug(
+                                        f"Segment progress: processed={progressed}/{n} "
+                                        f"downloaded={downloaded_count} remaining={remaining}"
                                     )
-                            return idx, False, b""
+                                    next_progress_log += progress_log_step
 
-                    tasks = [fetch_segment_with_semaphore(i, segments[i]) for i in target_indices]
-
-                    # Use asyncio.as_completed to process results as they come in, similar to wait(FIRST_COMPLETED)
-                    for coro in asyncio.as_completed(tasks):
-                        if stop_event is not None and stop_event.is_set():
-                            cancelled = True
-                            # The remaining tasks will see the event set and exit quickly
-                            continue
-
-                        i, success, data = await coro
-
-                        if cancelled:
-                            continue
-
-                        if success and data:
-                            downloaded[i] = True # Successfully got segment, mark it as done
-                            downloaded_count += 1
-                            if segment_dir:
-                                # Write to a temp path (good for resuming, but not I/O efficient)
-                                seg_path = segment_file_path(segment_dir, i, width)
-                                tmp_seg = f"{seg_path}.part"
-                                # Offload segment file writing to a thread
-                                def write_part(ts_path: str, t_data: bytes) -> None:
-                                    with open(ts_path, "wb") as f:
-                                        f.write(t_data)
-                                await asyncio.to_thread(write_part, tmp_seg, data)
-                                os.replace(tmp_seg, seg_path)
                             else:
-                                assert parts is not None
-                                parts[i] = data # Keep in memory (I/O efficient)
+                                # Handling failure (already retried in fetch_segment_with_semaphore)
+                                progressed += 1
+                                if callback:
+                                    callback(progressed, n)
+                                if progressed >= next_progress_log or progressed == n:
+                                    remaining = n - downloaded_count
+                                    self.logger.debug(
+                                        f"Segment progress: processed={progressed}/{n} "
+                                        f"downloaded={downloaded_count} remaining={remaining}"
+                                    )
+                                    next_progress_log += progress_log_step
 
-                            progressed += 1 # Fetched +1 segment, so we give back callback
-                            if callback:
-                                callback(progressed, n)
-                            if progressed >= next_progress_log or progressed == n:
-                                remaining = n - downloaded_count
-                                self.logger.debug(
-                                    f"Segment progress: processed={progressed}/{n} "
-                                    f"downloaded={downloaded_count} remaining={remaining}"
-                                )
-                                next_progress_log += progress_log_step
+                            if not segment_dir and parts is not None:
+                                chunks_to_write = []
+                                while next_to_write < n and parts[next_to_write] is not None:
+                                    if parts[next_to_write]:
+                                        chunks_to_write.append(parts[next_to_write])
+                                    next_to_write += 1
+                                if chunks_to_write:
+                                    # Write memory chunks to thread to prevent IO block
+                                    def write_chunks(fp: Any, list_of_data: List[bytes]) -> None:
+                                        for c_data in list_of_data:
+                                            fp.write(c_data)
+                                    await asyncio.to_thread(write_chunks, cast(Any, out_fp), chunks_to_write)
 
-                        else:
-                            # Handling failure (already retried in fetch_segment_with_semaphore)
-                            progressed += 1
-                            if callback:
-                                callback(progressed, n)
-                            if progressed >= next_progress_log or progressed == n:
-                                remaining = n - downloaded_count
-                                self.logger.debug(
-                                    f"Segment progress: processed={progressed}/{n} "
-                                    f"downloaded={downloaded_count} remaining={remaining}"
-                                )
-                                next_progress_log += progress_log_step
+                    finally:
+                        if out_fp is not None:
+                            out_fp.close()
 
-                        if not segment_dir and parts is not None:
-                            chunks_to_write = []
-                            while next_to_write < n and parts[next_to_write] is not None:
-                                if parts[next_to_write]:
-                                    chunks_to_write.append(parts[next_to_write])
-                                next_to_write += 1
-                            if chunks_to_write:
-                                # Write memory chunks to thread to prevent IO block
-                                def write_chunks(fp: Any, list_of_data: List[bytes]) -> None:
-                                    for c_data in list_of_data:
-                                        fp.write(c_data)
-                                await asyncio.to_thread(write_chunks, cast(Any, out_fp), chunks_to_write)
-
-                finally:
-                    if out_fp is not None:
-                        out_fp.close()
-
-            missing = [i for i, ok in enumerate(downloaded) if not ok] # Missing segments
-            missing_urls = [segments[i] for i in missing] # Missing URLs of segments
-            self.logger.info(
-                "Segment download finished: downloaded=%s/%s missing=%s cancelled=%s",
-            downloaded_count, n, len(missing), cancelled)
-            if missing:
-                sample = missing[:10]
-                self.logger.error(
-                    "Missing segments detected: count=%s sample=%s", len(missing), sample
-                )
-
-            report = DownloadReport(
-                status= "cancelled" if cancelled else ("failed" if missing else "completed"),
-                total=n,
-                downloaded= n - len(missing),
-                missing=missing,
-                missing_urls=missing_urls,
-                segment_dir=segment_dir,
-                segment_state_path=segment_state_path,
-                start_segment=start_segment,
-                quality=quality
-
-            )
-
-            if cancelled: # If user cancels, we clean up stuff
-                self.logger.warning(
-                    f"Download cancelled. cleanup_on_stop={cleanup_on_stop} keep_segment_dir={keep_segment_dir}"
-                )
-                if cleanup_on_stop:
-                    self._safe_remove(tmp_path)
-                    if segment_dir and not keep_segment_dir:
-                        self._safe_rmtree(segment_dir)
-
-                if segment_state_path:
-                    # This is the segment state that is saved as a file, this is NOT the returned report!
-                    assert  isinstance(segment_state_path, str)
-                    self.logger.info(f"Writing segment state to: {segment_state_path}")
-                    state = build_segment_state(
-                        segments=segments,
-                        missing=missing,
-                        segment_dir=segment_dir,
-                        segment_index_width=width if segment_dir else 0,
-                        path=path,
-                        quality=str(state_quality),
-                        start_segment=start_segment,
-                        m3u8_url=m3u8_url,
-                        created_at=created_at,
-                    )
-                    write_segment_state(segment_state_path, state)
-
-                if return_report:
-                    missing = report.missing
-                    self.logger.debug(
-                        f"Returning cancelled report: downloaded={report.downloaded} missing={len(missing)}"
-                    )
-                    return report
-                raise DownloadCancelled("Download cancelled.")
-
-            if missing:
-                self.logger.error(
-                    f"Download incomplete: {len(missing)} segments missing. Writing state={bool(segment_state_path)}"
-                )
-                self._safe_remove(tmp_path)
-                if segment_state_path:
-                    self.logger.info(f"Writing segment state to: {segment_state_path}")
-                    state = build_segment_state(
-                        segments=segments,
-                        missing=missing,
-                        segment_dir=segment_dir,
-                        segment_index_width=width if segment_dir else 0,
-                        path=path,
-                        quality=str(state_quality),
-                        start_segment=start_segment,
-                        m3u8_url=m3u8_url,
-                        created_at=created_at,
-                    )
-                    write_segment_state(segment_state_path, state)
-                if return_report:
-                    self.logger.debug(
-                        f"Returning failed report: downloaded={report.downloaded} missing={len(report.missing)}"
-                    )
-                    return report
-                raise UnknownError(
-                    f"Failed to download {len(missing)} segments. Try lowering workers or switching downloader=FFMPEG."
-                )
-
-            if segment_dir:
+                missing = [i for i, ok in enumerate(downloaded) if not ok] # Missing segments
+                missing_urls = [segments[i] for i in missing] # Missing URLs of segments
                 self.logger.info(
-                    f"Assembling {n} segments from {segment_dir} into {tmp_path}"
-                )
-                def assemble_segments() -> List[int]:
-                    with open(tmp_path, "wb") as out_file_path:
-                        for idx in range(n):
-                            segment_path = segment_file_path(segment_dir, idx, width)
-                            if not os.path.exists(segment_path):
-                                return [idx]
-                            with open(segment_path, "rb") as seg_fp:
-                                shutil.copyfileobj(seg_fp, out_file_path, length=1024 * 1024) # type: ignore[arg-type]
-                    return []
+                    "Segment download finished: downloaded=%s/%s missing=%s cancelled=%s",
+                downloaded_count, n, len(missing), cancelled)
+                if missing:
+                    sample = missing[:10]
+                    self.logger.error(
+                        "Missing segments detected: count=%s sample=%s", len(missing), sample
+                    )
 
-                # Offload heavy IO segment assembly
-                missing_assemble = await asyncio.to_thread(assemble_segments)
-                if missing_assemble:
-                    missing = missing_assemble
+                report = DownloadReport(
+                    status= "cancelled" if cancelled else ("failed" if missing else "completed"),
+                    total=n,
+                    downloaded= n - len(missing),
+                    missing=missing,
+                    missing_urls=missing_urls,
+                    segment_dir=segment_dir,
+                    segment_state_path=segment_state_path,
+                    start_segment=start_segment,
+                    quality=quality
+
+                )
+
+                if cancelled: # If user cancels, we clean up stuff
+                    self.logger.warning(
+                        f"Download cancelled. cleanup_on_stop={cleanup_on_stop} keep_segment_dir={keep_segment_dir}"
+                    )
+                    if cleanup_on_stop:
+                        self._safe_remove(tmp_path)
+                        if segment_dir and not keep_segment_dir:
+                            self._safe_rmtree(segment_dir)
+
+                    if segment_state_path:
+                        # This is the segment state that is saved as a file, this is NOT the returned report!
+                        assert  isinstance(segment_state_path, str)
+                        self.logger.info(f"Writing segment state to: {segment_state_path}")
+                        state = build_segment_state(
+                            segments=segments,
+                            missing=missing,
+                            segment_dir=segment_dir,
+                            segment_index_width=width if segment_dir else 0,
+                            path=path,
+                            quality=str(state_quality),
+                            start_segment=start_segment,
+                            m3u8_url=m3u8_url,
+                            created_at=created_at,
+                        )
+                        write_segment_state(segment_state_path, state)
+
+                    if return_report:
+                        missing = report.missing
+                        self.logger.debug(
+                            f"Returning cancelled report: downloaded={report.downloaded} missing={len(missing)}"
+                        )
+                        return report
+                    return False
 
                 if missing:
                     self.logger.error(
-                        f"Missing segment file during assemble: index={missing[0]} segment_dir={segment_dir}"
+                        f"Download incomplete: {len(missing)} segments missing. Writing state={bool(segment_state_path)}"
                     )
                     self._safe_remove(tmp_path)
                     if segment_state_path:
@@ -1645,51 +1599,99 @@ stop_event_set=%s""",
                             created_at=created_at,
                         )
                         write_segment_state(segment_state_path, state)
-                    report.status = "failed"
-                    report.missing = missing
-                    report.missing_urls = [segments[i] for i in missing]
                     if return_report:
                         self.logger.debug(
-                            f"Returning failed report after assemble: downloaded={report.downloaded} "
-                            f"missing={len(report.missing)}"
+                            f"Returning failed report: downloaded={report.downloaded} missing={len(report.missing)}"
                         )
                         return report
-                    raise UnknownError("Missing segment files during assemble.")
+                    return False
 
-            if remux:
-                self.logger.info(f"Remuxing TS to MP4: input={tmp_path} output={path}")
-                # Offload heavy CPU/IO bound task
-                await asyncio.to_thread(self._convert_ts_to_mp4, tmp_path, path, callback_remux, ios_support)
-                # This is important, because not all players can play MPEG-TS AND I want to write
-                # metadata to the files, and this doesn't work without a container.
-                self._safe_remove(tmp_path)
-                self.logger.info(f"Remux completed: output={path}")
+                if segment_dir:
+                    self.logger.info(
+                        f"Assembling {n} segments from {segment_dir} into {tmp_path}"
+                    )
+                    def assemble_segments() -> List[int]:
+                        with open(tmp_path, "wb") as out_file_path:
+                            for idx in range(n):
+                                segment_path = segment_file_path(segment_dir, idx, width)
+                                if not os.path.exists(segment_path):
+                                    return [idx]
+                                with open(segment_path, "rb") as seg_fp:
+                                    shutil.copyfileobj(seg_fp, out_file_path, length=1024 * 1024) # type: ignore[arg-type]
+                        return []
 
-            else:
-                self.logger.debug("Remux disabled; moving temporary file into place.")
-                try:
-                    os.replace(tmp_path, path) # If we don't remux, we just rename it to mp4 and treat it as done :)
-                except Exception as exc: # Shouldn't happen and I also don't know what this does lol
-                    self.logger.warning(f"os.replace failed: {exc}, falling back to manual copy.")
-                    def manual_copy() -> None:
-                        with open(path, "wb") as final_fp, open(tmp_path, "rb") as in_fp:
-                            for chunk in iter(lambda: in_fp.read(1024 * 1024), b""):
-                                final_fp.write(chunk)
-                    await asyncio.to_thread(manual_copy)
-                    self._safe_remove(tmp_path) # Remove stuff I guess
+                    # Offload heavy IO segment assembly
+                    missing_assemble = await asyncio.to_thread(assemble_segments)
+                    if missing_assemble:
+                        missing = missing_assemble
 
-            if segment_dir and not keep_segment_dir:
-                self._safe_rmtree(segment_dir) # Delete segment dir (cleanup) (optional)
-            if segment_state_path: # Delete segment state (optional)
-                self._safe_remove(segment_state_path)
-            self.logger.info(f"Download completed successfully: path={path}")
+                    if missing:
+                        self.logger.error(
+                            f"Missing segment file during assemble: index={missing[0]} segment_dir={segment_dir}"
+                        )
+                        self._safe_remove(tmp_path)
+                        if segment_state_path:
+                            self.logger.info(f"Writing segment state to: {segment_state_path}")
+                            state = build_segment_state(
+                                segments=segments,
+                                missing=missing,
+                                segment_dir=segment_dir,
+                                segment_index_width=width if segment_dir else 0,
+                                path=path,
+                                quality=str(state_quality),
+                                start_segment=start_segment,
+                                m3u8_url=m3u8_url,
+                                created_at=created_at,
+                            )
+                            write_segment_state(segment_state_path, state)
+                        report.status = "failed"
+                        report.missing = missing
+                        report.missing_urls = [segments[i] for i in missing]
+                        if return_report:
+                            self.logger.debug(
+                                f"Returning failed report after assemble: downloaded={report.downloaded} "
+                                f"missing={len(report.missing)}"
+                            )
+                            return report
+                        return False
 
-            if return_report: # Do a report, if user asked to
-                self.logger.debug(
-                    f"Returning completed report: downloaded={report.downloaded} missing={len(report.missing)}"
-                )
-                return report
-            return True
+                if remux:
+                    self.logger.info(f"Remuxing TS to MP4: input={tmp_path} output={path}")
+                    # Offload heavy CPU/IO bound task
+                    await asyncio.to_thread(self._convert_ts_to_mp4, tmp_path, path, callback_remux, ios_support)
+                    # This is important, because not all players can play MPEG-TS AND I want to write
+                    # metadata to the files, and this doesn't work without a container.
+                    self._safe_remove(tmp_path)
+                    self.logger.info(f"Remux completed: output={path}")
+
+                else:
+                    self.logger.debug("Remux disabled; moving temporary file into place.")
+                    try:
+                        os.replace(tmp_path, path) # If we don't remux, we just rename it to mp4 and treat it as done :)
+                    except Exception as exc: # Shouldn't happen and I also don't know what this does lol
+                        self.logger.warning(f"os.replace failed: {exc}, falling back to manual copy.")
+                        def manual_copy() -> None:
+                            with open(path, "wb") as final_fp, open(tmp_path, "rb") as in_fp:
+                                for chunk in iter(lambda: in_fp.read(1024 * 1024), b""):
+                                    final_fp.write(chunk)
+                        await asyncio.to_thread(manual_copy)
+                        self._safe_remove(tmp_path) # Remove stuff I guess
+
+                if segment_dir and not keep_segment_dir:
+                    self._safe_rmtree(segment_dir) # Delete segment dir (cleanup) (optional)
+                if segment_state_path: # Delete segment state (optional)
+                    self._safe_remove(segment_state_path)
+                self.logger.info(f"Download completed successfully: path={path}")
+
+                if return_report: # Do a report, if user asked to
+                    self.logger.debug(
+                        f"Returning completed report: downloaded={report.downloaded} missing={len(report.missing)}"
+                    )
+                    return report
+                return True
+            except Exception as e:
+                self.logger.exception(f"Unhandled exception in download wrapper: {e}")
+                return False
 
         return wrapper # Return the wrapper (start stuff)
 
