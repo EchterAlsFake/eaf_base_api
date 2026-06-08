@@ -9,7 +9,7 @@ class DownloadState:
     created_at: Any
     updated_at: Any
     m3u8_url: str | None
-    quality: str
+    quality: str | int
     output_path: Path | str
     segment_dir: Path | str | None
     segment_index_width: int
@@ -30,5 +30,5 @@ class DownloadReport:
     segment_dir: Path | str | None
     segment_state_path: Path | str | None
     start_segment: int
-    quality: str
+    quality: str | int
 

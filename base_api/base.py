@@ -1149,7 +1149,7 @@ a new Python file, import only m3u8 and see what error you get.
     async def download(
         self,
         video: Any, # The video object
-        quality: str, # Selected quality e.g., 720, 1080 and so on
+        quality: str | int, # Selected quality e.g., 720, 1080 and so on
         path: str, # Output Path
         callback: Callable[[int, int], None] | None,
         remux: bool = False, # Whether to remux the video from MPEG-TS to mp4 container
@@ -1233,7 +1233,7 @@ a new Python file, import only m3u8 and see what error you get.
         async def wrapper(
             self: "BaseCore",
             video: Any,
-            quality: str,
+            quality: str | int,
             callback: Callable[[int, int], None] | None,
             path: str,
             remux: bool = True,
