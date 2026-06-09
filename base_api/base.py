@@ -1939,8 +1939,8 @@ allow_multipart=%s""", url, path, max_retries, read_timeout, bool(stop_event and
 
             async def download_chunk(start_chunk: int, end_chunk: int, chunk_idx_now: int) -> bool:
                 nonlocal total_downloaded
-                headers_chunk = {"Range": f"bytes={start}-{end_chunk}", "Accept-Encoding": "identity"}
-                chunk_progress[chunk_idx] = 0
+                headers_chunk = {"Range": f"bytes={start_chunk}-{end_chunk}", "Accept-Encoding": "identity"}
+                chunk_progress[chunk_idx_now] = 0
 
                 for attempt_chunk in range(max_retries + 1):
                     if stop_event is not None and stop_event.is_set():
@@ -1972,18 +1972,18 @@ allow_multipart=%s""", url, path, max_retries, read_timeout, bool(stop_event and
                                     elif progress_bar:
                                         progress_bar.text_progress_bar(downloaded=total_downloaded[0], total=file_size)
                             finally:
-                                await asyncio.to_thread(f.close)
+                                await asyncio.to_thread(file.close)
 
                             return True # Chunk success
 
                     except Exception as exc:
-                        if attempt < max_retries:
+                        if attempt_chunk < max_retries:
                             self.logger.warning("Chunk %s failed (attempt %s/%s): %s",
-                                                chunk_idx_now, attempt + 1, max_retries, exc)
+                                                chunk_idx_now, attempt_chunk + 1, max_retries, exc)
                             # Reset progress for this chunk before retry
                             total_downloaded[0] -= chunk_progress[chunk_idx_now]
                             chunk_progress[chunk_idx_now] = 0
-                            await asyncio.sleep(1 * attempt)
+                            await asyncio.sleep(1 * attempt_chunk)
                         else:
                             self.logger.error("Chunk %s permanently failed: %s", chunk_idx_now, exc)
                             return False
