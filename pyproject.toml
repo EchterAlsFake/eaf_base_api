@@ -46,5 +46,7 @@ module-name = "base_api" # Because I named it differently we need to change here
 dev = [
     "mypy",
     "types-m3u8",
-    "pylint"
+    "pylint",
+    "pytest",
+    "pytest-asyncio"
 ]
