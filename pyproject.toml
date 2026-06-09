@@ -7,7 +7,7 @@ name = "eaf_base_api"
 version = "3.2.1"
 description = "A base API for EchterAlsFake's Porn APIs"
 readme = { file = "README.md", content-type = "text/markdown" }
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = "LGPL-3.0-or-later"
 license-files = ["LICENSE*"]
 
@@ -21,7 +21,6 @@ classifiers = [
 
 dependencies = [
   "curl_cffi",
-  "pylint>=3.3.9",
   "tenacity>=9.1.2",
 ]
 
@@ -45,6 +44,7 @@ module-name = "base_api" # Because I named it differently we need to change here
 
 [dependency-groups]
 dev = [
-    "mypy>=1.19.1",
-    "types-m3u8>=6.0.0.20250708",
+    "mypy",
+    "types-m3u8",
+    "pylint"
 ]
