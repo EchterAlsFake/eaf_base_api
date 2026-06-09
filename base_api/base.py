@@ -166,7 +166,7 @@ class Helper:
             alternative_constructor: An optional factory for non-standard results (e.g., when a page doesn't yield videos).
         """
         super().__init__()
-        self.fetch_core = core
+        self.core = core
         self.video_factory = video_constructor
         self.alternative_factory = alternative_constructor
 
@@ -223,7 +223,7 @@ class Helper:
 
     def _get_video(self, video_url: str) -> Any:
         """Helper to create a video object without fetching its HTML first"""
-        return self.video_factory(video_url, core=self.fetch_core)
+        return self.video_factory(video_url, core=self.core)
 
     async def _create_alternative_resource(self, resource_url: str) -> Any:
         """
@@ -232,7 +232,7 @@ class Helper:
         Some modules (like Xhamster) might return different types of objects depending on the URL.
         """
         assert self.alternative_factory is not None
-        resource_instance = self.alternative_factory(resource_url, core=self.fetch_core)
+        resource_instance = self.alternative_factory(resource_url, core=self.core)
 
         # If the constructor is asynchronous, we must await it.
         if asyncio.iscoroutine(resource_instance):
@@ -250,10 +250,10 @@ class Helper:
         start_timestamp = time.perf_counter()
         try:
             # Fetch the raw HTML content of the video page
-            html_content = await self.fetch_core.fetch(video_url)
+            html_content = await self.core.fetch(video_url)
 
             # Instantiate the video object using the provided factory
-            video_instance = self.video_factory(video_url, core=self.fetch_core, html_content=html_content)
+            video_instance = self.video_factory(video_url, core=self.core, html_content=html_content)
 
             # Handle both synchronous and asynchronous constructors
             if asyncio.iscoroutine(video_instance):
@@ -405,7 +405,7 @@ class Helper:
             try:
                 p_idx, p_url = next(page_source_iterator)
                 # Note: self.fetch_core.fetch is used here directly
-                task = asyncio.create_task(self.fetch_core.fetch(p_url, method=page_request_method))
+                task = asyncio.create_task(self.core.fetch(p_url, method=page_request_method))
                 pending_page_tasks[task] = (p_idx, p_url)
                 logger.debug(
                     "[%s] initial PAGE scheduled pidx=%d url=%s",
@@ -461,7 +461,7 @@ class Helper:
                         if not should_stop_paging:
                             try:
                                 next_p_idx, next_p_url = next(page_source_iterator)
-                                next_task = asyncio.create_task(self.fetch_core.fetch(next_p_url, method=page_request_method))
+                                next_task = asyncio.create_task(self.core.fetch(next_p_url, method=page_request_method))
                                 pending_page_tasks[next_task] = (next_p_idx, next_p_url)
                             except StopIteration:
                                 pass
@@ -538,7 +538,7 @@ class Helper:
                     if not should_stop_paging:
                         try:
                             n_idx, n_url = next(page_source_iterator)
-                            n_task = asyncio.create_task(self.fetch_core.fetch(n_url, method=page_request_method))
+                            n_task = asyncio.create_task(self.core.fetch(n_url, method=page_request_method))
                             pending_page_tasks[n_task] = (n_idx, n_url)
                             logger.debug("[%s] scheduled NEXT PAGE pidx=%d", execution_id, n_idx)
                         except StopIteration:
@@ -902,7 +902,7 @@ class BaseCore:
                             return content
 
                         elif status == 204:
-                            return response
+                            return response # No content left
 
                         if status == 403:
                             if not state["ua_switched"]:
@@ -928,7 +928,10 @@ class BaseCore:
                             wait = parse_retry_after(logger=self.logger, response=response)
                             if wait is not None:
                                 await asyncio.sleep(wait)
-                            raise NetworkingError("429 Rate Limited")
+                                continue
+
+                            if attempt.retry_state.attempt_number <= 2:
+                                raise NetworkingError("429 Rate Limited")
 
                         if 500 <= status < 600:
                             self.logger.warning("Server error %s on %s. Retrying...", status, url)
