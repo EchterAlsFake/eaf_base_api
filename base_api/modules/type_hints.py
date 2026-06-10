@@ -18,6 +18,9 @@ class DownloadState:
     missing: list[int]
     segments: list[str]
 
+    def __getitem__(self, key: str) -> Any:
+        return getattr(self, key)
+
 
 # Download state is used for the literal file that tracks it
 @dataclass
@@ -31,4 +34,8 @@ class DownloadReport:
     segment_state_path: Path | str | None
     start_segment: int
     quality: str | int
+
+    def __getitem__(self, key: str) -> Any:
+        return getattr(self, key)
+
 

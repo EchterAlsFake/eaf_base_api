@@ -259,6 +259,12 @@ class Helper:
             if asyncio.iscoroutine(video_instance):
                 video_instance = await video_instance
 
+            # Automatically call and await the init method if available (async initialization)
+            if hasattr(video_instance, "init") and callable(video_instance.init):
+                init_result = video_instance.init()
+                if asyncio.iscoroutine(init_result):
+                    await init_result
+
             elapsed_ms = (time.perf_counter() - start_timestamp) * 1000
             logger.debug("video_init ok url=%s (%.2f ms)", video_url, elapsed_ms)
             return video_instance
@@ -1437,7 +1443,7 @@ a new Python file, import only m3u8 and see what error you get.
 
                                     try:
                                         _, segment_data, is_success = await self.download_segment(url, timeout, stop_event)
-                                        if is_success and data:
+                                        if is_success and segment_data:
                                             return idx, True, segment_data
                                     except Exception as exception:
                                         self.logger.error(f"Worker exception for segment {idx}: {exception}")
