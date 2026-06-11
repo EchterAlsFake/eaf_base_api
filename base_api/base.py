@@ -1202,6 +1202,10 @@ a new Python file, import only m3u8 and see what error you get.
             self.logger.debug("download: no callback provided, using default text progress bar")
 
         m3u8_url = getattr(video, "m3u8_base_url", None)
+
+        if asyncio.iscoroutine(m3u8_url):
+            m3u8_url = await m3u8_url # For youporn api
+
         self.logger.info(
     """
     Download requested: quality=%s path=%s remux=%s max_workers=%s
