@@ -1002,6 +1002,10 @@ a new Python file, import only m3u8 and see what error you get.
 
         # Resolve master content
         assert m3u8 is not None
+
+        if asyncio.iscoroutine(m3u8_url):
+            m3u8_url = await m3u8_url
+
         if m3u8_url.lstrip().startswith("#EXTM3U"):
             master = m3u8.loads(m3u8_url)
             self.logger.debug("Resolved inline/custom m3u8 master content.")
