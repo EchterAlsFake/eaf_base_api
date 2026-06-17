@@ -255,6 +255,12 @@ class Helper:
             try:
                 # Fetch the raw HTML content of the video page
                 html_content = await self.core.fetch(video_url)
+                
+                if isinstance(html_content, Response):
+                    if html_content.status_code == 404:
+                        raise ResourceGone(f"Video returned 404 Not Found: {video_url}")
+                    else:
+                        raise NetworkingError(f"Unexpected response object with status {html_content.status_code} for {video_url}")
 
                 # Instantiate the video object using the provided factory
                 video_instance = self.video_factory(video_url, core=self.core, html_content=html_content)
