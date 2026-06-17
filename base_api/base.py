@@ -6,6 +6,7 @@ import time
 import string
 import shutil
 import asyncio
+import inspect
 import logging
 import traceback
 import threading
@@ -14,7 +15,7 @@ from itertools import islice
 from collections import deque
 from functools import lru_cache
 from urllib.parse import urljoin
-from typing import Union, Callable, Tuple, Iterable, TYPE_CHECKING, AsyncGenerator, Coroutine, cast, List, Dict, Any
+from typing import Union, Callable, Tuple, Iterable, TYPE_CHECKING, AsyncGenerator, Coroutine, cast, List, Dict, Any, Awaitable
 from curl_cffi import CurlOpt # Used for DNS over HTTPS
 from curl_cffi.requests.errors import RequestsError
 from curl_cffi.requests import AsyncSession, Response
@@ -239,7 +240,7 @@ class Helper:
             resource_instance = await resource_instance
         return resource_instance
 
-    async def _make_video_safe(self, video_url: str) -> Any:
+    async def _make_video_safe(self, video_url: str, on_video_error: Callable[[str, Exception, int], Awaitable[bool]] | None = None) -> Any:
         """
         Fetches the HTML for a video URL and creates a Video object safely.
 
@@ -247,33 +248,62 @@ class Helper:
         log errors, returning a VideoFetchError instead of crashing the iterator.
         """
         logger = self.logger
-        start_timestamp = time.perf_counter()
-        try:
-            # Fetch the raw HTML content of the video page
-            html_content = await self.core.fetch(video_url)
+        attempt = 0
+        while True:
+            attempt += 1
+            start_timestamp = time.perf_counter()
+            try:
+                # Fetch the raw HTML content of the video page
+                html_content = await self.core.fetch(video_url)
 
-            # Instantiate the video object using the provided factory
-            video_instance = self.video_factory(video_url, core=self.core, html_content=html_content)
+                # Instantiate the video object using the provided factory
+                video_instance = self.video_factory(video_url, core=self.core, html_content=html_content)
 
-            # Handle both synchronous and asynchronous constructors
-            if asyncio.iscoroutine(video_instance):
-                video_instance = await video_instance
+                # Handle both synchronous and asynchronous constructors
+                if asyncio.iscoroutine(video_instance):
+                    video_instance = await video_instance
 
-            # Automatically call and await the init method if available (async initialization)
-            if hasattr(video_instance, "init") and callable(video_instance.init):
-                init_result = video_instance.init()
-                if asyncio.iscoroutine(init_result):
-                    await init_result
+                # Automatically call and await the init method if available (async initialization)
+                if hasattr(video_instance, "init") and callable(video_instance.init):
+                    init_result = video_instance.init()
+                    if asyncio.iscoroutine(init_result):
+                        await init_result
 
-            elapsed_ms = (time.perf_counter() - start_timestamp) * 1000
-            logger.debug("video_init ok url=%s (%.2f ms)", video_url, elapsed_ms)
-            return video_instance
+                elapsed_ms = (time.perf_counter() - start_timestamp) * 1000
+                logger.debug("video_init ok url=%s (%.2f ms) attempt=%d", video_url, elapsed_ms, attempt)
+                return video_instance
 
-        except Exception as error:
-            elapsed_ms = (time.perf_counter() - start_timestamp) * 1000
-            logger.exception("video_init FAILED url=%s (%.2f ms): %s", video_url, elapsed_ms, error)
-            # Return a specialized error object so the caller can decide how to handle it
-            return VideoFetchError(video_url, error)
+            except Exception as error:
+                elapsed_ms = (time.perf_counter() - start_timestamp) * 1000
+                logger.exception("video_init FAILED url=%s (%.2f ms) attempt=%d: %s", video_url, elapsed_ms, attempt, error)
+                
+                if on_video_error:
+                    try:
+                        should_retry = await on_video_error(video_url, error, attempt)
+                        if should_retry:
+                            continue
+                    except Exception as e:
+                        logger.exception("on_video_error callback failed for url=%s: %s", video_url, e)
+                
+                # Return a specialized error object so the caller can decide how to handle it
+                return VideoFetchError(video_url, error)
+
+    async def _fetch_page_safe(self, url: str, method: str, on_page_error: Callable[[str, Exception, int], Awaitable[bool]] | None = None) -> Any:
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                return await self.core.fetch(url, method=method)
+            except Exception as error:
+                self.logger.exception("PAGE FAILED url=%s attempt=%d: %s", url, attempt, error)
+                if on_page_error:
+                    try:
+                        should_retry = await on_page_error(url, error, attempt)
+                        if should_retry:
+                            continue
+                    except Exception as e:
+                        self.logger.exception("on_page_error callback failed for url=%s: %s", url, e)
+                raise
 
     async def iterator(
             self,
@@ -284,6 +314,9 @@ class Helper:
             use_alternative_constructor: bool = False,
             page_request_method: str = "GET",
             video_request_method: str = "GET",
+            ignore_errors: bool = True,
+            on_video_error: Callable[[str, Exception, int], Awaitable[bool]] | None = None,
+            on_page_error: Callable[[str, Exception, int], Awaitable[bool]] | None = None,
     ) -> AsyncGenerator[Any, None]:
         """
         The main scraping engine that orchestrates concurrent page and video processing.
@@ -368,7 +401,8 @@ class Helper:
                     "[%s] yield_ordered_results yielding pidx=%d vidx=%d (buffer size: %d)",
                     execution_id, current_key[0], current_key[1], len(result_buffer)
                 )
-                ready_items.append(item)
+                if not (ignore_errors and isinstance(item, (VideoFetchError, PageFetchError))):
+                    ready_items.append(item)
                 count_flushed += 1
                 yield_video_cursor += 1
 
@@ -394,7 +428,7 @@ class Helper:
                 if use_alternative_constructor:
                     task = asyncio.create_task(self._create_alternative_resource(video_url))
                 else:
-                    task = asyncio.create_task(self._make_video_safe(video_url))
+                    task = asyncio.create_task(self._make_video_safe(video_url, on_video_error=on_video_error))
 
                 pending_video_tasks[task] = (page_idx, video_idx)
                 scheduled_count += 1
@@ -410,8 +444,7 @@ class Helper:
         for _ in range(max_page_concurrency):
             try:
                 p_idx, p_url = next(page_source_iterator)
-                # Note: self.fetch_core.fetch is used here directly
-                task = asyncio.create_task(self.core.fetch(p_url, method=page_request_method))
+                task = asyncio.create_task(self._fetch_page_safe(p_url, method=page_request_method, on_page_error=on_page_error))
                 pending_page_tasks[task] = (p_idx, p_url)
                 logger.debug(
                     "[%s] initial PAGE scheduled pidx=%d url=%s",
@@ -467,7 +500,7 @@ class Helper:
                         if not should_stop_paging:
                             try:
                                 next_p_idx, next_p_url = next(page_source_iterator)
-                                next_task = asyncio.create_task(self.core.fetch(next_p_url, method=page_request_method))
+                                next_task = asyncio.create_task(self._fetch_page_safe(next_p_url, method=page_request_method, on_page_error=on_page_error))
                                 pending_page_tasks[next_task] = (next_p_idx, next_p_url)
                             except StopIteration:
                                 pass
@@ -544,7 +577,7 @@ class Helper:
                     if not should_stop_paging:
                         try:
                             n_idx, n_url = next(page_source_iterator)
-                            n_task = asyncio.create_task(self.core.fetch(n_url, method=page_request_method))
+                            n_task = asyncio.create_task(self._fetch_page_safe(n_url, method=page_request_method, on_page_error=on_page_error))
                             pending_page_tasks[n_task] = (n_idx, n_url)
                             logger.debug("[%s] scheduled NEXT PAGE pidx=%d", execution_id, n_idx)
                         except StopIteration:
@@ -708,7 +741,7 @@ class BaseCore:
         delay = self.configuration.request_delay
         if delay and delay > 0:
             time_since_last_request = time.time() - self.last_request_time
-            self.logger.debug("Time since last request: {:.2f seconds}.".format(time_since_last_request))
+            self.logger.debug("Time since last request: {:.2f} seconds.".format(time_since_last_request))
             if time_since_last_request < delay:
                 sleep_time = delay - time_since_last_request
                 self.logger.debug("Enforcing delay of {:.2f} seconds.".format(sleep_time))
@@ -735,7 +768,7 @@ class BaseCore:
             self.initialize_session()
         session = self.session
         assert session is not None
-        cookies: Dict[str, Any] = cast(Dict[str, Any], cast(Any, dict(session.cookies)))
+        cookies: Dict[str, Any] = cast(Dict[str, Any], cast(Any, session.cookies.get_dict()))
         if override:
             cookies.update(override)
         return cookies
@@ -1003,7 +1036,9 @@ a new Python file, import only m3u8 and see what error you get.
         # Resolve master content
         assert m3u8 is not None
 
-        if asyncio.iscoroutine(m3u8_url):
+        if inspect.iscoroutinefunction(m3u8_url) or (callable(m3u8_url) and not isinstance(m3u8_url, str)):
+            m3u8_url = await m3u8_url()
+        elif inspect.iscoroutine(m3u8_url):
             m3u8_url = await m3u8_url
 
         if m3u8_url.lstrip().startswith("#EXTM3U"):
@@ -1207,8 +1242,10 @@ a new Python file, import only m3u8 and see what error you get.
 
         m3u8_url = getattr(video, "m3u8_base_url", None)
 
-        if asyncio.iscoroutine(m3u8_url):
-            m3u8_url = await m3u8_url # For youporn api
+        if inspect.iscoroutinefunction(m3u8_url) or (callable(m3u8_url) and not isinstance(m3u8_url, str)):
+            m3u8_url = await m3u8_url()
+        elif inspect.iscoroutine(m3u8_url):
+            m3u8_url = await m3u8_url
 
         self.logger.info(
     """
@@ -1239,7 +1276,8 @@ a new Python file, import only m3u8 and see what error you get.
             return_report=return_report,
             cleanup_on_stop=cleanup_on_stop,
             keep_segment_dir=keep_segment_dir,
-            ios_support=ios_support
+            ios_support=ios_support,
+            pre_resolved_m3u8_url=m3u8_url
         )
 
     def threaded(self, max_workers: int,
@@ -1262,7 +1300,8 @@ a new Python file, import only m3u8 and see what error you get.
             return_report: bool = False,
             cleanup_on_stop: bool = True,
             keep_segment_dir: bool = False,
-            ios_support: bool = False
+            ios_support: bool = False,
+            pre_resolved_m3u8_url: str | None = None
         ) -> DownloadReport | bool:
             """
             Threaded HLS segment downloader with optional resume state and stop flag.
@@ -1338,8 +1377,15 @@ a new Python file, import only m3u8 and see what error you get.
                     )
 
                 else:
-                    m3u8_master = getattr(video, "m3u8_base_url")
-                    assert m3u8_master is not None, "m3u8_base_url is missing from video object"
+                    if pre_resolved_m3u8_url is not None:
+                        m3u8_master = pre_resolved_m3u8_url
+                    else:
+                        m3u8_master = getattr(video, "m3u8_base_url")
+                        assert m3u8_master is not None, "m3u8_base_url is missing from video object"
+                        if inspect.iscoroutinefunction(m3u8_master) or (callable(m3u8_master) and not isinstance(m3u8_master, str)):
+                            m3u8_master = await m3u8_master()
+                        elif inspect.iscoroutine(m3u8_master):
+                            m3u8_master = await m3u8_master
                     self.logger.info(f"Fetching segments for quality={quality} m3u8_url_master={m3u8_master}")
                     segments = await self.get_segments(quality=quality, m3u8_url_master=m3u8_master)
                     total_before = len(segments)
@@ -1923,7 +1969,7 @@ allow_multipart=%s""", url, path, max_retries, read_timeout, bool(stop_event and
                     file_size = int(head_resp.headers.get("Content-Length", 0))
                     accept_ranges = head_resp.headers.get("Accept-Ranges", "")
             except Exception as e:
-                self.logger.warning("Failed to fetch HEAD info for concurrent check: %S.", e)
+                self.logger.warning("Failed to fetch HEAD info for concurrent check: %s.", e)
 
         # 2. Execute Fast Multipart Download if supported and allowed
         if allow_multipart and file_size > 0 and accept_ranges == "bytes":
