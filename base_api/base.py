@@ -281,7 +281,7 @@ class Helper:
 
             except Exception as error:
                 elapsed_ms = (time.perf_counter() - start_timestamp) * 1000
-                logger.exception("video_init FAILED url=%s (%.2f ms) attempt=%d: %s", video_url, elapsed_ms, attempt, error)
+                logger.warning("video_init FAILED url=%s (%.2f ms) attempt=%d: %s", video_url, elapsed_ms, attempt, error)
                 
                 if on_video_error:
                     try:
@@ -301,7 +301,7 @@ class Helper:
             try:
                 return await self.core.fetch(url, method=method)
             except Exception as error:
-                self.logger.exception("PAGE FAILED url=%s attempt=%d: %s", url, attempt, error)
+                self.logger.warning("PAGE FAILED url=%s attempt=%d: %s", url, attempt, error)
                 if on_page_error:
                     try:
                         should_retry = await on_page_error(url, error, attempt)
