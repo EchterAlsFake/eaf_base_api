@@ -4,10 +4,10 @@ build-backend = "uv_build"
 
 [project]
 name = "eaf_base_api"
-version = "3.3"
+version = "3.3.1"
 description = "A base API for EchterAlsFake's Porn APIs"
 readme = { file = "README.md", content-type = "text/markdown" }
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 license = "LGPL-3.0-or-later"
 license-files = ["LICENSE*"]
 
@@ -28,7 +28,7 @@ dependencies = [
 hls = [
   "m3u8",
   # av needs Python >= 3.10, so guard it (otherwise `pip install ...[hls]` fails on 3.8/3.9)
-  "av; python_version >= '3.10'",
+  "av; python_version >= '3.12'",
 ]
 
 [project.urls]

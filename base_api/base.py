@@ -1043,8 +1043,8 @@ a new Python file, import only m3u8 and see what error you get.
         assert m3u8 is not None
 
         if inspect.iscoroutinefunction(m3u8_url) or (callable(m3u8_url) and not isinstance(m3u8_url, str)):
-            m3u8_url = await m3u8_url()
-        elif inspect.iscoroutine(m3u8_url):
+            m3u8_url = m3u8_url()
+        if inspect.iscoroutine(m3u8_url) or inspect.isawaitable(m3u8_url):
             m3u8_url = await m3u8_url
 
         if m3u8_url.lstrip().startswith("#EXTM3U"):
@@ -1079,6 +1079,12 @@ a new Python file, import only m3u8 and see what error you get.
         Inspect the master playlist and return sorted unique heights (e.g., [240, 360, 480, 720, 1080]).
         """
         assert m3u8 is not None
+
+        if inspect.iscoroutinefunction(m3u8_url) or (callable(m3u8_url) and not isinstance(m3u8_url, str)):
+            m3u8_url = m3u8_url()
+        if inspect.iscoroutine(m3u8_url) or inspect.isawaitable(m3u8_url):
+            m3u8_url = await m3u8_url
+
         if not m3u8_url.startswith("https://"):
             master = m3u8.loads(m3u8_url)
         else:
@@ -1249,8 +1255,8 @@ a new Python file, import only m3u8 and see what error you get.
         m3u8_url = getattr(video, "m3u8_base_url", None)
 
         if inspect.iscoroutinefunction(m3u8_url) or (callable(m3u8_url) and not isinstance(m3u8_url, str)):
-            m3u8_url = await m3u8_url()
-        elif inspect.iscoroutine(m3u8_url):
+            m3u8_url = m3u8_url()
+        if inspect.iscoroutine(m3u8_url) or inspect.isawaitable(m3u8_url):
             m3u8_url = await m3u8_url
 
         self.logger.info(
@@ -1389,8 +1395,8 @@ a new Python file, import only m3u8 and see what error you get.
                         m3u8_master = getattr(video, "m3u8_base_url")
                         assert m3u8_master is not None, "m3u8_base_url is missing from video object"
                         if inspect.iscoroutinefunction(m3u8_master) or (callable(m3u8_master) and not isinstance(m3u8_master, str)):
-                            m3u8_master = await m3u8_master()
-                        elif inspect.iscoroutine(m3u8_master):
+                            m3u8_master = m3u8_master()
+                        if inspect.iscoroutine(m3u8_master) or inspect.isawaitable(m3u8_master):
                             m3u8_master = await m3u8_master
                     self.logger.info(f"Fetching segments for quality={quality} m3u8_url_master={m3u8_master}")
                     segments = await self.get_segments(quality=quality, m3u8_url_master=m3u8_master)
