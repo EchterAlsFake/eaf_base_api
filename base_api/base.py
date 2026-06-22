@@ -978,6 +978,9 @@ class BaseCore:
                             if attempt.retry_state.attempt_number <= 2:
                                 raise NetworkingError("429 Rate Limited")
 
+                        if status == 401:
+                            return response # Expected (for Vinted OSINT script I use)
+
                         if 500 <= status < 600:
                             self.logger.warning("Server error %s on %s. Retrying...", status, url)
                             raise NetworkingError(f"Server error {status}")
