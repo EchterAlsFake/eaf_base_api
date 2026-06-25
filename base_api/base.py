@@ -1,7 +1,6 @@
 from __future__ import annotations
 import re
 import os
-import uuid
 import time
 import string
 import shutil
@@ -10,12 +9,9 @@ import inspect
 import logging
 import traceback
 import threading
-from queue import Queue
-from itertools import islice
-from collections import deque
 from functools import lru_cache
 from urllib.parse import urljoin
-from typing import Union, Callable, Tuple, Iterable, TYPE_CHECKING, AsyncGenerator, Coroutine, cast, List, Dict, Any, Awaitable
+from typing import Union, Callable, Tuple, TYPE_CHECKING, AsyncGenerator, Coroutine, cast, List, Dict, Any, Awaitable
 from curl_cffi import CurlOpt # Used for DNS over HTTPS
 from curl_cffi.requests.errors import RequestsError
 from curl_cffi.requests import AsyncSession, Response
@@ -24,13 +20,13 @@ from tenacity import AsyncRetrying, stop_after_attempt, wait_exponential_jitter,
 if TYPE_CHECKING:
     import m3u8
     from .modules.errors import (SecurityAbort, ResourceGone, ProxySSLError, UnknownError, InvalidProxy,
-                                 DownloadCancelled, NetworkingError, VideoFetchError, PageFetchError)
+                                 DownloadCancelled, NetworkingError)
     from .modules.type_hints import DownloadReport
     from .modules.static_functions import (load_segment_state, parse_retry_after, log_precondition_failed,
                                            write_segment_state, build_segment_state, get_segment_index_width,
                                            segment_file_path, is_video_playlist, height_from_variant, pick_by_height,
-                                           normalize_quality_value, parse_challenge, strip_title,
-                                           other_challenge, least_factors, collect_variants, pick_by_label)
+                                           normalize_quality_value, parse_challenge, other_challenge, least_factors,
+                                           collect_variants, pick_by_label)
     from .modules.config import config, RuntimeConfig
     from .modules.progress_bars import Callback
     from .modules.logger import setup_logger
@@ -156,7 +152,7 @@ class Helper:
         Initializes the Scraping Helper.
 
         Args:
-            fetch_core: The engine responsible for network requests (must have a .fetch(url) method).
+            core: The engine responsible for network requests (must have a .fetch(url) method).
             video_constructor: A factory function/class to create Video objects from a URL and HTML.
             logger: An optional pre-configured logger instance.
             log_name: Name for the logger if one needs to be created.
@@ -183,133 +179,6 @@ class Helper:
                 http_port=http_port,
             )
 
-    @staticmethod
-    def chunked(data_source: Iterable[Any], chunk_size: int) -> Iterable[List[Any]]:
-        """
-        Splits an iterable into fixed-size lists (chunks).
-
-        This is useful for processing large datasets in batches to avoid overwhelming
-        memory or network resources.
-
-        Args:
-            data_source: The original stream of data to be split.
-            chunk_size: Maximum number of items in each yielded chunk.
-
-        Yields:
-            List[Any]: A chunk containing up to `chunk_size` items.
-        """
-
-        if chunk_size <= 0:
-            raise ValueError("chunk size must be > 0")
-
-        iterator = iter(data_source)
-        chunk_index = 0
-        logger = logging.getLogger("helper.iterator")
-        is_debug_enabled = logger.isEnabledFor(logging.DEBUG)
-
-        while True:
-            # islice efficiently pulls the next N items from the iterator
-            current_chunk = list(islice(iterator, chunk_size))
-            if not current_chunk:
-                return
-
-            if is_debug_enabled:
-                logger.debug(
-                    "chunked: yielding block #%d with %d items",
-                    chunk_index, len(current_chunk)
-                )
-
-            chunk_index += 1
-            yield current_chunk
-
-    def _get_video(self, video_url: str) -> Any:
-        """Helper to create a video object without fetching its HTML first"""
-        return self.video_factory(video_url, core=self.core)
-
-    async def _create_alternative_resource(self, resource_url: str) -> Any:
-        """
-        Creates an alternative object for special cases where a standard Video object isn't expected.
-
-        Some modules (like Xhamster) might return different types of objects depending on the URL.
-        """
-        assert self.alternative_factory is not None
-        resource_instance = self.alternative_factory(resource_url, core=self.core)
-
-        # If the constructor is asynchronous, we must await it.
-        if asyncio.iscoroutine(resource_instance):
-            resource_instance = await resource_instance
-        return resource_instance
-
-    async def _make_video_safe(self, video_url: str, on_video_error: Callable[[str, Exception, int], Awaitable[bool]] | None = None) -> Any:
-        """
-        Fetches the HTML for a video URL and creates a Video object safely.
-
-        This method wraps the initialization in a try-except block to catch and
-        log errors, returning a VideoFetchError instead of crashing the iterator.
-        """
-        logger = self.logger
-        attempt = 0
-        while True:
-            attempt += 1
-            start_timestamp = time.perf_counter()
-            try:
-                # Fetch the raw HTML content of the video page
-                html_content = await self.core.fetch(video_url)
-                
-                if isinstance(html_content, Response):
-                    if html_content.status_code == 404:
-                        raise ResourceGone(f"Video returned 404 Not Found: {video_url}")
-                    else:
-                        raise NetworkingError(f"Unexpected response object with status {html_content.status_code} for {video_url}")
-
-                # Instantiate the video object using the provided factory
-                video_instance = self.video_factory(video_url, core=self.core, html_content=html_content)
-
-                # Handle both synchronous and asynchronous constructors
-                if asyncio.iscoroutine(video_instance):
-                    video_instance = await video_instance
-
-                # Automatically call and await the init method if available (async initialization)
-                if hasattr(video_instance, "init") and callable(video_instance.init):
-                    init_result = video_instance.init()
-                    if asyncio.iscoroutine(init_result):
-                        await init_result
-
-                elapsed_ms = (time.perf_counter() - start_timestamp) * 1000
-                logger.debug("video_init ok url=%s (%.2f ms) attempt=%d", video_url, elapsed_ms, attempt)
-                return video_instance
-
-            except Exception as error:
-                elapsed_ms = (time.perf_counter() - start_timestamp) * 1000
-                logger.warning("video_init FAILED url=%s (%.2f ms) attempt=%d: %s", video_url, elapsed_ms, attempt, error)
-                
-                if on_video_error:
-                    try:
-                        should_retry = await on_video_error(video_url, error, attempt)
-                        if should_retry:
-                            continue
-                    except Exception as e:
-                        logger.exception("on_video_error callback failed for url=%s: %s", video_url, e)
-                
-                # Return a specialized error object so the caller can decide how to handle it
-                return VideoFetchError(video_url, error)
-
-    async def _fetch_page_safe(self, url: str, method: str, on_page_error: Callable[[str, Exception, int], Awaitable[bool]] | None = None) -> Any:
-        attempt = 0
-        while True:
-            attempt += 1
-            try:
-                return await self.core.fetch(url, method=method)
-            except Exception as error:
-                self.logger.warning("PAGE FAILED url=%s attempt=%d: %s", url, attempt, error)
-                if on_page_error:
-                    try:
-                        should_retry = await on_page_error(url, error, attempt)
-                        if should_retry:
-                            continue
-                    except Exception as e:
-                        self.logger.exception("on_page_error callback failed for url=%s: %s", url, e)
-                raise
 
     async def iterator(
             self,
@@ -329,345 +198,129 @@ class Helper:
         """
         logger = self.logger
         # A unique ID to track logs for this specific iterator run in multi-threaded/concurrent logs
-        execution_id = uuid.uuid4().hex[:8]
-        start_time = time.perf_counter()
 
-        if target_page_urls is None:
-            raise ValueError("target_page_urls must be provided")
-        if video_link_extractor is None:
-            raise ValueError("video_link_extractor must be provided")
-        if max_video_concurrency < 1:
-            raise ValueError("max_video_concurrency must be >= 1 to avoid deadlocks")
 
-        # Ensure boolean type for consistency
-        use_alternative_constructor = bool(use_alternative_constructor)
+        semaphore_pages = asyncio.Semaphore(max_page_concurrency) # This defines how many pages we scrape at once
+        semaphore_videos = asyncio.Semaphore(max_video_concurrency) # This defines how many videos we scrape at once
 
-        logger.info("[%s] iterator start pages=%d page_conc=%d video_conc=%d",
-            execution_id, len(target_page_urls), max_page_concurrency, max_video_concurrency
-        )
+        target_page_urls = target_page_urls # These are the initial pages we need to scrape to extract the video objects
+        video_link_extractor = video_link_extractor # This is the function that uses re / bs4 to extract the video links returning them as a list
 
-        # Buffer to store results that arrived out of order.
-        # Key: (page_index, video_index) -> Value: Video instance or Error
-        result_buffer: Dict[Tuple[int, int], Any] = {}
+        page_request_method = page_request_method # In very few exceptions we need to do POST requests instead of GET
+        video_request_method = video_request_method # Same as above
 
-        # Tracks how many videos were found on each page to know when a page is \"fully yielded\".
-        page_video_counts: Dict[int, int] = {}
+        use_alternative_constructor = use_alternative_constructor # If true a different class will be used to construct objects
+        # This class is supposed to take the HTML content (or Response in general) and do something with it.
+        # This is per library different
 
-        # Cursors used to maintain deterministic output order
-        yield_page_cursor = 0
-        yield_video_cursor = 0
+        video_queue = asyncio.Queue() # The page worker will give his video URLs into this queue (consumer / producer pattern)
+        results_queue = asyncio.Queue() #
 
-        # Flow control: stop paging if we encounter a 404 or specific termination signal
-        should_stop_paging = False
-        termination_page_index: int | None = None
+        assert isinstance(target_page_urls, list)
 
-        def yield_ordered_results() -> List[Any]:
+
+        async def fetch_page(url: str) -> str:
             """
-            Checks the result buffer and yields all items that are now ready in sequential order.
+            Fetches the HTML content of a page (URL) using a strict number of maximum concurrent tasks as defined
+            by the semaphore and 'max_page_concurrency' variable.
 
-            This is called whenever a task completes to see if we can \"unblock\" the output stream.
+            Returns the HTML Content
             """
-            nonlocal yield_page_cursor, yield_video_cursor
-            ready_items: List[Any] = []
-            count_flushed = 0
+            async with semaphore_pages:
+                logger.debug(f"Fetching Page: {url}")
+                html = await self.core.fetch(url, method=page_request_method)
+                return html
 
+        async def fetch_video(url: str) -> tuple[str, str]:
+            """
+            Fetches the HTML content of a Video....
+            """
+
+            async with semaphore_videos:
+                logger.debug(f"Fetching Video: {url}")
+                html = await self.core.fetch(url, method=video_request_method)
+                return url, html
+
+        async def page_worker(page_url: str):
+            html_content = await fetch_page(page_url)
+            extracted_videos = await asyncio.to_thread(video_link_extractor, html_content)
+            # When we pass the HTML content to the extractor so that bs4 can extract it, it will take a minimum time
+            # of like 20ms. This would block our event loop and prevent new network requests, so this optimizes the
+            # speed by offloading it to another thread
+
+            for video_url in extracted_videos:
+                await video_queue.put((video_url, 1))
+
+        async def video_worker():
             while True:
-                # 1. Check if we even know how many videos are on the current page yet
-                if yield_page_cursor not in page_video_counts:
-                    if count_flushed:
-                        logger.debug(
-                            "[%s] yield_ordered_results paused: page %d video count unknown; flushed %d",
-                            execution_id, yield_page_cursor, count_flushed
-                        )
-                    return ready_items
+                try:
+                    video_url, attempt_count = await video_queue.get() # Pulls the Video URL from the queue
 
-                # 2. Check if we've already yielded all videos for the current page
-                if yield_video_cursor >= page_video_counts[yield_page_cursor]:
-                    logger.debug(
-                        "[%s] page complete pidx=%d total_videos=%d -> moving to next page",
-                        execution_id, yield_page_cursor, page_video_counts[yield_page_cursor]
-                    )
-                    yield_page_cursor += 1
-                    yield_video_cursor = 0
-                    continue
+                except asyncio.CancelledError:
+                    return # Exit the loop if we already cancelled remaining parts
 
-                # 3. Check if the specific next item (by index) is available in our buffer
-                current_key = (yield_page_cursor, yield_video_cursor)
-                if current_key not in result_buffer:
-                    if count_flushed:
-                        logger.debug(
-                            "[%s] yield_ordered_results stopping: awaiting key=%s; flushed=%d",
-                            execution_id, current_key, count_flushed
-                        )
-                    return ready_items
+                result = ScrapeResult(video_url)
 
-                # Item is found! Remove from buffer and prepare for yielding
-                item = result_buffer.pop(current_key)
-                logger.debug(
-                    "[%s] yield_ordered_results yielding pidx=%d vidx=%d (buffer size: %d)",
-                    execution_id, current_key[0], current_key[1], len(result_buffer)
-                )
-                if not (ignore_errors and isinstance(item, (VideoFetchError, PageFetchError))):
-                    ready_items.append(item)
-                count_flushed += 1
-                yield_video_cursor += 1
+                try:
+                    async with semaphore_videos:
+                        self.logger.debug(f"Fetching Video HTML: {video_url}")
+                        url, html = await fetch_video(video_url)
+                        video_instance = self.video_factory(url, core=self.core, html_content=html) # Creates the video scrape object
+                        await video_instance.init()
 
-            return []
 
-        # Create an iterator for the input URLs to pull from them as slots become available
-        page_source_iterator = iter(enumerate(target_page_urls))
+                    result.video = video_instance
+                    result.is_success = True
+                    await results_queue.put(video_instance)
+                    # In this case the video was successfully fetched
 
-        # Tracking active asyncio tasks
-        pending_page_tasks: Dict[asyncio.Task, Tuple[int, str]] = {}
-        pending_video_tasks: Dict[asyncio.Task, Tuple[int, int]] = {}
+                except Exception as e:
+                    logger.error(f"Failed to scrape Video URL: {e}")
+                    if on_video_error is not None or ignore_errors:
+                        try:
+                            should_retry = await on_video_error(video_url, e, attempt_count)
 
-        # Queue of video URLs discovered from pages but not yet being fetched
-        video_queue: deque[Tuple[int, int, str]] = deque()
+                            if should_retry:
+                                self.logger.info(f"Re-Queuing {video_url}!")
+                                await video_queue.put((video_url, attempt_count + 1))
+                                video_queue.task_done()
+                                continue
+                        except Exception as callback_error:
+                            self.logger.error(f"Error inside the provided callback: {callback_error}")
 
-        def process_video_queue() -> int:
-            """"Schedules as many video fetch tasks as allowed by concurrency limits."""
-            scheduled_count = 0
-            while video_queue and len(pending_video_tasks) < max_video_concurrency:
-                page_idx, video_idx, video_url = video_queue.popleft()
+                        result.error = e
+                        await results_queue.put(result)
 
-                # Determine which constructor to use
-                if use_alternative_constructor:
-                    task = asyncio.create_task(self._create_alternative_resource(video_url))
-                else:
-                    task = asyncio.create_task(self._make_video_safe(video_url, on_video_error=on_video_error))
+                finally:
+                    video_queue.task_done()
 
-                pending_video_tasks[task] = (page_idx, video_idx)
-                scheduled_count += 1
-                logger.debug(
-                    "[%s] scheduled VIDEO pidx=%d vidx=%d url=%s"
-                    "(active_videos=%d queue_size=%d)",
-                    execution_id, page_idx, video_idx, video_url,
-                    len(pending_video_tasks), len(video_queue)
-                )
-            return scheduled_count
+        async def supervisor(page_tasks, video_workers):
+            await asyncio.gather(*page_tasks)
+            await video_queue.join()
 
-        # INITIALIZATION: Fill the page concurrency slots to start the process
-        for _ in range(max_page_concurrency):
-            try:
-                p_idx, p_url = next(page_source_iterator)
-                task = asyncio.create_task(self._fetch_page_safe(p_url, method=page_request_method, on_page_error=on_page_error))
-                pending_page_tasks[task] = (p_idx, p_url)
-                logger.debug(
-                    "[%s] initial PAGE scheduled pidx=%d url=%s",
-                    execution_id, p_idx, p_url
-                )
-            except StopIteration:
+            for worker in video_workers:
+                worker.cancel()
+
+            await results_queue.put(None)
+
+        page_tasks = [asyncio.create_task(page_worker(url)) for url in target_page_urls]
+        video_workers = [asyncio.create_task(video_worker()) for _ in range(max_video_concurrency)]
+        asyncio.create_task(supervisor(page_tasks, video_workers))
+
+        while True:
+            result_item = await results_queue.get()
+            if result_item is None:
                 break
 
-        # MAIN EVENT LOOP: Continue as long as there is work to do
-        while pending_page_tasks or pending_video_tasks or video_queue:
-
-            # Ensure we are utilizing our video fetch slots
-            if video_queue and len(pending_video_tasks) < max_video_concurrency:
-                process_video_queue()
-
-            # Prepare the list of tasks to watch for
-            tasks_to_watch = [*pending_page_tasks, *pending_video_tasks]
-
-            if not tasks_to_watch:
-                # If nothing is in flight but things are in queue, schedule them.
-                # This handles edge cases where the loop might otherwise stall.
-                process_video_queue()
-                if not (pending_page_tasks or pending_video_tasks):
-                    break
-                tasks_to_watch = [*pending_page_tasks, *pending_video_tasks]
-
-            # Wait for at least one task (page or video) to complete
-            done_tasks, _ = await asyncio.wait(tasks_to_watch, return_when=asyncio.FIRST_COMPLETED)
-
-            for task in done_tasks:
-
-                # CASE A: A PAGE FETCH TASK COMPLETED
-                if task in pending_page_tasks:
-                    p_idx, p_url = pending_page_tasks.pop(task)
-                    try:
-                        # Extract the result (HTML content or a Response object)
-                        page_content_or_response = task.result()
-                        logger.info(
-                            "[%s] PAGE fetch finished pidx=%d url=%s (active: pages=%d videos=%d)",
-                            execution_id, p_idx, p_url, len(pending_page_tasks), len(pending_video_tasks)
-                        )
-                    except Exception as err:
-                        # If a page fails, we record a PageFetchError at video index 0 for that page
-                        logger.exception("[%s] PAGE FAILED pidx=%d url=%s: %s", execution_id, p_idx, p_url, err)
-                        page_video_counts[p_idx] = 1
-                        result_buffer[(p_idx, 0)] = PageFetchError(p_url, err)
-
-                        # Try to yield what we can
-                        for item in yield_ordered_results():
-                            yield item
-
-                        # Schedule next page if we haven't hit a termination condition
-                        if not should_stop_paging:
-                            try:
-                                next_p_idx, next_p_url = next(page_source_iterator)
-                                next_task = asyncio.create_task(self._fetch_page_safe(next_p_url, method=page_request_method, on_page_error=on_page_error))
-                                pending_page_tasks[next_task] = (next_p_idx, next_p_url)
-                            except StopIteration:
-                                pass
-                        continue
-
-                    # DETECT 404: If the core returns a Response object with status 404, we stop paging
-                    is_resource_missing = False
-                    try:
-                        # Check for standard 'requests'-like Response object
-                        if isinstance(page_content_or_response, Response) and page_content_or_response.status_code == 404:
-                            is_resource_missing = True
-                    except Exception as type_err:
-                        logger.debug("Duck-typing check for 404 due to: %s", type_err)
-                        # Fallback for different core implementations
-                        if getattr(page_content_or_response, "status_code", None) == 404:
-                            is_resource_missing = True
-
-                    if is_resource_missing:
-                        logger.warning("[%s] PAGE 404 DETECTED pidx=%d url=%s -> terminating paging", execution_id, p_idx, p_url)
-                        should_stop_paging = True
-                        termination_page_index = p_idx
-                        # 404 pages contain zero videos
-                        page_video_counts[p_idx] = 0
-                        for item in yield_ordered_results():
-                            yield item
-                        continue
-
-                    # IGNORE POST-404 PAGES: If we already hit a 404, ignore any later pages that might finish
-                    if should_stop_paging and termination_page_index is not None and p_idx > termination_page_index:
-                        logger.info("[%s] skipping PAGE pidx=%d (after 404 at %d)", execution_id, p_idx, termination_page_index)
-                        page_video_counts[p_idx] = 0
-                        for item in yield_ordered_results():
-                            yield item
-                        continue
-
-                    # EXTRACTION: Get video URLs from the successfully fetched page HTML
-                    html_payload = page_content_or_response
-                    try:
-                        extracted_result = video_link_extractor(html_payload)
-                        # Handle async extractors
-                        if asyncio.iscoroutine(extracted_result):
-                            video_urls = await extracted_result
-                        else:
-                            video_urls = extracted_result
-
-                        video_urls = video_urls or []
-                        logger.debug("[%s] extraction ok pidx=%d found=%d", execution_id, p_idx, len(video_urls))
-                    except Exception as ext_err:
-                        logger.exception("[%s] extraction FAILED pidx=%d url=%s: %s", execution_id, p_idx, p_url, ext_err)
-                        page_video_counts[p_idx] = 1
-                        result_buffer[(p_idx, 0)] = PageFetchError(p_url, ext_err)
-                        video_urls = []
-
-                    # Record the number of items we expect to yield for this page
-                    if video_urls:
-                        page_video_counts[p_idx] = len(video_urls)
-                    elif p_idx not in page_video_counts:
-                        page_video_counts[p_idx] = 0
-
-                    logger.info("[%s] PAGE indexed pidx=%d items=%d", execution_id, p_idx, page_video_counts[p_idx])
-
-                    # Add found video URLs to the queue for processing
-                    for v_idx, v_url in enumerate(video_urls):
-                        video_queue.append((p_idx, v_idx, v_url))
-
-                    # Schedule new video tasks immediately
-                    process_video_queue()
-
-                    # Yield any items that are now ready in order
-                    for item in yield_ordered_results():
-                        yield item
-
-                    # Fetch next page if we haven't stopped paging yet
-                    if not should_stop_paging:
-                        try:
-                            n_idx, n_url = next(page_source_iterator)
-                            n_task = asyncio.create_task(self._fetch_page_safe(n_url, method=page_request_method, on_page_error=on_page_error))
-                            pending_page_tasks[n_task] = (n_idx, n_url)
-                            logger.debug("[%s] scheduled NEXT PAGE pidx=%d", execution_id, n_idx)
-                        except StopIteration:
-                            logger.debug("[%s] pagination exhausted", execution_id)
-
-                # CASE B: A VIDEO FETCH TASK COMPLETED
-                elif task in pending_video_tasks:
-                    p_idx, v_idx = pending_video_tasks.pop(task)
-                    try:
-                        video_result = task.result()
-                        result_buffer[(p_idx, v_idx)] = video_result
-                        logger.debug(
-                            "[%s] VIDEO finished pidx=%d vidx=%d (buffer size: %d)",
-                            execution_id, p_idx, v_idx, len(result_buffer)
-                        )
-                    except Exception as vid_err:
-                        logger.exception("[%s] VIDEO EXCEPTION pidx=%d vidx=%d: %s", execution_id, p_idx, v_idx, vid_err)
-                        result_buffer[(p_idx, v_idx)] = VideoFetchError(f"<unknown:{p_idx}/{v_idx}>", vid_err)
-
-                    # Yield ready results and backfill video slots
-                    for item in yield_ordered_results():
-                        yield item
-                    process_video_queue()
-
-        # FINALIZE: Clean up and log performance
-        logger.debug("[%s] final flush sequence", execution_id)
-        for item in yield_ordered_results():
-            yield item
-
-        execution_duration_ms = (time.perf_counter() - start_time) * 1000
-        logger.info("[%s] iterator complete. Total time: %.2f ms", execution_id, execution_duration_ms)
+            yield result_item
 
 
-def async_generator_to_sync(async_gen_func: Callable[..., Any], *args: Any, **kwargs: Any) -> Iterable[Any]:
-    """
-    Safely bridges an async generator to a synchronous generator using
-    a background thread and a Queue.
-    """
-    sync_queue: Queue[Any] = Queue()
-    sentinel = object()  # Used to signal the generator is finished
-    error_sentinel = object()  # Used to signal an exception occurred
-
-    def _background_runner() -> None:
-        # Create a new event loop for this background thread
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-
-        async def _consume() -> None:
-            try:
-                # Instantiate and iterate over the async generator
-                gen = async_gen_func(*args, **kwargs)
-                async for _item in gen:
-                    sync_queue.put(_item)
-            except Exception as e:
-                # Catch any errors in the scraper and pass them to the sync thread
-                sync_queue.put((error_sentinel, e))
-            finally:
-                # Signal that we are done
-                sync_queue.put(sentinel)
-
-        try:
-            loop.run_until_complete(_consume())
-        finally:
-            loop.close()
-
-    # 1. Start the async execution in a background thread
-    thread = threading.Thread(target=_background_runner, daemon=True)
-    thread.start()
-
-    # 2. Synchronously yield from the queue as items come in
-    while True:
-        item = sync_queue.get()  # This blocks until an item is ready!
-
-        # Check if the async generator finished
-        if item is sentinel:
-            break
-
-        # Check if the async generator threw an exception
-        if isinstance(item, tuple) and len(item) == 2 and item[0] is error_sentinel:
-            raise item[1]
-
-        yield item
-
-    thread.join()
+class ScrapeResult:
+    def __init__(self, url: str):
+        self.url = url
+        self.video: Any = None
+        self.error: Exception | None = None
+        self.is_success: bool = False
 
 
 class BaseCore:
