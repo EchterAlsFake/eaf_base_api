@@ -4,6 +4,7 @@ import os
 import time
 import string
 import shutil
+import random
 import asyncio
 import inspect
 import logging
@@ -197,8 +198,6 @@ class Helper:
         The main scraping engine that orchestrates concurrent page and video processing.
         """
         logger = self.logger
-        # A unique ID to track logs for this specific iterator run in multi-threaded/concurrent logs
-
 
         semaphore_pages = asyncio.Semaphore(max_page_concurrency) # This defines how many pages we scrape at once
         semaphore_videos = asyncio.Semaphore(max_video_concurrency) # This defines how many videos we scrape at once
@@ -235,11 +234,9 @@ class Helper:
             """
             Fetches the HTML content of a Video....
             """
-
-            async with semaphore_videos:
-                logger.debug(f"Fetching Video: {url}")
-                html = await self.core.fetch(url, method=video_request_method)
-                return url, html
+            logger.debug(f"Fetching Video: {url}")
+            html = await self.core.fetch(url, method=video_request_method)
+            return url, html
 
         async def page_worker(page_url: str):
             html_content = await fetch_page(page_url)
@@ -257,10 +254,10 @@ class Helper:
                     video_url, attempt_count = await video_queue.get() # Pulls the Video URL from the queue
 
                 except asyncio.CancelledError:
-                    return # Exit the loop if we already cancelled remaining parts
+                    return # Exit the loop if we already canceled remaining parts
 
                 result = ScrapeResult(video_url)
-
+                task_cleared = False
                 try:
                     async with semaphore_videos:
                         self.logger.debug(f"Fetching Video HTML: {video_url}")
@@ -278,13 +275,16 @@ class Helper:
                     logger.error(f"Failed to scrape Video URL: {e}")
                     if on_video_error is not None or ignore_errors:
                         try:
-                            should_retry = await on_video_error(video_url, e, attempt_count)
+                            if on_video_error is not None:
+                                should_retry = await on_video_error(video_url, e, attempt_count)
 
-                            if should_retry:
-                                self.logger.info(f"Re-Queuing {video_url}!")
-                                await video_queue.put((video_url, attempt_count + 1))
-                                video_queue.task_done()
-                                continue
+                                if should_retry:
+                                    self.logger.info(f"Re-Queuing {video_url}!")
+                                    await video_queue.put((video_url, attempt_count + 1))
+                                    video_queue.task_done()
+                                    task_cleared = True
+                                    continue
+
                         except Exception as callback_error:
                             self.logger.error(f"Error inside the provided callback: {callback_error}")
 
@@ -292,27 +292,41 @@ class Helper:
                         await results_queue.put(result)
 
                 finally:
-                    video_queue.task_done()
+                    if not task_cleared:
+                        video_queue.task_done()
 
-        async def supervisor(page_tasks, video_workers):
-            await asyncio.gather(*page_tasks)
-            await video_queue.join()
+        async def supervisor():
+            await asyncio.gather(*page_tasks, return_exceptions=True)
 
-            for worker in video_workers:
-                worker.cancel()
+            await video_queue.join() # Wait until we extracted basically all videos
+
+            # After completed extraction we cancel all the workers
+            for task in page_tasks:
+                task.cancel()
+
+            for task in video_workers:
+                task.cancel()
 
             await results_queue.put(None)
 
-        page_tasks = [asyncio.create_task(page_worker(url)) for url in target_page_urls]
-        video_workers = [asyncio.create_task(video_worker()) for _ in range(max_video_concurrency)]
-        asyncio.create_task(supervisor(page_tasks, video_workers))
 
-        while True:
-            result_item = await results_queue.get()
-            if result_item is None:
-                break
+        async with asyncio.TaskGroup() as tg:
+            page_tasks = [tg.create_task(page_worker(url)) for url in target_page_urls]
+            video_workers = [tg.create_task(video_worker()) for _ in range(max_video_concurrency)]
+            supervisor_task = tg.create_task(supervisor())
 
-            yield result_item
+            while True:
+                result_item = await results_queue.get()
+                if result_item is None:
+                    break
+
+                yield result_item
+
+            for task in page_tasks:
+                task.cancel()
+
+            for task in video_workers:
+                task.cancel()
 
 
 class ScrapeResult:
@@ -625,11 +639,20 @@ class BaseCore:
                         if status == 429:
                             wait = parse_retry_after(logger=self.logger, response=response)
                             if wait is not None:
+                                self.logger.warning(f"Rate limited (429). Server requested {wait}s pause.")
                                 await asyncio.sleep(wait)
-                                continue
+
+                            else:
+                                delay = random.randint(2, 6)
+
+                                self.logger.warning(
+                                    f"Rate limited (429). No header found. Backing off {delay}s.")
+                                await asyncio.sleep(delay)
 
                             if attempt.retry_state.attempt_number <= 2:
                                 raise NetworkingError("429 Rate Limited")
+
+                            continue
 
                         if status == 401:
                             return response # Expected (for Vinted OSINT script I use)
@@ -654,8 +677,9 @@ class BaseCore:
                         elif "timeout" in err_str or "read" in err_str:
                             self.logger.error("Timeout for URL %s: %s", url, e)
                         raise
-                    except ResourceGone:
+                    except (RequestsError, NetworkingError, ResourceGone):
                         raise
+
                     except (SecurityAbort, ProxySSLError, InvalidProxy, UnknownError):
                         raise
                     except Exception as e:
