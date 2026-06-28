@@ -59,7 +59,7 @@ class DownloadConfigHLS(BaseConfigDownload):
 class DownloadConfigRAW(BaseConfigDownload):
     allow_multipart: bool = True
     max_workers: int = 5
-    read_timeout: float = 120.0,
+    read_timeout: float = 120.0
     chunk_size: int = 1024
     max_retries: int = 5
 

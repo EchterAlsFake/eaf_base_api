@@ -48,6 +48,7 @@ class UnknownError(Exception):
     """
     def __init__(self, message: str) -> None:
         self.message = message
+        super().__init__(message)
 
 
 # Networking Errors
@@ -59,6 +60,7 @@ class ResourceGone(Exception):
     """
     def __init__(self, message: str) -> None:
         self.message = message
+        super().__init__(message)
 
 
 class BaseScraperError(Exception):
@@ -88,6 +90,7 @@ class ProxySSLError(Exception):
     """
     def __init__(self, message: str) -> None:
         self.message = message
+        super().__init__(message)
 
 
 class InvalidProxy(Exception):
@@ -98,6 +101,7 @@ class InvalidProxy(Exception):
     """
     def __init__(self, message: str) -> None:
         self.message = message
+        super().__init__(message)
 
 
 
@@ -115,6 +119,7 @@ class DownloadCancelled(BaseScraperError):
     """
     def __init__(self, message: str) -> None:
         self.message = message
+        super().__init__(message)
 
 
 class SegmentError(Exception):
@@ -123,6 +128,7 @@ class SegmentError(Exception):
     """
     def __init__(self, message: str) -> None:
         self.message = message
+        super().__init__(message)
 
 
 class VideoFetchError(BaseScraperError):
@@ -146,7 +152,7 @@ class ChallengeRegexError(BaseScraperError):
     ...
 
 
-class ChallengeMathError:
+class ChallengeMathError(BaseScraperError):
     ...
 
 
