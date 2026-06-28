@@ -12,54 +12,38 @@ import traceback
 import threading
 from functools import lru_cache
 from urllib.parse import urljoin
-from typing import Union, Callable, Tuple, TYPE_CHECKING, AsyncGenerator, Coroutine, cast, List, Dict, Any, Awaitable
 from curl_cffi import CurlOpt # Used for DNS over HTTPS
 from curl_cffi.requests.errors import RequestsError
 from curl_cffi.requests import AsyncSession, Response
 from tenacity import AsyncRetrying, stop_after_attempt, wait_exponential_jitter, retry_if_exception_type, RetryError
+from typing import Union, Callable, Tuple, AsyncGenerator, Coroutine, cast, List, Dict, Any, Awaitable, TYPE_CHECKING
 
-if TYPE_CHECKING:
+
+# 1. Standardize on relative imports
+from base_api.modules.errors import *
+from base_api.modules.type_hints import DownloadReport
+from base_api.modules.static_functions import (
+    load_segment_state, parse_retry_after, log_precondition_failed,
+    write_segment_state, build_segment_state, get_segment_index_width,
+    segment_file_path, is_video_playlist, height_from_variant,
+    pick_by_height, normalize_quality_value,
+    parse_challenge, other_challenge, least_factors,
+    collect_variants, pick_by_label
+)
+from base_api.modules.config import config, RuntimeConfig, DownloadConfigHLS, DownloadConfigRAW
+from base_api.modules.progress_bars import Callback
+from base_api.modules.logger import setup_logger
+
+# 2. Handle optional dependencies cleanly
+try:
     import m3u8
-    from .modules.errors import (SecurityAbort, ResourceGone, ProxySSLError, UnknownError, InvalidProxy,
-                                 DownloadCancelled, NetworkingError)
-    from .modules.type_hints import DownloadReport
-    from .modules.static_functions import (load_segment_state, parse_retry_after, log_precondition_failed,
-                                           write_segment_state, build_segment_state, get_segment_index_width,
-                                           segment_file_path, is_video_playlist, height_from_variant, pick_by_height,
-                                           normalize_quality_value, parse_challenge, other_challenge, least_factors,
-                                           collect_variants, pick_by_label)
-    from .modules.config import config, RuntimeConfig
-    from .modules.progress_bars import Callback
-    from .modules.logger import setup_logger
-    from av.audio.codeccontext import AudioCodecContext
+except ImportError:
+    m3u8 = None
 
-else:
-    try:
-        from modules.errors import (SecurityAbort, ResourceGone, ProxySSLError, UnknownError, InvalidProxy,
-                                     DownloadCancelled, NetworkingError, VideoFetchError, PageFetchError)
-        from modules.type_hints import DownloadReport
-        from .modules.static_functions import (load_segment_state, parse_retry_after, log_precondition_failed,
-                                               write_segment_state, build_segment_state, get_segment_index_width,
-                                               segment_file_path, is_video_playlist, height_from_variant,
-                                               pick_by_height, strip_title,
-                                               normalize_quality_value, parse_challenge,
-                                               other_challenge, least_factors, collect_variants, pick_by_label)
-        from modules.config import config
-        from modules.progress_bars import Callback
-        from modules.logger import setup_logger
-    except (ModuleNotFoundError, ImportError):
-        from .modules.errors import (SecurityAbort, ResourceGone, ProxySSLError, UnknownError, InvalidProxy,
-                                     DownloadCancelled, NetworkingError, VideoFetchError, PageFetchError)
-        from .modules.type_hints import DownloadReport
-        from .modules.static_functions import (load_segment_state, parse_retry_after, log_precondition_failed,
-                                               write_segment_state, build_segment_state, get_segment_index_width,
-                                               segment_file_path, is_video_playlist, height_from_variant,
-                                               pick_by_height, strip_title,
-                                               normalize_quality_value, parse_challenge,
-                                               other_challenge, least_factors, collect_variants, pick_by_label)
-        from .modules.config import config
-        from .modules.progress_bars import Callback
-        from .modules.logger import setup_logger
+# 3. Handle specific runtime imports
+if TYPE_CHECKING:
+    from av.audio.codeccontext import AudioCodecContext
+    import m3u8
 
 # The following imports are optional, because they depend on per API and I want to be as memory efficient as possible
 
@@ -158,7 +142,7 @@ class Helper:
             logger: An optional pre-configured logger instance.
             log_name: Name for the logger if one needs to be created.
             log_file: Optional file path to log output to.
-            log_level: Logging severity level (e.g., logging.INFO).
+            log_level: Logging severity level (e.g., logging.INFO)
             http_ip: Optional IP address for remote logging.
             http_port: Optional port for remote logging.
             alternative_constructor: An optional factory for non-standard results (e.g., when a page doesn't yield videos).
@@ -183,7 +167,7 @@ class Helper:
 
     async def iterator(
             self,
-            target_page_urls: List[str] | None = None,
+            target_page_urls: List[str],
             video_link_extractor: Callable[..., Any] | None = None,
             max_page_concurrency: int = 5,
             max_video_concurrency: int = 20,
@@ -193,29 +177,17 @@ class Helper:
             ignore_errors: bool = True,
             on_video_error: Callable[[str, Exception, int], Awaitable[bool]] | None = None,
             on_page_error: Callable[[str, Exception, int], Awaitable[bool]] | None = None,
+            keep_original_order: bool = False
+
     ) -> AsyncGenerator[Any, None]:
         """
         The main scraping engine that orchestrates concurrent page and video processing.
         """
         logger = self.logger
-
-        semaphore_pages = asyncio.Semaphore(max_page_concurrency) # This defines how many pages we scrape at once
-        semaphore_videos = asyncio.Semaphore(max_video_concurrency) # This defines how many videos we scrape at once
-
-        target_page_urls = target_page_urls # These are the initial pages we need to scrape to extract the video objects
-        video_link_extractor = video_link_extractor # This is the function that uses re / bs4 to extract the video links returning them as a list
-
-        page_request_method = page_request_method # In very few exceptions we need to do POST requests instead of GET
-        video_request_method = video_request_method # Same as above
-
-        use_alternative_constructor = use_alternative_constructor # If true a different class will be used to construct objects
-        # This class is supposed to take the HTML content (or Response in general) and do something with it.
-        # This is per library different
-
         video_queue = asyncio.Queue() # The page worker will give his video URLs into this queue (consumer / producer pattern)
-        results_queue = asyncio.Queue() #
-
-        assert isinstance(target_page_urls, list)
+        page_queue = asyncio.Queue() # Stores the page URLs in a queue to apply retry logic later
+        results_queue = asyncio.Queue() # This is the queue that stores the actual videos
+        page_videos_count: dict[int, int] = {}
 
 
         async def fetch_page(url: str) -> str:
@@ -225,10 +197,8 @@ class Helper:
 
             Returns the HTML Content
             """
-            async with semaphore_pages:
-                logger.debug(f"Fetching Page: {url}")
-                html = await self.core.fetch(url, method=page_request_method)
-                return html
+            logger.debug(f"Fetching Page: {url}")
+            return await self.core.fetch(url, method=page_request_method)
 
         async def fetch_video(url: str) -> tuple[str, str]:
             """
@@ -238,20 +208,65 @@ class Helper:
             html = await self.core.fetch(url, method=video_request_method)
             return url, html
 
-        async def page_worker(page_url: str):
-            html_content = await fetch_page(page_url)
-            extracted_videos = await asyncio.to_thread(video_link_extractor, html_content)
-            # When we pass the HTML content to the extractor so that bs4 can extract it, it will take a minimum time
-            # of like 20ms. This would block our event loop and prevent new network requests, so this optimizes the
-            # speed by offloading it to another thread
+        async def page_worker():
+            while True:
+                try:
+                    page_index, page_url, attempt_count = await page_queue.get()
 
-            for video_url in extracted_videos:
-                await video_queue.put((video_url, 1))
+                except asyncio.CancelledError:
+                    return # Exits the loop
+
+                task_cleared = False
+
+                try:
+                    self.logger.debug(f"Fetching Page HTML: {page_url}")
+                    html_content = await fetch_page(page_url)
+                    extracted_videos = await asyncio.to_thread(video_link_extractor, html_content)
+                    page_videos_count[page_index] = len(extracted_videos)
+                    # When we pass the HTML content to the extractor so that bs4 can extract it, it will take a minimum time
+                    # of like 20ms. This would block our event loop and prevent new network requests, so this optimizes the
+                    # speed by offloading it to another thread
+
+                except Exception as e:
+                    self.logger.error(f"Failed to fetch page: {e}")
+
+                    if on_page_error is not None or ignore_errors:
+                        try:
+                            if on_page_error is not None:
+                                should_retry = await on_page_error(page_url, e, attempt_count)
+
+                                if should_retry:
+                                    self.logger.info(f"Re-Queuing {page_url}!")
+                                    await page_queue.put((page_index, page_url, attempt_count + 1))
+                                    page_queue.task_done()
+                                    task_cleared = True
+                                    continue
+
+                        except Exception as callback_error:
+                            self.logger.error(f"Error inside the provided callback: {callback_error}")
+                            raise CallbackError("""
+Warning: Your callback did not return True, because of that the failed video will NOT be appended to the queue
+and it will be skipped processing!""") from callback_error
+
+                    if not task_cleared:
+                        page_videos_count[page_index] = 0
+
+                if page_index in page_videos_count and page_videos_count[page_index] > 0:
+                    for video_idx, video_url in enumerate(extracted_videos):
+                        await video_queue.put((page_index, video_idx, video_url, 1))
+
+                if not task_cleared:
+                    page_queue.task_done()
+
+        async def process_video(video):
+            cleaned_video = await video.init()
+            return cleaned_video
+
 
         async def video_worker():
             while True:
                 try:
-                    video_url, attempt_count = await video_queue.get() # Pulls the Video URL from the queue
+                    page_index, video_index, video_url, attempt_count = await video_queue.get() # Pulls the Video URL from the queue
 
                 except asyncio.CancelledError:
                     return # Exit the loop if we already canceled remaining parts
@@ -259,16 +274,20 @@ class Helper:
                 result = ScrapeResult(video_url)
                 task_cleared = False
                 try:
-                    async with semaphore_videos:
-                        self.logger.debug(f"Fetching Video HTML: {video_url}")
-                        url, html = await fetch_video(video_url)
+                    self.logger.debug(f"Fetching Video HTML: {video_url}")
+                    url, html = await fetch_video(video_url)
+                    if use_alternative_constructor:
+                        video_instance = self.alternative_factory(url, core=self.core, html_content=html)
+
+                    else:
                         video_instance = self.video_factory(url, core=self.core, html_content=html) # Creates the video scrape object
-                        await video_instance.init()
 
 
-                    result.video = video_instance
+                    processed = await process_video(video_instance)
+                    await video_instance.clean() # Basically wipes the instance to free up memory
+                    result.video = processed
                     result.is_success = True
-                    await results_queue.put(video_instance)
+                    await results_queue.put((page_index, video_index, result))
                     # In this case the video was successfully fetched
 
                 except Exception as e:
@@ -280,53 +299,87 @@ class Helper:
 
                                 if should_retry:
                                     self.logger.info(f"Re-Queuing {video_url}!")
-                                    await video_queue.put((video_url, attempt_count + 1))
+                                    await video_queue.put((page_index, video_index, video_url, attempt_count + 1))
                                     video_queue.task_done()
                                     task_cleared = True
                                     continue
 
                         except Exception as callback_error:
                             self.logger.error(f"Error inside the provided callback: {callback_error}")
+                            raise CallbackError("""
+Warning: Your callback did not return True, because of that the failed video will NOT be appended to the queue
+and it will be skipped processing!""") from callback_error
 
-                        result.error = e
-                        await results_queue.put(result)
+
+                    result.error = e
+                    await results_queue.put((page_index, video_index, result))
 
                 finally:
                     if not task_cleared:
                         video_queue.task_done()
 
-        async def supervisor():
-            await asyncio.gather(*page_tasks, return_exceptions=True)
+        async def create_page_queue():
+            for index, url in enumerate(target_page_urls):
+                await page_queue.put((index, url, 1))
 
-            await video_queue.join() # Wait until we extracted basically all videos
-
-            # After completed extraction we cancel all the workers
-            for task in page_tasks:
-                task.cancel()
-
-            for task in video_workers:
-                task.cancel()
-
+        async def worker_supervisor():
+            await page_queue.join()
+            await video_queue.join()
             await results_queue.put(None)
 
-
         async with asyncio.TaskGroup() as tg:
-            page_tasks = [tg.create_task(page_worker(url)) for url in target_page_urls]
+            fill_page_queue = tg.create_task(create_page_queue())
+            page_tasks = [tg.create_task(page_worker()) for _ in range(max_page_concurrency)]
             video_workers = [tg.create_task(video_worker()) for _ in range(max_video_concurrency)]
-            supervisor_task = tg.create_task(supervisor())
+            supervisor = tg.create_task(worker_supervisor())
+
+            expected_page = 0
+            expected_video = 0
+            buffer = {}
 
             while True:
                 result_item = await results_queue.get()
                 if result_item is None:
+                    for task in page_tasks + video_workers:
+                        task.cancel()
+
+                    if keep_original_order:
+                        while True:
+                            if expected_page in page_videos_count and expected_video >= page_videos_count[expected_page]:
+                                expected_page += 1
+                                expected_video = 0
+                                continue
+
+                            if (expected_page, expected_video) in buffer:
+                                yield buffer.pop((expected_page, expected_video))
+                                expected_video += 1
+
+
+                            else:
+                                break
+
                     break
 
-                yield result_item
+                page_idx, video_idx, result_obj = result_item
+                if not keep_original_order:
+                    yield result_obj
 
-            for task in page_tasks:
-                task.cancel()
+                else:
+                    buffer[(page_idx, video_idx)] = result_obj
 
-            for task in video_workers:
-                task.cancel()
+                    while True:
+                        if expected_page in page_videos_count and expected_video >= page_videos_count[expected_page]:
+                            expected_page += 1
+                            expected_video = 0
+                            continue
+
+                        if (expected_page, expected_video) in buffer:
+                            yield buffer.pop((expected_page, expected_video))
+                            expected_video += 1
+
+                        else:
+                            break
+
 
 
 class ScrapeResult:
@@ -460,7 +513,7 @@ class BaseCore:
         headers: Dict[str, str] | None = None,
         json_data: Dict[str, Any] | None = None,
         params: Dict[str, Any] | None = None,
-    ) -> Union[bytes, str, Response]:
+    ) -> bytes | str | Response:
         """
         Fetch content with retries, optional caching, proxy support, and bandwidth limiting.
         Now uses Tenacity for robust retry logic.
@@ -483,7 +536,7 @@ class BaseCore:
         retryer = AsyncRetrying(
             stop=stop_after_attempt(max_retries),
             wait=wait_exponential_jitter(initial=0.5, max=30.0, jitter=0.5),
-            retry=retry_if_exception_type((RequestsError, NetworkingError)),
+            retry=retry_if_exception_type((RequestsError, NetworkRequestError)),
             reraise=True
         )
 
@@ -546,8 +599,10 @@ class BaseCore:
                                         self.logger.info("Another task already resolved the challenge! Retrying request with the new cookie.")
                                         if self.latest_key:
                                             session.cookies.set("KEY", self.latest_key, domain=".pornhub.com", path="/")
-                                        raise NetworkingError("Challenge resolved by other task, retry")
-                                        
+
+                                        await asyncio.sleep(1.5)
+                                        continue
+
                                     self.logger.info("Challenge page detected! Solving...")
                                     get_challenge = re.compile(r'go\(\).*?{(.*?)n=l.*?KEY.*?s\+":(\d+):', re.DOTALL)
                                     challenge_data = re.search(get_challenge, resp_text)
@@ -584,16 +639,15 @@ class BaseCore:
                                                 pass
 
                                             await asyncio.sleep(1.5)
-                                            raise NetworkingError("Challenge solved, retry immediate")
-                                        except Exception as math_err:
-                                            if isinstance(math_err, SecurityAbort):
-                                                raise
-                                            self.logger.error("Failed executing math engine: %s", repr(math_err))
-                                            raise NetworkingError("Math error, retry")
+                                            continue
+                                        except Exception as challenge_error:
+                                            raise ChallengeMathError from challenge_error
+
                                     else:
-                                        self.logger.error("Detected challenge page, but your regex failed to extract data.")
-                                        await asyncio.sleep(2)
-                                        raise NetworkingError("Challenge regex failed, retry")
+                                        self.logger.error("Detected challenge page, but the regex failed to extract data.")
+                                        await asyncio.sleep(1.5)
+                                        raise ChallengeRegexError("Detected Challenge, but regex couldn't extract, report this!")
+
 
                         if status == 200:
                             self.logger.debug("Successfully fetched URL: %s", url)
@@ -617,15 +671,7 @@ class BaseCore:
                             return response # No content left
 
                         if status == 403:
-                            if not state["ua_switched"]:
-                                await asyncio.sleep(2)
-                                state["ua_switched"] = True
-                                self.logger.warning("Switched User-Agent on 403")
-                                raise NetworkingError("403 User-Agent Switch")
-                            else:
-                                msg = f"Forbidden (403) after retries for URL: {url}"
-                                self.logger.error(msg)
-                                response.raise_for_status()
+                            raise AccessDeniedError("Request blocked by server!")
 
                         if status == 412:
                             log_precondition_failed(logger=self.logger, attempt=attempt.retry_state.attempt_number, response=response)
@@ -650,7 +696,7 @@ class BaseCore:
                                 await asyncio.sleep(delay)
 
                             if attempt.retry_state.attempt_number <= 2:
-                                raise NetworkingError("429 Rate Limited")
+                                raise RateLimitError("429 Rate Limited", retry_after=delay, url=url)
 
                             continue
 
@@ -659,11 +705,11 @@ class BaseCore:
 
                         if 500 <= status < 600:
                             self.logger.warning("Server error %s on %s. Retrying...", status, url)
-                            raise NetworkingError(f"Server error {status}")
+                            raise HTTPStatusError(f"Server error {status}", status_code=status, url=url)
 
                         if status != 200:
                             self.logger.info("HTTP %s for %s.", status, url)
-                            raise NetworkingError(f"HTTP {status}")
+                            raise NetworkRequestError(f"HTTP {status}")
 
                     except RequestsError as e:
                         err_str = str(e).lower()
@@ -677,11 +723,12 @@ class BaseCore:
                         elif "timeout" in err_str or "read" in err_str:
                             self.logger.error("Timeout for URL %s: %s", url, e)
                         raise
-                    except (RequestsError, NetworkingError, ResourceGone):
+                    except (RequestsError, NetworkRequestError, ResourceGone):
                         raise
 
                     except (SecurityAbort, ProxySSLError, InvalidProxy, UnknownError):
                         raise
+
                     except Exception as e:
                         self.logger.error("Unexpected error for %s: %s\n%s", url, e, traceback.format_exc())
                         raise UnknownError(f"Unexpected error for URL {url}: {e}") from e
@@ -739,11 +786,11 @@ a new Python file, import only m3u8 and see what error you get.
             self.logger.debug("Resolved m3u8 master: %s", m3u8_url)
 
         if not master.is_variant:
-            raise ValueError("Provided URL/content is not a master playlist.")
+            raise PlaylistExtractionError(f"Playlist is not a master Playlist: {m3u8_url}")
 
         variants = collect_variants(master)
         if not variants:
-            raise ValueError("No usable video variants found in master playlist.")
+            raise PlaylistExtractionError(f"No usable variants found in master Playlist: {m3u8_url}, {master}")
 
         q = normalize_quality_value(quality)
         if isinstance(q, str):  # 'best'/'half'/'worst'
@@ -889,65 +936,28 @@ a new Python file, import only m3u8 and see what error you get.
     async def download(
         self,
         video: Any, # The video object
-        quality: str | int, # Selected quality e.g., 720, 1080 and so on
-        path: str, # Output Path
-        callback: Callable[[int, int], None] | None,
-        remux: bool = False, # Whether to remux the video from MPEG-TS to mp4 container
-        callback_remux: Callable[[int, int], None] | None = None, # Callback for the remuxing process
-        max_workers_download: int = 20, # The maximum amount of workers that fetch segments at the same time
-        start_segment: int = 0, # The start segment to work on (only relevant for resuming)
-        stop_event: threading.Event | None = None, # Stop event to exit the download
-        segment_state_path: str | None = None, # The path for the segment state (json), for resuming
-        segment_dir: str | None = None, # The directory of segments
-        return_report: bool = False, # Whether to do a report
-        cleanup_on_stop: bool = True,
-        keep_segment_dir: bool = False,
-        ios_support: bool = False
+        configuration: DownloadConfigHLS
     ) -> DownloadReport | bool:
         """
         :param video:
-        :param callback:
-        :param quality:
-        :param path:
-        :param remux:
-        :param callback_remux:
-        :param max_workers_download:
-        :param start_segment:
-        :param stop_event:
-        :param segment_state_path:
-        :param segment_dir:
-        :param return_report:
-        :param cleanup_on_stop:
-        :param keep_segment_dir:
-        :param ios_support:
+        :param configuration:
         :return:
         """
-        requested_workers = max_workers_download
-        max_workers_download = max_workers_download or self.configuration.max_workers_download # Get max workers
-        if not requested_workers:
-            self.logger.debug("download: using config max_workers_download=%s", max_workers_download)
 
-        if callback is None:
+        max_workers_download = self.configuration.max_workers_download # Get max workers
+
+        if configuration.callback is None:
             # Use a terminal text progressbar by default
-            callback = Callback.text_progress_bar
+            configuration.callback = Callback.text_progress_bar
             self.logger.debug("download: no callback provided, using default text progress bar")
 
-        m3u8_url = getattr(video, "m3u8_base_url", None)
+        m3u8_url = configuration.m3u8_base_url
 
         if inspect.iscoroutinefunction(m3u8_url) or (callable(m3u8_url) and not isinstance(m3u8_url, str)):
             m3u8_url = m3u8_url()
         if inspect.iscoroutine(m3u8_url) or inspect.isawaitable(m3u8_url):
             m3u8_url = await m3u8_url
 
-        self.logger.info(
-    """
-    Download requested: quality=%s path=%s remux=%s max_workers=%s
-    start_segment=%s segment_state_path=%s segment_dir=%s
-    return_report=%s cleanup_on_stop=%s keep_segment_dir=%s
-    stop_event_set=%s""",
-            quality, path, remux, max_workers_download, start_segment, segment_state_path, segment_dir,
-            return_report, cleanup_on_stop, keep_segment_dir, bool(stop_event and stop_event.is_set())
-        )
         if m3u8_url:
             self.logger.debug("Download m3u8_base_url=%s", m3u8_url)
 
@@ -956,19 +966,7 @@ a new Python file, import only m3u8 and see what error you get.
         return await threaded_download(
             self,
             video=video,
-            quality=quality,
-            path=path,
-            callback=callback,
-            remux=remux,
-            callback_remux=callback_remux,
-            start_segment=start_segment,
-            stop_event=stop_event,
-            segment_state_path=segment_state_path,
-            segment_dir=segment_dir,
-            return_report=return_report,
-            cleanup_on_stop=cleanup_on_stop,
-            keep_segment_dir=keep_segment_dir,
-            ios_support=ios_support,
+            configuration=configuration,
             pre_resolved_m3u8_url=m3u8_url
         )
 
@@ -979,29 +977,29 @@ a new Python file, import only m3u8 and see what error you get.
 
         async def wrapper(
             self: "BaseCore",
-            video: Any,
-            quality: str | int,
-            callback: Callable[[int, int], None] | None,
-            path: str,
-            remux: bool = True,
-            callback_remux: Callable[[int, int], None] | None = None,
-            start_segment: int = 0,
-            stop_event: threading.Event | None = None,
-            segment_state_path: str | None = None,
-            segment_dir: str | None = None,
-            return_report: bool = False,
-            cleanup_on_stop: bool = True,
-            keep_segment_dir: bool = False,
-            ios_support: bool = False,
-            pre_resolved_m3u8_url: str | None = None
+            configuration: DownloadConfigHLS,
+            pre_resolved_m3u8: str
         ) -> DownloadReport | bool:
             """
             Threaded HLS segment downloader with optional resume state and stop flag.
             """
             try:
-                # Cast these to satisfy type checker if they come in as Optional
-                cleanup_on_stop = bool(cleanup_on_stop)
-                keep_segment_dir = bool(keep_segment_dir)
+                cleanup_on_stop = configuration.cleanup_on_stop
+                keep_segment_dir = configuration.keep_segment_dir
+                quality = configuration.quality
+                path = configuration.path
+                remux = configuration.remux
+                start_segment = configuration.start_segment
+                segment_state_path = configuration.segment_state_path
+                segment_dir = configuration.segment_dir
+                return_report = configuration.return_report
+                callback = configuration.callback
+                callback_remux = configuration.callback_remux
+                stop_event = configuration.stop_event
+                ios_support = configuration.ios_support
+                pre_resolved_m3u8_url = pre_resolved_m3u8
+
+                assert isinstance(pre_resolved_m3u8_url, str)
 
                 self.logger.info(
                     f"Threaded download start: quality={quality} path={path} remux={remux} start_segment={start_segment} "
@@ -1069,15 +1067,7 @@ a new Python file, import only m3u8 and see what error you get.
                     )
 
                 else:
-                    if pre_resolved_m3u8_url is not None:
-                        m3u8_master = pre_resolved_m3u8_url
-                    else:
-                        m3u8_master = getattr(video, "m3u8_base_url")
-                        assert m3u8_master is not None, "m3u8_base_url is missing from video object"
-                        if inspect.iscoroutinefunction(m3u8_master) or (callable(m3u8_master) and not isinstance(m3u8_master, str)):
-                            m3u8_master = m3u8_master()
-                        if inspect.iscoroutine(m3u8_master) or inspect.isawaitable(m3u8_master):
-                            m3u8_master = await m3u8_master
+                    m3u8_master = pre_resolved_m3u8_url
                     self.logger.info(f"Fetching segments for quality={quality} m3u8_url_master={m3u8_master}")
                     segments = await self.get_segments(quality=quality, m3u8_url_master=m3u8_master)
                     total_before = len(segments)
@@ -1604,18 +1594,21 @@ a new Python file, import only m3u8 and see what error you get.
             elapsed = time.perf_counter() - start_ts
             self.logger.info("Remux skipped; file moved. elapsed=%s.2f", elapsed)
 
-    async def legacy_download(self, path: str, url: str, callback: Callable[[int, int], None] | None = None,
-                        max_retries: int = 5,
-                        chunk_size: int = 1024,
-                        read_timeout: float = 120.0,
-                        stop_event: threading.Event | None = None,
-                        max_workers: int = 5,
-                        allow_multipart: bool = True) -> bool:
+    async def legacy_download(self, url: str, configuration: DownloadConfigRAW) -> bool:
         """
         Download a file using streaming with stall tolerance and resume.
         Supports fast concurrent range downloading if the server supports it and allow_multipart is True.
         Assumes self.session is an AsyncSession.
         """
+        path = configuration.path
+        max_retries = configuration.max_retries
+        read_timeout = configuration.read_timeout
+        stop_event = configuration.stop_event
+        allow_multipart = configuration.allow_multipart
+        callback = configuration.callback
+        chunk_size = configuration.chunk_size
+        max_workers = configuration.max_workers
+
         self.logger.info(
 """Legacy download start: url=%s path=%s
 max_retries=%s read_timeout=%s
@@ -1758,7 +1751,7 @@ allow_multipart=%s""", url, path, max_retries, read_timeout, bool(stop_event and
                 raise DownloadCancelled("Download cancelled.")
 
             if not all(results):
-                raise NetworkingError("One or more chunks failed to download completely.")
+                raise NetworkRequestError("One or more chunks failed to download completely.")
 
             self.logger.info("Fast multipart download complete: path=%s", path)
             return True
@@ -1846,11 +1839,11 @@ allow_multipart=%s""", url, path, max_retries, read_timeout, bool(stop_event and
                         await asyncio.sleep(backoff)
                     continue
                 else:
-                    raise NetworkingError(f"Stream for: {url} was closed or failed: {e}")
+                    raise NetworkRequestError(f"Stream for: {url} was closed or failed: {e}")
             except DownloadCancelled:
                 raise
             except Exception:
                 error = traceback.format_exc()
-                raise NetworkingError(f"Unknown error for: {url} -->: {error}")
+                raise NetworkRequestError(f"Unknown error for: {url} -->: {error}")
 
         return False

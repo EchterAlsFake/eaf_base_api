@@ -383,7 +383,7 @@ def log_precondition_failed(logger, response: Response, attempt: int) -> None:
     )
 
 
-def strip_title(cls, title: str, max_length: int = 255) -> str:
+def strip_title(title: str, max_length: int = 255) -> str:
     """
     Sanitize a filename to be safe across Windows, macOS, Linux, and Android.
     Replaces or strips illegal characters and trims to a safe length.
