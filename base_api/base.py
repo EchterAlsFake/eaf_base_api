@@ -396,6 +396,7 @@ class BaseCore:
     """
     def __init__(self, configuration: "RuntimeConfig" = config) -> None:
         self.lock = asyncio.Lock()
+        self._delay_lock = asyncio.Lock()
         self.latest_key: str | None = None
         self.latest_key_time: float = 0.0
         self.last_request_time = time.time()
@@ -466,13 +467,14 @@ class BaseCore:
         """Enforces the specified delay in config.request_delay (only if > 0)."""
         delay = self.configuration.request_delay
         if delay and delay > 0:
-            time_since_last_request = time.time() - self.last_request_time
-            self.logger.debug("Time since last request: {:.2f} seconds.".format(time_since_last_request))
-            if time_since_last_request < delay:
-                sleep_time = delay - time_since_last_request
-                self.logger.debug("Enforcing delay of {:.2f} seconds.".format(sleep_time))
-                await asyncio.sleep(sleep_time)
-        self.last_request_time = time.time()
+            async with self._delay_lock:
+                time_since_last_request = time.time() - self.last_request_time
+                self.logger.debug("Time since last request: {:.2f} seconds.".format(time_since_last_request))
+                if time_since_last_request < delay:
+                    sleep_time = delay - time_since_last_request
+                    self.logger.debug("Enforcing delay of {:.2f} seconds.".format(sleep_time))
+                    await asyncio.sleep(sleep_time)
+                self.last_request_time = time.time()
 
     def _merged_headers(self, override: Dict[str, str] | None) -> Dict[str, Any]:
         """
