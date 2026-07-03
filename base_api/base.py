@@ -164,7 +164,6 @@ class Helper:
                 http_port=http_port,
             )
 
-
     async def iterator(
             self,
             target_page_urls: List[str],
@@ -184,11 +183,10 @@ class Helper:
         The main scraping engine that orchestrates concurrent page and video processing.
         """
         logger = self.logger
-        video_queue = asyncio.Queue() # The page worker will give his video URLs into this queue (consumer / producer pattern)
-        page_queue = asyncio.Queue() # Stores the page URLs in a queue to apply retry logic later
-        results_queue = asyncio.Queue() # This is the queue that stores the actual videos
+        video_queue = asyncio.Queue()  # The page worker will give his video URLs into this queue (consumer / producer pattern)
+        page_queue = asyncio.Queue()  # Stores the page URLs in a queue to apply retry logic later
+        results_queue = asyncio.Queue()  # This is the queue that stores the actual videos
         page_videos_count: dict[int, int] = {}
-
 
         async def fetch_page(url: str) -> str:
             """
@@ -214,7 +212,7 @@ class Helper:
                     page_index, page_url, attempt_count = await page_queue.get()
 
                 except asyncio.CancelledError:
-                    return # Exits the loop
+                    return  # Exits the loop
 
                 task_cleared = False
 
@@ -245,8 +243,8 @@ class Helper:
                         except Exception as callback_error:
                             self.logger.error(f"Error inside the provided callback: {callback_error}")
                             raise CallbackError("""
-Warning: Your callback did not return True, because of that the failed video will NOT be appended to the queue
-and it will be skipped processing!""") from callback_error
+    Warning: Your callback did not return True, because of that the failed video will NOT be appended to the queue
+    and it will be skipped processing!""") from callback_error
 
                     if not task_cleared:
                         page_videos_count[page_index] = 0
@@ -262,14 +260,13 @@ and it will be skipped processing!""") from callback_error
             cleaned_video = await video.init()
             return cleaned_video
 
-
         async def video_worker():
             while True:
                 try:
-                    page_index, video_index, video_url, attempt_count = await video_queue.get() # Pulls the Video URL from the queue
+                    page_index, video_index, video_url, attempt_count = await video_queue.get()  # Pulls the Video URL from the queue
 
                 except asyncio.CancelledError:
-                    return # Exit the loop if we already canceled remaining parts
+                    return  # Exit the loop if we already canceled remaining parts
 
                 result = ScrapeResult(video_url)
                 task_cleared = False
@@ -280,15 +277,16 @@ and it will be skipped processing!""") from callback_error
                         video_instance = self.alternative_factory(url, core=self.core, html_content=html)
 
                     else:
-                        video_instance = self.video_factory(url, core=self.core, html_content=html) # Creates the video scrape object
+                        video_instance = self.video_factory(url, core=self.core,
+                                                            html_content=html)  # Creates the video scrape object
 
+                    async with video_instance:
+                        processed = await process_video(video_instance)
+                        result.video = processed
+                        result.is_success = True
+                        # In this case the video was successfully fetched
 
-                    processed = await process_video(video_instance)
-                    await video_instance.clean() # Basically wipes the instance to free up memory
-                    result.video = processed
-                    result.is_success = True
                     await results_queue.put((page_index, video_index, result))
-                    # In this case the video was successfully fetched
 
                 except Exception as e:
                     logger.error(f"Failed to scrape Video URL: {e}")
@@ -307,9 +305,8 @@ and it will be skipped processing!""") from callback_error
                         except Exception as callback_error:
                             self.logger.error(f"Error inside the provided callback: {callback_error}")
                             raise CallbackError("""
-Warning: Your callback did not return True, because of that the failed video will NOT be appended to the queue
-and it will be skipped processing!""") from callback_error
-
+    Warning: Your callback did not return True, because of that the failed video will NOT be appended to the queue
+    and it will be skipped processing!""") from callback_error
 
                     result.error = e
                     await results_queue.put((page_index, video_index, result))
@@ -345,7 +342,8 @@ and it will be skipped processing!""") from callback_error
 
                     if keep_original_order:
                         while True:
-                            if expected_page in page_videos_count and expected_video >= page_videos_count[expected_page]:
+                            if expected_page in page_videos_count and expected_video >= page_videos_count[
+                                expected_page]:
                                 expected_page += 1
                                 expected_video = 0
                                 continue
@@ -379,7 +377,6 @@ and it will be skipped processing!""") from callback_error
 
                         else:
                             break
-
 
 
 class ScrapeResult:

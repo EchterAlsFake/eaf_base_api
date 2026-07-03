@@ -84,30 +84,79 @@ def normalize_quality_value(quality: Union[str, int]) -> Union[str, int]:
     raise ValueError(f"Invalid quality: {quality}")
 
 
-def choose_quality_from_list(available: List[str | int], target: Union[str, int]) -> int:
-    # available like ["240", "360", "480", "720", "1080"] (Can also be unsorted)
-    available_ints = sorted({int(x) for x in available}) # -> [144, 240, etc...]
+def choose_quality_from_list(
+        available: List[Union[str, int]],
+        target: Union[str, int],
+        default_fallback: int | str | None = None
+) -> int:
+    """
+    Selects a video quality from a list based on a target integer< or label.
+
+    :param available: List of available qualities (e.g., [240, "360", "1080p"]).
+    :param target: Numeric target (highest ≤ target) or label ("best", "worst", "half").
+    :param default_fallback: Optional integer to return if all parsing fails.
+    :return: The selected quality as an integer.
+    """
+
+    # 1. Edge Case: Empty List
+    if not available:
+        if default_fallback is not None:
+            return default_fallback
+        raise ValueError("The 'available' list cannot be empty.")
+
+    # 2. Data Sanitization: Filter out unparseable values safely
+    valid_ints = set()
+    for x in available:
+        try:
+            # Handle common string formats gracefully (e.g., "1080p" -> 1080)
+            if isinstance(x, str):
+                x = x.lower().rstrip('p')
+            valid_ints.add(int(x))
+        except (ValueError, TypeError):
+            continue  # Skip unparseable garbage rather than crashing
+
+    if not valid_ints:
+        if default_fallback is not None:
+            return default_fallback
+        raise ValueError("No valid numeric qualities found in 'available'.")
+
+    # Sort the sanitized list (e.g., [144, 240, 360, 720, 1080])
+    available_ints = sorted(valid_ints)
+
+    # 3. Edge Case: User passes a numeric string as a target (e.g., "1080")
+    if isinstance(target, str) and target.isdigit():
+        target = int(target)
+
+    # 4. Handle String Targets
     if isinstance(target, str):
+        target = target.lower()
         if target == "best":
-            return available_ints[-1] # Return the last index, this represents the best quality [144,360,720] -1 = 720
+            return available_ints[-1]
         if target == "worst":
-            return available_ints[0] # Return the first index, this represents the worst quality [144,360,720] 0 = 144
+            return available_ints[0]
         if target == "half":
-            return available_ints[len(available_ints) // 2] # Divides all options by 2 to find the middle, rounds up
-        raise ValueError("Invalid label.")
+            # Middle index. Examples: len=3 (idx 1), len=4 (idx 2, rounds up)
+            return available_ints[len(available_ints) // 2]
 
-    # numeric: highest ≤ target, else closest
-    le = [h for h in available_ints if h <= target]
-    # This works by iterating over the available qualities until the target is reached. It creates a new list with these
-    # qualities and returns the last index, as the last index in this case must be maximum best quality before we go over
-    # the specified one.
+        # Fallback for unrecognized string labels
+        if default_fallback is not None:
+            return default_fallback
+        raise ValueError(f"Invalid label: '{target}'. Expected 'best', 'worst', 'half', or a number.")
 
-    if le:
-        return le[-1] # Returns the stuff
-    # fallback closest (ties -> higher)
-    # This happens if the user for example specified 144 as the quality, but only 240+ is available.
-    return available_ints[0]
+    # 5. Handle Numeric Targets (highest ≤ target, else closest)
+    if isinstance(target, (int, float)):
+        le = [h for h in available_ints if h <= target]
+        if le:
+            return le[-1]
 
+        # Fallback closest: if target is 144 but only 240+ is available,
+        # all available qualities are > target. The closest is the lowest available.
+        return available_ints[0]
+
+    # Catch-all for entirely wrong target types (e.g., lists, dicts)
+    if default_fallback is not None:
+        return default_fallback
+    raise TypeError("Target must be a string or integer.")
 
 
 def height_from_variant(variant: Any) -> int | None:
