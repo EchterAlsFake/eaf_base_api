@@ -12,11 +12,12 @@ import traceback
 import threading
 from functools import lru_cache
 from urllib.parse import urljoin
+from dataclasses import dataclass
 from curl_cffi import CurlOpt # Used for DNS over HTTPS
 from curl_cffi.requests.errors import RequestsError
 from curl_cffi.requests import AsyncSession, Response
 from tenacity import AsyncRetrying, stop_after_attempt, wait_exponential_jitter, retry_if_exception_type, RetryError
-from typing import Union, Callable, Tuple, AsyncGenerator, Coroutine, cast, List, Dict, Any, Awaitable, TYPE_CHECKING
+from typing import Union, Callable, Tuple, AsyncGenerator, cast, List, Dict, Any, Awaitable, TYPE_CHECKING
 
 
 # 1. Standardize on relative imports
@@ -32,7 +33,7 @@ from base_api.modules.static_functions import (
 )
 from base_api.modules.config import config, RuntimeConfig, DownloadConfigHLS, DownloadConfigRAW
 from base_api.modules.progress_bars import Callback
-from base_api.modules.logger import setup_logger
+from base_api.modules.logger import configure_app_logging
 
 # 2. Handle optional dependencies cleanly
 try:
@@ -68,7 +69,7 @@ class Cache:
     def __init__(self, configuration: "RuntimeConfig") -> None:
         self.cache_dictionary: Dict[str, Any] = {}
         self.lock = threading.Lock()
-        self.logger = setup_logger("BASE API - [Cache]", level=logging.CRITICAL)
+        self.logger = configure_app_logging("BASE API - [Cache]", level=logging.CRITICAL)
         self.configuration = configuration
 
     def enable_logging(self, log_file: str | None = None, level: int = logging.DEBUG,
@@ -76,7 +77,7 @@ class Cache:
         """
         Enables logging dynamically for this module.
         """
-        self.logger = setup_logger(name="BASE API - [Cache]", log_file=log_file, level=level,
+        self.logger = configure_app_logging("BASE API - [Cache]", log_file=log_file, level=level,
                                    http_ip=log_ip, http_port=log_port)
 
     def handle_cache(self, url: str | None) -> Any:
@@ -111,19 +112,71 @@ class Cache:
             self.cache_dictionary.pop(entry)
 
 
+@dataclass(slots=True, kw_only=True)
+class BaseMedia:
+    url: str
+    core: object
+
+    # Internal flag to track if HTML has been fetched
+    _api_loaded: bool = False
+    _html_loaded: bool = False
+    _anything_else_loaded: bool = False
+
+    def __getattribute__(self, name: str):
+        val = object.__getattribute__(self, name)
+
+        if val is not None or name.startswith("_"):
+            return val
+
+        try:
+            api_done = object.__getattribute__(self, "_api_loaded")
+            html_done = object.__getattribute__(self, "_html_loaded")
+            anything_else_done = object.__getattribute__(self, "_anything_else_loaded")
+
+        except AttributeError:
+            # This just prevents an error during the dataclass __init__ phase
+            return val
+
+        if not api_done or not html_done or not anything_else_done:
+            missing = []
+            if not api_done: missing.append("api=True")
+            if not html_done: missing.append("html=True")
+            if not anything_else_done: missing.append("anything_else=True")
+
+            raise DataNotLoadedError(f"""
+Attribute: '{name}' is missing. Try fetching more data:
+'await {self.__class__.__name__.lower()}.load({', '.join(missing)}"""
+            )
+
+        return val
+
+    async def load(self, api: bool = True, html: bool = False, anything: bool = False) -> BaseMedia:
+        if (api and self._api_loaded) and (not html or self._html_loaded) and (not anything or self._anything_else_loaded):
+            return self
+
+        await self._perform_load(api=api, html=html, anything_else=anything)
+        if api: self._api_loaded = True
+        if html: self._html_loaded = True
+        if anything: self._anything_else_loaded = True
+        return self
+
+    async def _perform_load(self, api: bool, html: bool, anything_else: bool):
+        raise NotImplementedError("Subclasses must define _perform_load()")
+
+
 class Helper:
     """
-    Orchestrates the concurrent fetching and processing of paginated content.
+    The Helper class basically provides the blue-print for all my APIs. It fetches the content
+    of multiple pages e.g., videos, gifs, photos and retrieves the data asynchronously.
+    The underlying class that is passed to the Helper is then responsible for the actual
+    parsing logic.
 
-    This class manages the lifecycle of a scraping session, handling multiple pages
-    concurrently, extracting video URLs from them, and then fetching video details,
-    all while ensuring that the results are yielded in the original order they appeared
-    in the pagination.
+    This allows me to re-use the code and I don't have to do the same work 20x
     """
     def __init__(
         self,
         core: BaseCore,
-        video_constructor: Callable[..., Any],
+        constructor: Any,
         *,
         logger: logging.Logger | None = None,
         log_name: str = "helper.iterator",
@@ -131,33 +184,30 @@ class Helper:
         log_level: int = logging.INFO,
         http_ip: str | None = None,
         http_port: int | str | None = None,
-        alternative_constructor: Callable[..., Any] | None = None
     ) -> None:
         """
         Initializes the Scraping Helper.
 
         Args:
             core: The engine responsible for network requests (must have a .fetch(url) method).
-            video_constructor: A factory function/class to create Video objects from a URL and HTML.
+            constructor: Creates data with the fetched content
             logger: An optional pre-configured logger instance.
             log_name: Name for the logger if one needs to be created.
             log_file: Optional file path to log output to.
             log_level: Logging severity level (e.g., logging.INFO)
             http_ip: Optional IP address for remote logging.
             http_port: Optional port for remote logging.
-            alternative_constructor: An optional factory for non-standard results (e.g., when a page doesn't yield videos).
         """
         super().__init__()
         self.core = core
-        self.video_factory = video_constructor
-        self.alternative_factory = alternative_constructor
+        self.constructor = constructor
 
         if logger is not None:
             self.logger = logger
         else:
             # Create a dedicated, re-usable logger; safe to call multiple times thanks to setup_logger
-            self.logger = setup_logger(
-                name=log_name,
+            self.logger = configure_app_logging(
+                log_name,
                 log_file=log_file,
                 level=log_level,
                 http_ip=http_ip,
@@ -166,17 +216,18 @@ class Helper:
 
     async def iterator(
             self,
-            target_page_urls: List[str],
-            video_link_extractor: Callable[..., Any] | None = None,
-            max_page_concurrency: int = 5,
-            max_video_concurrency: int = 20,
-            use_alternative_constructor: bool = False,
-            page_request_method: str = "GET",
-            video_request_method: str = "GET",
-            ignore_errors: bool = True,
-            on_video_error: Callable[[str, Exception, int], Awaitable[bool]] | None = None,
-            on_page_error: Callable[[str, Exception, int], Awaitable[bool]] | None = None,
-            keep_original_order: bool = False
+            target_page_urls: List[str], # List of page URLs to search for videos on
+            video_link_extractor: Callable[..., Any] | None = None, # The extractor function that gets the video urls from a page
+            max_page_concurrency: int = 5, # How many pages to scrape at the same time
+            max_video_concurrency: int = 20, # How many videos to scrape at the same time
+            page_request_method: str = "GET", # The method for requesting the page
+            fetch_html: bool = True, # Whether to also load html content for the object directly here
+            fetch_api: bool = True, # Whether to also load data from an api endpoint
+            fetch_anything_else: bool = False, # Maybe some other stuff that can be used idk yet
+            ignore_errors: bool = True, # Whether errors should be ignored (untested lol)
+            on_video_error: Callable[[str, Exception, int], Awaitable[bool]] | None = None, # Custom function that handles retrying
+            on_page_error: Callable[[str, Exception, int], Awaitable[bool]] | None = None, # .._..
+            keep_original_order: bool = False # Whether to keep the original order of videos as they appeared on the page
 
     ) -> AsyncGenerator[Any, None]:
         """
@@ -186,7 +237,7 @@ class Helper:
         video_queue = asyncio.Queue()  # The page worker will give his video URLs into this queue (consumer / producer pattern)
         page_queue = asyncio.Queue()  # Stores the page URLs in a queue to apply retry logic later
         results_queue = asyncio.Queue()  # This is the queue that stores the actual videos
-        page_videos_count: dict[int, int] = {}
+        page_videos_count: dict[int, int] = {} # This stores information about the order
 
         async def fetch_page(url: str) -> str:
             """
@@ -197,14 +248,6 @@ class Helper:
             """
             logger.debug(f"Fetching Page: {url}")
             return await self.core.fetch(url, method=page_request_method)
-
-        async def fetch_video(url: str) -> tuple[str, str]:
-            """
-            Fetches the HTML content of a Video....
-            """
-            logger.debug(f"Fetching Video: {url}")
-            html = await self.core.fetch(url, method=video_request_method)
-            return url, html
 
         async def page_worker():
             while True:
@@ -250,54 +293,46 @@ class Helper:
                         page_videos_count[page_index] = 0
 
                 if page_index in page_videos_count and page_videos_count[page_index] > 0:
-                    for video_idx, video_url in enumerate(extracted_videos):
-                        await video_queue.put((page_index, video_idx, video_url, 1))
+                    for video_idx, video_data in enumerate(extracted_videos):
+                        await video_queue.put((page_index, video_idx, video_data, 1))
 
                 if not task_cleared:
                     page_queue.task_done()
 
-        async def process_video(video):
-            cleaned_video = await video.init()
-            return cleaned_video
-
         async def video_worker():
             while True:
                 try:
-                    page_index, video_index, video_url, attempt_count = await video_queue.get()  # Pulls the Video URL from the queue
+                    page_index, video_index, video_data, attempt_count = await video_queue.get()  # Pulls the Video URL from the queue
 
                 except asyncio.CancelledError:
                     return  # Exit the loop if we already canceled remaining parts
-
-                result = ScrapeResult(video_url)
+                url = video_data.get("url")
+                result = ScrapeResult(url)
                 task_cleared = False
+
                 try:
-                    self.logger.debug(f"Fetching Video HTML: {video_url}")
-                    url, html = await fetch_video(video_url)
-                    if use_alternative_constructor:
-                        video_instance = self.alternative_factory(url, core=self.core, html_content=html)
+                    instance = self.constructor(core=self.core, **video_data)
 
-                    else:
-                        video_instance = self.video_factory(url, core=self.core,
-                                                            html_content=html)  # Creates the video scrape object
+                    if fetch_html or fetch_api or fetch_anything_else:
+                        await instance.load(api=fetch_api, html=fetch_html, anything=fetch_anything_else)
 
-                    async with video_instance:
-                        processed = await process_video(video_instance)
-                        result.video = processed
-                        result.is_success = True
-                        # In this case the video was successfully fetched
+
+                    result.video = instance
+                    result.is_success = True
+                    # In this case the video was successfully fetched
 
                     await results_queue.put((page_index, video_index, result))
 
                 except Exception as e:
-                    logger.error(f"Failed to scrape Video URL: {e}")
+                    logger.error(f"Failed to scrape Video URL: {e}", exc_info=True)
                     if on_video_error is not None or ignore_errors:
                         try:
                             if on_video_error is not None:
-                                should_retry = await on_video_error(video_url, e, attempt_count)
+                                should_retry = await on_video_error(url, e, attempt_count)
 
                                 if should_retry:
-                                    self.logger.info(f"Re-Queuing {video_url}!")
-                                    await video_queue.put((page_index, video_index, video_url, attempt_count + 1))
+                                    self.logger.info(f"Re-Queuing {url}!")
+                                    await video_queue.put((page_index, video_index, video_data, attempt_count + 1))
                                     video_queue.task_done()
                                     task_cleared = True
                                     continue
@@ -324,26 +359,50 @@ class Helper:
             await video_queue.join()
             await results_queue.put(None)
 
-        async with asyncio.TaskGroup() as tg:
-            fill_page_queue = tg.create_task(create_page_queue())
-            page_tasks = [tg.create_task(page_worker()) for _ in range(max_page_concurrency)]
-            video_workers = [tg.create_task(video_worker()) for _ in range(max_video_concurrency)]
-            supervisor = tg.create_task(worker_supervisor())
+        try:
+            async with asyncio.TaskGroup() as tg:
+                fill_page_queue = tg.create_task(create_page_queue())
+                page_tasks = [tg.create_task(page_worker()) for _ in range(max_page_concurrency)]
+                video_workers = [tg.create_task(video_worker()) for _ in range(max_video_concurrency)]
+                supervisor = tg.create_task(worker_supervisor())
 
-            expected_page = 0
-            expected_video = 0
-            buffer = {}
+                expected_page = 0
+                expected_video = 0
+                buffer = {}
 
-            while True:
-                result_item = await results_queue.get()
-                if result_item is None:
-                    for task in page_tasks + video_workers:
-                        task.cancel()
+                while True:
+                    result_item = await results_queue.get()
+                    if result_item is None:
+                        for task in page_tasks + video_workers:
+                            task.cancel()
 
-                    if keep_original_order:
+                        if keep_original_order:
+                            while True:
+                                if expected_page in page_videos_count and expected_video >= page_videos_count[
+                                    expected_page]:
+                                    expected_page += 1
+                                    expected_video = 0
+                                    continue
+
+                                if (expected_page, expected_video) in buffer:
+                                    yield buffer.pop((expected_page, expected_video))
+                                    expected_video += 1
+
+
+                                else:
+                                    break
+
+                        break
+
+                    page_idx, video_idx, result_obj = result_item
+                    if not keep_original_order:
+                        yield result_obj
+
+                    else:
+                        buffer[(page_idx, video_idx)] = result_obj
+
                         while True:
-                            if expected_page in page_videos_count and expected_video >= page_videos_count[
-                                expected_page]:
+                            if expected_page in page_videos_count and expected_video >= page_videos_count[expected_page]:
                                 expected_page += 1
                                 expected_video = 0
                                 continue
@@ -352,31 +411,11 @@ class Helper:
                                 yield buffer.pop((expected_page, expected_video))
                                 expected_video += 1
 
-
                             else:
                                 break
 
-                    break
-
-                page_idx, video_idx, result_obj = result_item
-                if not keep_original_order:
-                    yield result_obj
-
-                else:
-                    buffer[(page_idx, video_idx)] = result_obj
-
-                    while True:
-                        if expected_page in page_videos_count and expected_video >= page_videos_count[expected_page]:
-                            expected_page += 1
-                            expected_video = 0
-                            continue
-
-                        if (expected_page, expected_video) in buffer:
-                            yield buffer.pop((expected_page, expected_video))
-                            expected_video += 1
-
-                        else:
-                            break
+        except * GeneratorExit as eg:
+            raise eg.exceptions[0] # Raise the Generator Exit so that the other processes can clean up
 
 
 class ScrapeResult:
@@ -401,7 +440,7 @@ class BaseCore:
         self.session: AsyncSession | None = None
         self.configuration = configuration
         self.cache = Cache(self.configuration)
-        self.logger = setup_logger("BASE API - [BaseCore]", log_file=None, level=logging.ERROR)
+        self.logger = configure_app_logging("BASE API - [BaseCore]", log_file=None, level=logging.ERROR)
         self.default_headers = {
             "User-Agent": UA_DESKTOP_CHROME,
             "Accept-Language": self.configuration.locale,
@@ -411,9 +450,9 @@ class BaseCore:
     def enable_logging(self, log_file: str | None = None, level: int = logging.DEBUG, log_ip:
     str | None = None, log_port: int | str | None = None) -> None:
         """Enables logging dynamically for this module."""
-        self.logger = setup_logger(name="BASE API - [BaseCore]", log_file=log_file, level=level, http_ip=log_ip,
+        self.logger = configure_app_logging("BASE API - [BaseCore]", log_file=log_file, level=level, http_ip=log_ip,
                                    http_port=log_port)
-        self.cache.logger = setup_logger(name="BASE API - [Cache]", log_file=log_file, level=level, http_ip=log_ip,
+        self.cache.logger = configure_app_logging("BASE API - [Cache]", log_file=log_file, level=level, http_ip=log_ip,
                                          http_port=log_port)
 
     def initialize_session(self) -> None:
