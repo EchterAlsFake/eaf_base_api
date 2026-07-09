@@ -678,6 +678,8 @@ class BaseCore:
 
                                             await asyncio.sleep(1.5)
                                             raise NetworkRequestError("Retrying request after solving challenge.")
+                                        except (NetworkRequestError, SecurityAbort):
+                                            raise
                                         except Exception as challenge_error:
                                             raise ChallengeMathError from challenge_error
 
