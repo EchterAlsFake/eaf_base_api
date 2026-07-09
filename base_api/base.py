@@ -639,7 +639,7 @@ class BaseCore:
                                             session.cookies.set("KEY", self.latest_key, domain=".pornhub.com", path="/")
 
                                         await asyncio.sleep(1.5)
-                                        continue
+                                        raise NetworkRequestError("Retrying request with the new cookie.")
 
                                     self.logger.info("Challenge page detected! Solving...")
                                     get_challenge = re.compile(r'go\(\).*?{(.*?)n=l.*?KEY.*?s\+":(\d+):', re.DOTALL)
@@ -677,7 +677,7 @@ class BaseCore:
                                                 pass
 
                                             await asyncio.sleep(1.5)
-                                            continue
+                                            raise NetworkRequestError("Retrying request after solving challenge.")
                                         except Exception as challenge_error:
                                             raise ChallengeMathError from challenge_error
 
