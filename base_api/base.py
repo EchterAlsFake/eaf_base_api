@@ -269,7 +269,7 @@ class Helper:
                     # speed by offloading it to another thread
 
                 except Exception as e:
-                    self.logger.error(f"Failed to fetch page: {e}")
+                    self.logger.error(f"Failed to fetch page: {e}", exc_info=True)
 
                     if on_page_error is not None or ignore_errors:
                         try:
@@ -284,7 +284,7 @@ class Helper:
                                     continue
 
                         except Exception as callback_error:
-                            self.logger.error(f"Error inside the provided callback: {callback_error}")
+                            self.logger.error(f"Error inside the provided callback: {callback_error}", exc_info=True)
                             raise CallbackError("""
     Warning: Your callback did not return True, because of that the failed video will NOT be appended to the queue
     and it will be skipped processing!""") from callback_error
@@ -338,7 +338,7 @@ class Helper:
                                     continue
 
                         except Exception as callback_error:
-                            self.logger.error(f"Error inside the provided callback: {callback_error}")
+                            self.logger.error(f"Error inside the provided callback: {callback_error}", exc_info=True)
                             raise CallbackError("""
     Warning: Your callback did not return True, because of that the failed video will NOT be appended to the queue
     and it will be skipped processing!""") from callback_error
@@ -415,7 +415,7 @@ class Helper:
                                 break
 
         except * GeneratorExit as eg:
-            raise eg.exceptions[0] # Raise the Generator Exit so that the other processes can clean up
+            raise eg.exceptions[0] from eg # Raise the Generator Exit so that the other processes can clean up
 
 
 class ScrapeResult:
@@ -753,15 +753,15 @@ class BaseCore:
 
                     except RequestsError as e:
                         err_str = str(e).lower()
-                        self.logger.error("Request error for URL %s: %s", url, e)
+                        self.logger.error("Request error for URL %s: %s", url, e, exc_info=True)
                         if "certificate verify failed" in err_str:
-                            raise ProxySSLError("Proxy has an invalid SSL certificate, set 'verify = False' in config")
+                            raise ProxySSLError("Proxy has an invalid SSL certificate, set 'verify = False' in config") from e
                         elif "cookie conflict" in err_str:
                             raise UnknownError(f"Cookie conflict during request to {url}: {e}") from e
                         elif "proxy" in err_str:
                             raise InvalidProxy("Proxy error when trying a request, aborting!") from e
                         elif "timeout" in err_str or "read" in err_str:
-                            self.logger.error("Timeout for URL %s: %s", url, e)
+                            self.logger.error("Timeout for URL %s: %s", url, e, exc_info=True)
                         raise
                     except (RequestsError, NetworkRequestError, ResourceGone):
                         raise
@@ -780,7 +780,7 @@ class BaseCore:
                 try:
                     last_resp.raise_for_status()
                 except Exception as e:
-                    raise e
+                    raise e from re_err
             raise UnknownError(
                 f"Failed to fetch: {url} after {max_retries} attempts. "
                 "If you're sure you're not blocked and your connection is stable, "
@@ -1216,7 +1216,7 @@ a new Python file, import only m3u8 and see what error you get.
                                     if is_success and segment_data:
                                         return idx, True, segment_data
                                 except Exception as exception:
-                                    self.logger.error(f"Worker exception for segment {idx}: {exception}")
+                                    self.logger.error(f"Worker exception for segment {idx}: {exception}", exc_info=True)
 
                                 if attempt < max_seg_retries:
                                     self.logger.warning(
@@ -1488,9 +1488,9 @@ a new Python file, import only m3u8 and see what error you get.
             from av.audio.resampler import AudioResampler  # type: ignore[import-not-found]
             import av.audio.frame  # Used for runtime isinstance check
         except (ModuleNotFoundError, ImportError) as e:
-            self.logger.error("PyAV import failed for remux: %s", e)
+            self.logger.error("PyAV import failed for remux: %s", e, exc_info=True)
             raise ModuleNotFoundError(
-                f"PyAV is required for remuxing. Install with pip install av. Not supported on Termux! {e}")
+                f"PyAV is required for remuxing. Install with pip install av. Not supported on Termux! {e}") from e
 
         self.logger.debug("Opening input for remux: %s", input_path)
         input_ = av_open(input_path)
@@ -1762,7 +1762,7 @@ allow_multipart=%s""", url, path, max_retries, read_timeout, bool(stop_event and
                             chunk_progress[chunk_idx_now] = 0
                             await asyncio.sleep(1 * attempt_chunk)
                         else:
-                            self.logger.error("Chunk %s permanently failed: %s", chunk_idx_now, exc)
+                            self.logger.error("Chunk %s permanently failed: %s", chunk_idx_now, exc, exc_info=True)
                             return False
                 return False
 
@@ -1866,16 +1866,16 @@ allow_multipart=%s""", url, path, max_retries, read_timeout, bool(stop_event and
                     backoff = min(2 ** attempt, 30)
                     self.logger.warning("Read timeout; retrying %s/%s in %s", attempt, max_retries,  backoff)
                     if stop_event is not None and stop_event.wait(backoff):
-                        raise DownloadCancelled("Download cancelled.")
+                        raise DownloadCancelled("Download cancelled.") from e
                     else:
                         await asyncio.sleep(backoff)
                     continue
                 else:
-                    raise NetworkRequestError(f"Stream for: {url} was closed or failed: {e}")
+                    raise NetworkRequestError(f"Stream for: {url} was closed or failed: {e}") from e
             except DownloadCancelled:
                 raise
-            except Exception:
+            except Exception as exc:
                 error = traceback.format_exc()
-                raise NetworkRequestError(f"Unknown error for: {url} -->: {error}")
+                raise NetworkRequestError(f"Unknown error for: {url} -->: {error}") from exc
 
         return False
