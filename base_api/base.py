@@ -262,12 +262,19 @@ class Helper:
                 try:
                     self.logger.debug(f"Fetching Page HTML: {page_url}")
                     html_content = await fetch_page(page_url)
+
+                    if isinstance(html_content, Response):
+                        if html_content.status_code == 404:
+                            raise NoPageLeft("No pages left, exiting...")
+
                     extracted_videos = await asyncio.to_thread(video_link_extractor, html_content)
                     page_videos_count[page_index] = len(extracted_videos)
                     # When we pass the HTML content to the extractor so that bs4 can extract it, it will take a minimum time
                     # of like 20ms. This would block our event loop and prevent new network requests, so this optimizes the
                     # speed by offloading it to another thread
 
+                except NoPageLeft:
+                    raise
                 except Exception as e:
                     self.logger.error(f"Failed to fetch page: {e}", exc_info=True)
 
@@ -355,9 +362,15 @@ class Helper:
                 await page_queue.put((index, url, 1))
 
         async def worker_supervisor():
-            await page_queue.join()
-            await video_queue.join()
-            await results_queue.put(None)
+            try:
+                await page_queue.join()
+                await video_queue.join()
+
+            except asyncio.CancelledError:
+                raise
+
+            finally:
+                await results_queue.put(None)
 
         try:
             async with asyncio.TaskGroup() as tg:
@@ -414,9 +427,11 @@ class Helper:
                             else:
                                 break
 
-        except * GeneratorExit as eg:
+        except* GeneratorExit as eg:
             raise eg.exceptions[0] from eg # Raise the Generator Exit so that the other processes can clean up
 
+        except* NoPageLeft as eg:
+            pass
 
 class ScrapeResult:
     def __init__(self, url: str):
