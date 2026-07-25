@@ -269,12 +269,23 @@ class Helper:
 
                     extracted_videos = await asyncio.to_thread(video_link_extractor, html_content)
                     page_videos_count[page_index] = len(extracted_videos)
+                    if len(extracted_videos) == 0:
+                        raise NoPageLeft("No videos extracted, assuming end of pagination...")
                     # When we pass the HTML content to the extractor so that bs4 can extract it, it will take a minimum time
                     # of like 20ms. This would block our event loop and prevent new network requests, so this optimizes the
                     # speed by offloading it to another thread
 
                 except NoPageLeft:
-                    raise
+                    if not task_cleared:
+                        page_videos_count[page_index] = 0
+                        # Prune the page queue to avoid useless requests for remaining pages
+                        while not page_queue.empty():
+                            try:
+                                pruned_item = page_queue.get_nowait()
+                                page_videos_count[pruned_item[0]] = 0
+                                page_queue.task_done()
+                            except asyncio.QueueEmpty:
+                                break
                 except Exception as e:
                     self.logger.error(f"Failed to fetch page: {e}", exc_info=True)
 
