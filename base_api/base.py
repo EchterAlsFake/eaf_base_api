@@ -238,6 +238,10 @@ class Helper:
         page_queue = asyncio.Queue()  # Stores the page URLs in a queue to apply retry logic later
         results_queue = asyncio.Queue()  # This is the queue that stores the actual videos
         page_videos_count: dict[int, int] = {} # This stores information about the order
+        _DONE = object()
+
+        for index, url in enumerate(target_page_urls):
+            page_queue.put_nowait((index, url, 1))
 
         async def fetch_page(url: str) -> str:
             """
@@ -376,73 +380,79 @@ class Helper:
             try:
                 await page_queue.join()
                 await video_queue.join()
-
-            except asyncio.CancelledError:
-                raise
-
             finally:
                 await results_queue.put(None)
 
-        try:
-            async with asyncio.TaskGroup() as tg:
-                fill_page_queue = tg.create_task(create_page_queue())
-                page_tasks = [tg.create_task(page_worker()) for _ in range(max_page_concurrency)]
-                video_workers = [tg.create_task(video_worker()) for _ in range(max_video_concurrency)]
-                supervisor = tg.create_task(worker_supervisor())
+        async with asyncio.TaskGroup() as tg:
+            page_tasks = [
+                tg.create_task(page_worker(), name=f"page-worker-{index}")
+                for index in range(max_page_concurrency)
+            ]
+            video_workers = [
+                tg.create_task(video_worker(), name=f"video-worker-{index}")
+                for index in range(max_video_concurrency)
+            ]
+            supervisor = tg.create_task(
+                worker_supervisor(),
+                name="scrape-supervisor",
+            )
 
-                expected_page = 0
-                expected_video = 0
-                buffer = {}
+            expected_page = 0
+            expected_video = 0
+            buffer: dict[tuple[int, int], ScrapeResult] = {}
 
+            try:
                 while True:
                     result_item = await results_queue.get()
-                    if result_item is None:
-                        for task in page_tasks + video_workers:
-                            task.cancel()
 
+                    if result_item is _DONE:
                         if keep_original_order:
                             while True:
-                                if expected_page in page_videos_count and expected_video >= page_videos_count[
-                                    expected_page]:
+                                while (expected_page in page_videos_count and expected_video >= page_videos_count[expected_page]
+                                ):
                                     expected_page += 1
                                     expected_video = 0
-                                    continue
 
-                                if (expected_page, expected_video) in buffer:
-                                    yield buffer.pop((expected_page, expected_video))
-                                    expected_video += 1
-
-
-                                else:
+                                key = (expected_page, expected_video)
+                                if key not in buffer:
                                     break
+
+                                yield buffer.pop(key)
+                                expected_video += 1
 
                         break
 
                     page_idx, video_idx, result_obj = result_item
+
                     if not keep_original_order:
                         yield result_obj
+                        continue
 
-                    else:
-                        buffer[(page_idx, video_idx)] = result_obj
+                    buffer[(page_idx, video_idx)] = result_obj
 
-                        while True:
-                            if expected_page in page_videos_count and expected_video >= page_videos_count[expected_page]:
-                                expected_page += 1
-                                expected_video = 0
-                                continue
+                    while True:
+                        while (expected_page in page_videos_count and expected_video >= page_videos_count[expected_page]
+                        ):
+                            expected_page += 1
+                            expected_video = 0
 
-                            if (expected_page, expected_video) in buffer:
-                                yield buffer.pop((expected_page, expected_video))
-                                expected_video += 1
+                        key = (expected_page, expected_video)
+                        if key not in buffer:
+                            break
 
-                            else:
-                                break
+                        yield buffer.pop(key)
+                        expected_video += 1
 
-        except* GeneratorExit as eg:
-            raise eg.exceptions[0] from eg # Raise the Generator Exit so that the other processes can clean up
+            finally:
+                # Covers normal completion, consumer break, cancellation and aclose().
+                supervisor.cancel()
 
-        except* NoPageLeft as eg:
-            pass
+                for task in page_tasks:
+                    task.cancel()
+
+                for task in video_workers:
+                    task.cancel()
+
 
 class ScrapeResult:
     def __init__(self, url: str):
