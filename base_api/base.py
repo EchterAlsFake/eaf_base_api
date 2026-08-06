@@ -498,9 +498,9 @@ class BaseCore:
         if self.configuration.dns_over_https:
             curl_options[CurlOpt.DOH_URL] = str(self.configuration.dns_over_https).encode("utf-8")
 
-        proxies = None
-        if self.configuration.proxies:
-            proxies = self.configuration.proxies
+        proxy = None
+        if self.configuration.proxy:
+            proxy = self.configuration.proxy
 
         if self.configuration.max_bandwidth_mb is not None and self.configuration.max_bandwidth_mb > 0:
             global_limit_bytes = int(self.configuration.max_bandwidth_mb * 1024 * 1024)
@@ -521,7 +521,8 @@ class BaseCore:
             p_auth = (u, p)
 
         self.session = cast(Any, AsyncSession)(
-            proxies=proxies,
+            interface=self.configuration.interface,
+            proxy=proxy,
             timeout=self.configuration.timeout,
             verify=verify,
             impersonate=impersonation,

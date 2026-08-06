@@ -27,5 +27,5 @@ I can recommend everyone the download functions for HLS streaming since, for exa
 optimized. If you just use mine, you need to consume less caffeine and brain cells to make such a function :)
 
 # License
-Licensed under The [LGPLv3](https://www.gnu.org/licenses/lgpl-3.0.en.html) license.
-<br>Copyright (C) 2024-2025 Johannes Habel
+Licensed under The [AGPLv3](https://opensource.org/license/agpl-3-0) license.
+<br>Copyright (C) 2024-2026 Johannes Habel

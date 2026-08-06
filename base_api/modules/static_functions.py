@@ -2,6 +2,8 @@ import os
 import re
 import math
 import json
+import unicodedata
+from pathlib import PurePath
 from .type_hints import DownloadState
 from datetime import timezone, datetime
 from curl_cffi.requests import Response
@@ -432,31 +434,49 @@ def log_precondition_failed(logger, response: Response, attempt: int) -> None:
     )
 
 
-def strip_title(title: str, max_length: int = 255) -> str:
-    """
-    Sanitize a filename to be safe across Windows, macOS, Linux, and Android.
-    Replaces or strips illegal characters and trims to a safe length.
-    """
+def strip_title(
+    title: str, max_length: int = 255, default_name: str = "untitled"
+) -> str:
+    """Sanitize a filename to be safe across Windows, macOS, Linux, and Android.
 
-    # Reserved characters on Windows + `/` for Unix/macOS
+    Prevents path traversal, replaces illegal characters, handles Windows reserved
+    names, and trims to a safe length.
+    """
+    if not title:
+        return default_name
+
+    # 1. Normalize Unicode (converts full-width slashes/characters to standard ASCII where applicable)
+    sanitized = unicodedata.normalize("NFKC", title)
+
+    # 2. Extract only the filename component (strips drive letters & path prefixes)
+    sanitized = PurePath(sanitized).name
+
+    # 3. Replace illegal filename characters & explicit path separators with underscores
     illegal_chars = r'[<>:"/\\|?*\x00-\x1F]'
-    sanitized = re.sub(illegal_chars, "_", title)
+    sanitized = re.sub(illegal_chars, "_", sanitized)
 
-    # Strip invisible zero-width characters
-    sanitized = re.sub(r'[\u200B-\u200D\uFEFF]', '', sanitized)
+    # 4. Strip invisible zero-width & non-printable Unicode control characters
+    sanitized = re.sub(r"[\u200B-\u200D\uFEFF]", "", sanitized)
 
-    # Strip trailing periods or spaces (Windows)
-    sanitized = sanitized.rstrip(" .")
+    # 5. Strip LEADING and TRAILING spaces and dots
+    # (Prevents '.' and '..' traversal tokens and hidden files)
+    sanitized = sanitized.strip(" .")
 
-    # Prevent reserved Windows filenames
+    # 6. Prevent Windows reserved filenames (CON, PRN, AUX, NUL, COM1-9, LPT1-9)
     reserved_names = {
-        "CON", "PRN", "AUX", "NUL",
+        "CON",
+        "PRN",
+        "AUX",
+        "NUL",
         *(f"COM{i}" for i in range(1, 10)),
         *(f"LPT{i}" for i in range(1, 10)),
     }
-    name_only = sanitized.split('.')[0].upper()
+    name_only = sanitized.split(".")[0].upper()
     if name_only in reserved_names:
         sanitized = f"_{sanitized}"
 
-    # Trim to max length
-    return sanitized[:max_length]
+    # 7. Trim to max length, then re-strip trailing dots/spaces in case the slice cut mid-string
+    sanitized = sanitized[:max_length].rstrip(" .")
+
+    # 8. Return default fallback if sanitization leaves an empty string
+    return sanitized if sanitized else default_name

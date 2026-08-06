@@ -18,8 +18,8 @@ class RuntimeConfig:
         self.request_delay: int = 0
         self.timeout: int = 20
         self.max_bandwidth_mb: float| None = None # Set speed limit in megabytes per second e.g, 2.0, 3.5 etc...
-        self.proxies: Dict[str, str] | None = None
-        self.http_version: str = "v3" # "v3 = HTTP/3.0, v2 = HTTP/2.0, v1 = HTTP/1.1
+        self.proxy = None
+        self.http_version: str = "v2" # "v3 = HTTP/3.0, v2 = HTTP/2.0, v1 = HTTP/1.1
         self.dns_over_https: str | None = None
         self.impersonation: str = "chrome"
         self.custom_ja3: str | None = None # Absolutely only for advanced users, research before you use this!!!
@@ -31,6 +31,7 @@ class RuntimeConfig:
         self.max_workers_download: int = 20
         self.videos_concurrency: int = 5
         self.pages_concurrency: int = 2
+        self.interface: str | None = None # IP Address of the network interface you want to bind to
 
 
 @dataclass
