@@ -79,9 +79,21 @@ class HTTPStatusError(BaseScraperError):
 
 
 class RateLimitError(HTTPStatusError):
-    def __init__(self, message: str, url: str, retry_after: int = 0):
+    def __init__(self, message: str, url: str, retry_after: float | None = None):
         super().__init__(message, 429, url)
         self.retry_after = retry_after
+
+
+class RequestRetriesExhausted(NetworkRequestError):
+    """Raised after a retryable request consumes its complete attempt budget."""
+
+    def __init__(self, url: str, attempts: int, last_error: Exception) -> None:
+        self.url = url
+        self.attempts = attempts
+        self.last_error = last_error
+        super().__init__(
+            f"Request to {url} failed after {attempts} attempts: {last_error}"
+        )
 
 
 class ProxySSLError(Exception):

@@ -4,6 +4,34 @@ Version 4 intentionally has no compatibility layer for the old `BaseMedia` flags
 or TaskGroup-based Helper implementation. This guide uses the structure of
 `unofficial-api-for-pornhub` as the concrete example.
 
+## HTTP request API
+
+The multi-mode `BaseCore.fetch()` method was removed. Replace it according to the
+representation the caller needs:
+
+| Old call | Replacement |
+| --- | --- |
+| `fetch(url)` | `fetch_text(url)` |
+| `fetch(url, get_bytes=True)` | `fetch_bytes(url)` |
+| `fetch(url, get_response=True)` | `request(url)` |
+| `fetch(url, save_cache=False)` | `fetch_text(url, cache_policy=CachePolicy.BYPASS)` |
+
+Use `CachePolicy.REFRESH` to force a network request and store its result. POST and
+PATCH requests are not cached or retried by default; pass
+`retry_non_idempotent=True` only when replaying the operation is safe. Prefer
+`async with BaseCore() as core` or call `await core.close()` explicitly.
+
+The request/cache configuration names now describe their units and semantics:
+
+| Removed setting | Replacement |
+| --- | --- |
+| `max_cache_items` | `response_cache_size_bytes` and `segment_cache_size_bytes` |
+| `max_retries` | `request_attempts` |
+
+TTL and retry timing are configured with `response_cache_ttl`,
+`segment_cache_ttl`, `request_retry_initial_delay`,
+`request_retry_max_delay`, and `request_retry_jitter`.
+
 ## 1. Update imports
 
 Import the field declaration, scheduling, retry, and error-policy types used by

@@ -2,6 +2,7 @@ from __future__ import annotations
 import re
 import os
 import time
+import hashlib
 import string
 import shutil
 import random
@@ -19,10 +20,11 @@ from dataclasses import MISSING, dataclass, field, fields
 from curl_cffi import CurlOpt # Used for DNS over HTTPS
 from curl_cffi.requests.errors import RequestsError
 from curl_cffi.requests import AsyncSession, Response
-from tenacity import AsyncRetrying, stop_after_attempt, wait_exponential_jitter, retry_if_exception_type, RetryError
+from cachetools import TTLCache
+from tenacity import AsyncRetrying, stop_after_attempt, wait_exponential_jitter, retry_if_exception, RetryError
 from typing import (
     Union, Callable, Tuple, AsyncGenerator, ClassVar, Generic, TypeVar,
-    cast, List, Dict, Any, Awaitable, Self, TYPE_CHECKING,
+    cast, List, Dict, Any, Awaitable, Self, TYPE_CHECKING, Protocol,
 )
 
 
@@ -67,55 +69,137 @@ UA_DESKTOP_CHROME = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.
 REGEX_CHALLENGE = re.compile(r'var p=(\d+); var s=(\d+);.*?(\d+):1;', re.DOTALL)
 
 
-class Cache:
-    """
-    Caches content from network requests
-    """
+class CachePolicy(StrEnum):
+    """Control whether a text request reads from or writes to the cache."""
+
+    USE = "use"
+    BYPASS = "bypass"
+    REFRESH = "refresh"
+
+
+@dataclass(frozen=True, slots=True)
+class RequestCacheKey:
+    """Identity of a cacheable HTTP request without retaining credentials."""
+
+    method: str
+    url: str
+    allow_redirects: bool
+    params_fingerprint: str
+    body_fingerprint: str
+    headers_fingerprint: str
+    cookies_fingerprint: str
+
+
+@dataclass(frozen=True, slots=True)
+class SegmentCacheKey:
+    master_url: str
+    quality: str
+
+
+class CacheBackend(Protocol):
+    """Storage contract consumed by :class:`BaseCore`."""
+
+    def get_response(self, key: RequestCacheKey) -> str | None: ...
+    def set_response(self, key: RequestCacheKey, content: str) -> None: ...
+    def delete_response(self, key: RequestCacheKey) -> None: ...
+    def invalidate_url(self, url: str) -> None: ...
+    def get_segments(self, key: SegmentCacheKey) -> list[str] | None: ...
+    def set_segments(self, key: SegmentCacheKey, segments: Sequence[str]) -> None: ...
+
+
+def _text_size(value: str) -> int:
+    return len(value.encode("utf-8"))
+
+
+def _segments_size(value: tuple[str, ...]) -> int:
+    return sum(len(segment.encode("utf-8")) for segment in value)
+
+
+def _freeze_cache_value(value: Any) -> Any:
+    """Convert common request values into a deterministic, hashable structure."""
+    if isinstance(value, Mapping):
+        items = (
+            (_freeze_cache_value(key), _freeze_cache_value(item))
+            for key, item in value.items()
+        )
+        return tuple(sorted(items, key=repr))
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_cache_value(item) for item in value)
+    if isinstance(value, (set, frozenset)):
+        return tuple(sorted((_freeze_cache_value(item) for item in value), key=repr))
+    if isinstance(value, bytearray):
+        return bytes(value)
+    if value is None or isinstance(value, (str, bytes, int, float, bool)):
+        return value
+    return repr(value)
+
+
+def _cache_fingerprint(value: Any) -> str:
+    frozen = _freeze_cache_value(value)
+    return hashlib.sha256(repr(frozen).encode("utf-8")).hexdigest()
+
+
+class Cache(CacheBackend):
+    """Thread-safe, bounded TTL caches for text responses and HLS segments."""
 
     def __init__(self, configuration: "RuntimeConfig") -> None:
-        self.cache_dictionary: Dict[str, Any] = {}
-        self.lock = threading.Lock()
-        self.logger = configure_app_logging("BASE API - [Cache]", level=logging.CRITICAL)
-        self.configuration = configuration
+        self._responses: TTLCache[RequestCacheKey, str] = TTLCache(
+            maxsize=max(1, configuration.response_cache_size_bytes),
+            ttl=configuration.response_cache_ttl,
+            getsizeof=_text_size,
+        )
+        self._segments: TTLCache[SegmentCacheKey, tuple[str, ...]] = TTLCache(
+            maxsize=max(1, configuration.segment_cache_size_bytes),
+            ttl=configuration.segment_cache_ttl,
+            getsizeof=_segments_size,
+        )
+        self._responses_enabled = configuration.response_cache_size_bytes > 0
+        self._segments_enabled = configuration.segment_cache_size_bytes > 0
+        self.lock = threading.RLock()
 
-    def enable_logging(self, log_file: str | None = None, level: int = logging.DEBUG,
-                       log_ip: str | None = None, log_port: str | int | None = None) -> None:
-        """
-        Enables logging dynamically for this module.
-        """
-        self.logger = configure_app_logging("BASE API - [Cache]", log_file=log_file, level=level,
-                                   http_ip=log_ip, http_port=log_port)
-
-    def handle_cache(self, url: str | None) -> Any:
-        if url is None:
+    def get_response(self, key: RequestCacheKey) -> str | None:
+        if not self._responses_enabled:
             return None
-
         with self.lock:
-            content = self.cache_dictionary.get(url, None)
-            return content
+            return self._responses.get(key)
 
-    def save_cache(self, url: str, content: Any) -> None:
+    def set_response(self, key: RequestCacheKey, content: str) -> None:
+        if not self._responses_enabled or _text_size(content) > self._responses.maxsize:
+            return
         with self.lock:
-            if len(self.cache_dictionary.keys()) >= self.configuration.max_cache_items:
-                first_key = next(iter(self.cache_dictionary))
-                # Delete the first item
-                del self.cache_dictionary[first_key]
-                self.logger.info("Deleting: %s from cache, due to caching limits...", first_key)
+            self._responses[key] = content
 
-            self.cache_dictionary[url] = content
-
-    def save_segments_to_cache(self, m3u8_url: str, segments: List[Any]) -> None:
+    def delete_response(self, key: RequestCacheKey) -> None:
         with self.lock:
-            self.cache_dictionary[m3u8_url] = segments
+            self._responses.pop(key, None)
 
-    def get_segments_from_cache(self, m3u8_url: str) -> List[str] | None:
+    def invalidate_url(self, url: str) -> None:
         with self.lock:
-            segments = self.cache_dictionary.get(m3u8_url, None)
-            return segments
+            for key in tuple(self._responses):
+                if key.url == url:
+                    self._responses.pop(key, None)
 
-    def delete_cache(self, entry: str) -> None:
+    def get_segments(self, key: SegmentCacheKey) -> list[str] | None:
+        if not self._segments_enabled:
+            return None
         with self.lock:
-            self.cache_dictionary.pop(entry)
+            segments = self._segments.get(key)
+            return list(segments) if segments is not None else None
+
+    def set_segments(self, key: SegmentCacheKey, segments: Sequence[str]) -> None:
+        frozen_segments = tuple(segments)
+        if (
+            not self._segments_enabled
+            or _segments_size(frozen_segments) > self._segments.maxsize
+        ):
+            return
+        with self.lock:
+            self._segments[key] = frozen_segments
+
+    def clear(self) -> None:
+        with self.lock:
+            self._responses.clear()
+            self._segments.clear()
 
 
 _MEDIA_SOURCES_KEY = "eaf_base_api.load_sources"
@@ -1202,7 +1286,7 @@ class Helper(Generic[MediaT]):
     ) -> _PageOutcome[MediaT]:
         async def operation() -> tuple[_ItemJob, ...]:
             self.logger.debug("Fetching page %s: %s", job.index, job.url)
-            content = await self.core.fetch(job.url, method=request_method)
+            content = await self.core.fetch_text(job.url, method=request_method)
 
             def extract_all() -> tuple[Mapping[str, Any], ...]:
                 extracted = item_extractor(content)
@@ -1429,16 +1513,23 @@ class BaseCore:
     """
     The base class which has all necessary functions for other API packages
     """
-    def __init__(self, configuration: "RuntimeConfig" = config) -> None:
+    def __init__(
+        self,
+        configuration: "RuntimeConfig" = config,
+        *,
+        cache: CacheBackend | None = None,
+    ) -> None:
         self.lock = asyncio.Lock()
         self._delay_lock = asyncio.Lock()
+        self._cache_flight_lock = asyncio.Lock()
+        self._inflight_text_requests: dict[RequestCacheKey, asyncio.Future[str]] = {}
         self.latest_key: str | None = None
         self.latest_key_time: float = 0.0
-        self.last_request_time = time.time()
+        self.last_request_time: float | None = None
         self.total_requests: int = 0  # Tracks how many requests have been made
         self.session: AsyncSession | None = None
         self.configuration = configuration
-        self.cache = Cache(self.configuration)
+        self.cache = cache if cache is not None else Cache(self.configuration)
         self.logger = configure_app_logging("BASE API - [BaseCore]", log_file=None, level=logging.ERROR)
         self.default_headers = {
             "User-Agent": UA_DESKTOP_CHROME,
@@ -1446,13 +1537,25 @@ class BaseCore:
             "Accept-Encoding": "gzip, deflate, br"
         }
 
+    async def __aenter__(self) -> Self:
+        if self.session is None:
+            self.initialize_session()
+        return self
+
+    async def __aexit__(self, *_: object) -> None:
+        await self.close()
+
+    async def close(self) -> None:
+        """Close the owned HTTP session and allow the core to be reused later."""
+        session, self.session = self.session, None
+        if session is not None:
+            await session.close()
+
     def enable_logging(self, log_file: str | None = None, level: int = logging.DEBUG, log_ip:
     str | None = None, log_port: int | str | None = None) -> None:
         """Enables logging dynamically for this module."""
         self.logger = configure_app_logging("BASE API - [BaseCore]", log_file=log_file, level=level, http_ip=log_ip,
                                    http_port=log_port)
-        self.cache.logger = configure_app_logging("BASE API - [Cache]", log_file=log_file, level=level, http_ip=log_ip,
-                                         http_port=log_port)
 
     def initialize_session(self) -> None:
         verify = self.configuration.verify_ssl
@@ -1504,13 +1607,19 @@ class BaseCore:
         delay = self.configuration.request_delay
         if delay and delay > 0:
             async with self._delay_lock:
-                time_since_last_request = time.time() - self.last_request_time
-                self.logger.debug("Time since last request: {:.2f} seconds.".format(time_since_last_request))
+                now = time.monotonic()
+                if self.last_request_time is None:
+                    self.last_request_time = now
+                    return
+                time_since_last_request = now - self.last_request_time
+                self.logger.debug(
+                    "Time since last request: %.2f seconds.", time_since_last_request
+                )
                 if time_since_last_request < delay:
                     sleep_time = delay - time_since_last_request
-                    self.logger.debug("Enforcing delay of {:.2f} seconds.".format(sleep_time))
+                    self.logger.debug("Enforcing delay of %.2f seconds.", sleep_time)
                     await asyncio.sleep(sleep_time)
-                self.last_request_time = time.time()
+                self.last_request_time = time.monotonic()
 
     def _merged_headers(self, override: Dict[str, str] | None) -> Dict[str, Any]:
         """
@@ -1537,13 +1646,11 @@ class BaseCore:
             cookies.update(override)
         return cookies
 
-    async def fetch(
+    async def request(
         self,
         url: str,
-        get_bytes: bool = False,
-        timeout: int | None = None,
-        get_response: bool = False,
-        save_cache: bool = True,
+        *,
+        timeout: float | None = None,
         cookies: Dict[str, str] | None = None,
         allow_redirects: bool = True,
         data: Dict[str, Any] | None = None,
@@ -1551,38 +1658,55 @@ class BaseCore:
         headers: Dict[str, str] | None = None,
         json_data: Dict[str, Any] | None = None,
         params: Dict[str, Any] | None = None,
-    ) -> bytes | str | Response:
+        retry_non_idempotent: bool = False,
+    ) -> Response:
         """
-        Fetch content with retries, optional caching, proxy support, and bandwidth limiting.
-        Now uses Tenacity for robust retry logic.
+        Execute an HTTP request and return a successful response.
+
+        Network failures, HTTP 408/425/429, and 5xx responses are retried for
+        idempotent methods. Retrying a non-idempotent method requires an explicit
+        opt-in because the server may already have applied the request.
         """
         if self.session is None:
             self.initialize_session()
         session = self.session
         assert session is not None
 
-        # Cache (only for text mode)
-        cache_hit = self.cache.handle_cache(url)
-        if cache_hit is not None and not get_bytes and not get_response:
-            self.logger.info("Fetched content for: %s from cache!", url)
-            return cache_hit
+        request_method = method.upper()
+        req_timeout = timeout if timeout is not None else self.configuration.timeout
+        max_attempts = max(1, int(self.configuration.request_attempts))
+        method_is_retryable = request_method in {
+            "GET", "HEAD", "PUT", "DELETE", "OPTIONS", "TRACE"
+        } or retry_non_idempotent
 
-        req_timeout = timeout or self.configuration.timeout
-        max_retries = max(1, int(self.configuration.max_retries))
+        def should_retry(error: BaseException) -> bool:
+            if not method_is_retryable:
+                return False
+            if isinstance(error, (RequestsError, NetworkRequestError)):
+                return True
+            return isinstance(error, HTTPStatusError) and (
+                error.status_code in {408, 425, 429}
+                or 500 <= error.status_code < 600
+            )
 
-        # We will use AsyncRetrying for the core retry logic
-        retryer = AsyncRetrying(
-            stop=stop_after_attempt(max_retries),
-            wait=wait_exponential_jitter(initial=0.5, max=30.0, jitter=0.5),
-            retry=retry_if_exception_type((RequestsError, NetworkRequestError)),
-            reraise=True
+        exponential_wait = wait_exponential_jitter(
+            initial=self.configuration.request_retry_initial_delay,
+            max=self.configuration.request_retry_max_delay,
+            jitter=self.configuration.request_retry_jitter,
         )
 
-        # Track state that changes across retries
-        state = {
-            "last_response": None,
-            "ua_switched": False
-        }
+        def retry_wait(retry_state: Any) -> float:
+            error = retry_state.outcome.exception() if retry_state.outcome else None
+            if isinstance(error, RateLimitError) and error.retry_after is not None:
+                return max(0.0, error.retry_after)
+            return cast(float, exponential_wait(retry_state))
+
+        retryer = AsyncRetrying(
+            stop=stop_after_attempt(max_attempts),
+            wait=retry_wait,
+            retry=retry_if_exception(should_retry),
+            reraise=False,
+        )
 
         try:
             async for attempt in retryer:
@@ -1590,24 +1714,17 @@ class BaseCore:
                     try:
                         await self.enforce_delay()
                         req_headers = self._merged_headers(headers)
-                        if state["ua_switched"]:
-                            req_headers["User-Agent"] = "AppleWebKit/537.36 (KHTML, like Gecko)"
-                            
                         req_cookies = self._merged_cookies(cookies)
                         
-                        if isinstance(self.configuration.max_bandwidth_mb, int):
-                            speed_limit = self.configuration.max_bandwidth_mb * 1024 * 1024
-                        else:
-                            speed_limit = None
-
-                        current_time = asyncio.get_event_loop().time()
+                        current_time = asyncio.get_running_loop().time()
                         latest_key = self.latest_key
                         if "KEY" not in session.cookies and latest_key is not None:
                             if current_time - self.latest_key_time < 10:
                                 session.cookies.set("KEY", latest_key, domain=".pornhub.com", path="/")
 
+                        self.total_requests += 1
                         response = await cast(Any, session).request(
-                            method=cast(Any, method),
+                            method=cast(Any, request_method),
                             url=url,
                             timeout=req_timeout,
                             allow_redirects=allow_redirects,
@@ -1616,15 +1733,12 @@ class BaseCore:
                             params=params,
                             headers=req_headers,
                             cookies=req_cookies,
-                            max_recv_speed=speed_limit or 0,
                         )
 
-                        state["last_response"] = response
-                        self.total_requests += 1
                         status = response.status_code
 
                         content_type = response.headers.get("content-type", "").lower()
-                        is_html = "text/html" in content_type if content_type else (not get_bytes)
+                        is_html = "text/html" in content_type if content_type else True
 
                         if is_html:
                             enc = getattr(response, "encoding", None) or "utf-8"
@@ -1667,12 +1781,12 @@ class BaseCore:
                                             cookie_value = f'{n}*{p // n}:{s}:{token_str}:1'
 
                                             self.latest_key = cookie_value
-                                            self.latest_key_time = asyncio.get_event_loop().time()
+                                            self.latest_key_time = asyncio.get_running_loop().time()
                                             session.cookies.set("KEY", cookie_value, domain=".pornhub.com", path="/")
                                             self.logger.info("RESOLVED CHALLENGE! Injected cookie: %s", cookie_value)
 
                                             try:
-                                                self.cache.delete_cache(url)
+                                                self.cache.invalidate_url(url)
                                             except (KeyError, Exception):
                                                 pass
 
@@ -1689,67 +1803,40 @@ class BaseCore:
                                         raise ChallengeRegexError("Detected Challenge, but regex couldn't extract, report this!")
 
 
-                        if status == 200:
+                        if 200 <= status < 300:
                             self.logger.debug("Successfully fetched URL: %s", url)
-                            if get_response:
-                                return response
-                            raw_content = response.content
-                            if get_bytes:
-                                content = raw_content
-                            else:
-                                enc = getattr(response, "encoding", None) or "utf-8"
-                                try:
-                                    content = cast(bytes, raw_content).decode(enc, errors="strict")
-                                except UnicodeDecodeError:
-                                    self.logger.warning("Content could not be decoded as %s (%s), decoding 'latin1' instead!", enc, url)
-                                    content = cast(bytes, raw_content).decode("latin1", errors="replace")
-                                if save_cache:
-                                    self.cache.save_cache(url, content)
-                            return content
+                            return response
 
-                        elif status == 204:
-                            return response # No content left
-
-                        if status == 403:
+                        if status in {401, 403}:
                             raise AccessDeniedError("Request blocked by server!")
 
                         if status == 412:
                             log_precondition_failed(logger=self.logger, attempt=attempt.retry_state.attempt_number, response=response)
 
-                        if status == 404:
-                            return response
-
                         if status == 410:
                             raise ResourceGone(f"Resource gone (HTTP 410) for URL: {url}")
 
                         if status == 429:
-                            wait = parse_retry_after(logger=self.logger, response=response)
-                            if wait is not None:
-                                self.logger.warning(f"Rate limited (429). Server requested {wait}s pause.")
-                                await asyncio.sleep(wait)
-
-                            else:
-                                delay = random.randint(2, 6)
-
+                            retry_after = parse_retry_after(
+                                logger=self.logger, response=response
+                            )
+                            if retry_after is not None:
                                 self.logger.warning(
-                                    f"Rate limited (429). No header found. Backing off {delay}s.")
-                                await asyncio.sleep(delay)
-
-                            if attempt.retry_state.attempt_number <= 2:
-                                raise RateLimitError("429 Rate Limited", retry_after=delay, url=url)
-
-                            continue
-
-                        if status == 401:
-                            return response # Expected (for Vinted OSINT script I use)
+                                    "Rate limited (429). Server requested %ss pause.",
+                                    retry_after,
+                                )
+                            raise RateLimitError(
+                                "429 Rate Limited", retry_after=retry_after, url=url
+                            )
 
                         if 500 <= status < 600:
                             self.logger.warning("Server error %s on %s. Retrying...", status, url)
                             raise HTTPStatusError(f"Server error {status}", status_code=status, url=url)
 
-                        if status != 200:
-                            self.logger.info("HTTP %s for %s.", status, url)
-                            raise NetworkRequestError(f"HTTP {status}")
+                        self.logger.info("HTTP %s for %s.", status, url)
+                        raise HTTPStatusError(
+                            f"HTTP {status} for {url}", status_code=status, url=url
+                        )
 
                     except RequestsError as e:
                         err_str = str(e).lower()
@@ -1763,10 +1850,7 @@ class BaseCore:
                         elif "timeout" in err_str or "read" in err_str:
                             self.logger.error("Timeout for URL %s: %s", url, e, exc_info=True)
                         raise
-                    except (RequestsError, NetworkRequestError, ResourceGone):
-                        raise
-
-                    except (SecurityAbort, ProxySSLError, InvalidProxy, UnknownError):
+                    except (BaseScraperError, ResourceGone, ProxySSLError, InvalidProxy, UnknownError):
                         raise
 
                     except Exception as e:
@@ -1774,18 +1858,173 @@ class BaseCore:
                         raise UnknownError(f"Unexpected error for URL {url}: {e}") from e
 
         except RetryError as re_err:
-            last_resp = state.get("last_response")
-            self.logger.error("Failed to fetch URL %s after %s attempts.", url, max_retries)
-            if last_resp is not None:
-                try:
-                    last_resp.raise_for_status()
-                except Exception as e:
-                    raise e from re_err
-            raise UnknownError(
-                f"Failed to fetch: {url} after {max_retries} attempts. "
-                "If you're sure you're not blocked and your connection is stable, "
-                "please open an issue with the URL and steps to reproduce."
-            ) from re_err
+            last_error = re_err.last_attempt.exception()
+            if not isinstance(last_error, Exception):
+                last_error = NetworkRequestError("Request retry budget was exhausted")
+            self.logger.error(
+                "Request to %s failed after %s attempts.", url, max_attempts
+            )
+            raise RequestRetriesExhausted(url, max_attempts, last_error) from last_error
+
+        raise RuntimeError("request retry controller exited without an outcome")
+
+    def _request_cache_key(
+        self,
+        *,
+        url: str,
+        method: str,
+        allow_redirects: bool,
+        params: Mapping[str, Any] | None,
+        data: Mapping[str, Any] | None,
+        json_data: Mapping[str, Any] | None,
+        headers: Dict[str, str] | None,
+        cookies: Dict[str, str] | None,
+    ) -> RequestCacheKey:
+        merged_headers = {
+            str(key).lower(): value
+            for key, value in self._merged_headers(headers).items()
+        }
+        merged_cookies = self._merged_cookies(cookies)
+        return RequestCacheKey(
+            method=method.upper(),
+            url=url,
+            allow_redirects=allow_redirects,
+            params_fingerprint=_cache_fingerprint(params),
+            body_fingerprint=_cache_fingerprint((data, json_data)),
+            headers_fingerprint=_cache_fingerprint(merged_headers),
+            cookies_fingerprint=_cache_fingerprint(merged_cookies),
+        )
+
+    @staticmethod
+    def _decode_response(response: Response, url: str, logger: logging.Logger) -> str:
+        raw_content = cast(bytes, response.content)
+        encoding = getattr(response, "encoding", None) or "utf-8"
+        try:
+            return raw_content.decode(encoding, errors="strict")
+        except UnicodeDecodeError:
+            logger.warning(
+                "Content could not be decoded as %s (%s), decoding latin1 instead!",
+                encoding,
+                url,
+            )
+            return raw_content.decode("latin1", errors="replace")
+
+    async def fetch_text(
+        self,
+        url: str,
+        *,
+        cache_policy: CachePolicy = CachePolicy.USE,
+        timeout: float | None = None,
+        cookies: Dict[str, str] | None = None,
+        allow_redirects: bool = True,
+        data: Dict[str, Any] | None = None,
+        method: str = "GET",
+        headers: Dict[str, str] | None = None,
+        json_data: Dict[str, Any] | None = None,
+        params: Dict[str, Any] | None = None,
+        retry_non_idempotent: bool = False,
+    ) -> str:
+        """Fetch and decode text, optionally using the bounded response cache."""
+        request_method = method.upper()
+        cacheable = request_method == "GET" and cache_policy is not CachePolicy.BYPASS
+        key = None
+        if cacheable:
+            key = self._request_cache_key(
+                url=url,
+                method=request_method,
+                allow_redirects=allow_redirects,
+                params=params,
+                data=data,
+                json_data=json_data,
+                headers=headers,
+                cookies=cookies,
+            )
+
+        if key is not None and cache_policy is CachePolicy.USE:
+            cached = self.cache.get_response(key)
+            if cached is not None:
+                self.logger.info("Fetched content for %s from cache.", url)
+                return cached
+
+        leader = True
+        pending: asyncio.Future[str] | None = None
+        if key is not None:
+            async with self._cache_flight_lock:
+                if cache_policy is CachePolicy.USE:
+                    cached = self.cache.get_response(key)
+                    if cached is not None:
+                        return cached
+                pending = self._inflight_text_requests.get(key)
+                if pending is None:
+                    pending = asyncio.get_running_loop().create_future()
+                    self._inflight_text_requests[key] = pending
+                else:
+                    leader = False
+
+        if not leader:
+            assert pending is not None
+            return await asyncio.shield(pending)
+
+        try:
+            response = await self.request(
+                url,
+                timeout=timeout,
+                cookies=cookies,
+                allow_redirects=allow_redirects,
+                data=data,
+                method=request_method,
+                headers=headers,
+                json_data=json_data,
+                params=params,
+                retry_non_idempotent=retry_non_idempotent,
+            )
+            content = self._decode_response(response, url, self.logger)
+            if key is not None:
+                self.cache.set_response(key, content)
+                assert pending is not None
+                if not pending.done():
+                    pending.set_result(content)
+            return content
+        except BaseException as error:
+            if pending is not None and not pending.done():
+                pending.set_exception(error)
+                # Mark the exception as observed even when there were no followers.
+                pending.exception()
+            raise
+        finally:
+            if key is not None:
+                async with self._cache_flight_lock:
+                    if self._inflight_text_requests.get(key) is pending:
+                        self._inflight_text_requests.pop(key, None)
+
+    async def fetch_bytes(
+        self,
+        url: str,
+        *,
+        timeout: float | None = None,
+        cookies: Dict[str, str] | None = None,
+        allow_redirects: bool = True,
+        data: Dict[str, Any] | None = None,
+        method: str = "GET",
+        headers: Dict[str, str] | None = None,
+        json_data: Dict[str, Any] | None = None,
+        params: Dict[str, Any] | None = None,
+        retry_non_idempotent: bool = False,
+    ) -> bytes:
+        """Fetch a response body as bytes without involving the text cache."""
+        response = await self.request(
+            url,
+            timeout=timeout,
+            cookies=cookies,
+            allow_redirects=allow_redirects,
+            data=data,
+            method=method,
+            headers=headers,
+            json_data=json_data,
+            params=params,
+            retry_non_idempotent=retry_non_idempotent,
+        )
+        return cast(bytes, response.content)
 
 
     @lru_cache(maxsize=250)
@@ -1819,8 +2058,7 @@ a new Python file, import only m3u8 and see what error you get.
             self.logger.debug("Resolved inline/custom m3u8 master content.")
             base_for_join = ""  # URIs should be absolute in inline cases; join will handle if relative
         else:
-            content = await self.fetch(url=m3u8_url)
-            assert isinstance(content, str)
+            content = await self.fetch_text(url=m3u8_url)
             master = m3u8.loads(content)
             base_for_join = m3u8_url
             self.logger.debug("Resolved m3u8 master: %s", m3u8_url)
@@ -1855,8 +2093,7 @@ a new Python file, import only m3u8 and see what error you get.
         if not m3u8_url.startswith("https://"):
             master = m3u8.loads(m3u8_url)
         else:
-            content = await self.fetch(url=m3u8_url)
-            assert isinstance(content, str)
+            content = await self.fetch_text(url=m3u8_url)
             master = m3u8.loads(content)
 
         if not master.is_variant:
@@ -1875,8 +2112,8 @@ a new Python file, import only m3u8 and see what error you get.
 
     async def get_segments(self, m3u8_url_master: str, quality: Union[str, int]) -> List[str]:
         assert m3u8 is not None
-        _cache_url = f"{m3u8_url_master}{quality}"
-        _segments: List[str] | None = self.cache.get_segments_from_cache(_cache_url)
+        segment_cache_key = SegmentCacheKey(m3u8_url_master, str(quality))
+        _segments = self.cache.get_segments(segment_cache_key)
         if _segments is not None:
             self.logger.info("Received: %s from cache!", len(_segments))
             return _segments
@@ -1886,8 +2123,9 @@ a new Python file, import only m3u8 and see what error you get.
         self.logger.debug("Trying to fetch segments from m3u8 -> %s", playlist_url)
 
         # M3U8s are volatile → don't cache
-        content = await self.fetch(url=playlist_url, save_cache=False)
-        assert isinstance(content, str)
+        content = await self.fetch_text(
+            url=playlist_url, cache_policy=CachePolicy.BYPASS
+        )
         parsed = m3u8.loads(content)
 
         # If we accidentally got a master, pick the first media playlist (existing behavior),
@@ -1898,8 +2136,9 @@ a new Python file, import only m3u8 and see what error you get.
             media_rel = parsed.playlists[0].uri
             media_url = urljoin(playlist_url, media_rel)
             self.logger.info("Resolved to new URL: %s", media_url)
-            content = await self.fetch(url=media_url, save_cache=False)
-            assert isinstance(content, str)
+            content = await self.fetch_text(
+                url=media_url, cache_policy=CachePolicy.BYPASS
+            )
             parsed = m3u8.loads(content)
             base_url = media_url
 
@@ -1931,7 +2170,7 @@ a new Python file, import only m3u8 and see what error you get.
 
         self.logger.debug("Fetched %s segments from m3u8 URL (including init if present)", len(segments))
         self.logger.info("Saving segments to cache....")
-        self.cache.save_segments_to_cache(_cache_url, segments)
+        self.cache.set_segments(segment_cache_key, segments)
         return segments
 
 
@@ -1965,8 +2204,7 @@ a new Python file, import only m3u8 and see what error you get.
             if stop_event is not None and stop_event.is_set():
                 return url, b"", False # Stopping the download here
 
-            content = await self.fetch(url, timeout=timeout, get_bytes=True, save_cache=False)
-            assert isinstance(content, bytes)
+            content = await self.fetch_bytes(url, timeout=timeout)
             return url, content, True
         except Exception as e:
             # Log and mark failure; the caller will decide whether to retry or abort.

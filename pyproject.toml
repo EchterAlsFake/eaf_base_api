@@ -20,6 +20,7 @@ classifiers = [
 ]
 
 dependencies = [
+  "cachetools>=7.0.0",
   "curl_cffi",
   "tenacity>=9.1.2",
 ]

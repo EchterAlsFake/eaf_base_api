@@ -12,8 +12,14 @@ type possible_qualities_int = Literal[144, 240, 360, 480, 540, 720, 1080, 1440, 
 
 class RuntimeConfig:
     def __init__(self) -> None:
-        self.max_cache_items: int = 200
-        self.max_retries: int = 4
+        self.response_cache_size_bytes: int = 32 * 1024 * 1024
+        self.response_cache_ttl: float = 300.0
+        self.segment_cache_size_bytes: int = 8 * 1024 * 1024
+        self.segment_cache_ttl: float = 300.0
+        self.request_attempts: int = 4
+        self.request_retry_initial_delay: float = 0.5
+        self.request_retry_max_delay: float = 30.0
+        self.request_retry_jitter: float = 0.5
         self.request_delay: int = 0
         self.timeout: int = 20
         self.max_bandwidth_mb: float| None = None # Set speed limit in megabytes per second e.g, 2.0, 3.5 etc...

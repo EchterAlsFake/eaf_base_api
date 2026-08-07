@@ -75,6 +75,39 @@ sources. A loader returning `None` marks the field as loaded and does not raise.
 Loader mappings are validated before any values are committed, preventing partial
 model updates after parser failures.
 
+## HTTP requests and caching
+
+`BaseCore` exposes one method per response representation. Use the core as an
+async context manager so its connection pool is closed deterministically:
+
+```python
+from base_api import BaseCore, CachePolicy
+
+async with BaseCore() as core:
+    response = await core.request("https://example.com/status")
+    text = await core.fetch_text("https://example.com/page")
+    data = await core.fetch_bytes("https://example.com/file")
+
+    fresh_text = await core.fetch_text(
+        "https://example.com/live",
+        cache_policy=CachePolicy.REFRESH,
+    )
+    uncached_text = await core.fetch_text(
+        "https://example.com/volatile",
+        cache_policy=CachePolicy.BYPASS,
+    )
+```
+
+Only successful GET text responses are cached. Cache keys distinguish parameters,
+request bodies, headers, and cookies without storing credentials in plaintext.
+`CachePolicy.USE` reads and writes the cache, `REFRESH` skips the read and replaces
+the entry, and `BYPASS` neither reads nor writes. Concurrent misses for the same
+request share one network operation.
+
+Network failures and retryable HTTP statuses are retried automatically for
+idempotent methods. Set `retry_non_idempotent=True` only when repeating a POST or
+PATCH is known to be safe.
+
 ## Concurrent page and media iteration
 
 `Helper` uses bounded `asyncio` task sets. Completion order is the default because
