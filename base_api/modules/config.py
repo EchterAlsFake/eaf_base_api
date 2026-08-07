@@ -1,10 +1,9 @@
 import asyncio
 
 from dataclasses import dataclass
-from typing import Dict, Any, Callable, Awaitable, Literal
+from typing import Dict, Any, Callable, Literal
 
 type callback_hint = Callable[[int, int], None] | None
-type on_error_hint = Callable[[str, Exception, int], Awaitable[bool]] | None
 type possible_qualities = Literal["hd", "sd", "144p", "240p", "360p", "480p", "540p", "720p", "1080p", "1440p", "2160p",
                                    "best", "worst", "half"]
 

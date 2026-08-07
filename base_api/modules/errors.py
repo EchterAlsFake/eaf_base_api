@@ -131,21 +131,178 @@ class SegmentError(Exception):
         super().__init__(message)
 
 
-class VideoFetchError(BaseScraperError):
-    """
-    Raised or yielded when a video fails to fetch during concurrent fetching.
-    """
-    def __init__(self, url: str, original_error: Exception) -> None:
-        self.url = url
-        self.original_error = original_error
-        super().__init__(f"Failed to fetch video at {url}: {original_error}")
+class MediaFieldError(BaseScraperError):
+    """Base class for errors involving a field on a ``BaseMedia`` model."""
 
 
-class PageFetchError(BaseScraperError):
-    def __init__(self, url: str, original_error: Exception) -> None:
+class UnknownMediaFieldError(MediaFieldError, AttributeError):
+    """Raised when a caller asks ``BaseMedia`` to load an undeclared field."""
+
+    def __init__(self, model_name: str, field_name: str) -> None:
+        self.model_name = model_name
+        self.field_name = field_name
+        super().__init__(f"{model_name!s} has no dataclass field named {field_name!r}")
+
+
+class FieldNotLoadableError(MediaFieldError):
+    """Raised when a real dataclass field has no loader source assigned to it."""
+
+    def __init__(self, model_name: str, field_name: str) -> None:
+        self.model_name = model_name
+        self.field_name = field_name
+        super().__init__(
+            f"{model_name}.{field_name} is not a loadable media field; "
+            "declare it with media_field(...) before requesting it"
+        )
+
+
+class DataNotLoadedError(MediaFieldError):
+    """
+    Raised by direct attribute access when a loadable field is still unresolved.
+
+    ``None`` never causes this exception.  The media implementation uses a private
+    sentinel for unresolved fields, so a loader may deliberately return ``None``
+    when the remote service does not provide an optional value.
+    """
+
+    def __init__(
+        self,
+        model_name: str,
+        field_name: str,
+        url: str,
+        sources: tuple[str, ...],
+        source_errors: dict[str, BaseException] | None = None,
+    ) -> None:
+        self.model_name = model_name
+        self.field_name = field_name
+        self.url = url
+        self.sources = sources
+        self.source_errors = source_errors or {}
+
+        source_list = ", ".join(repr(source) for source in sources)
+        message = (
+            f"{model_name}.{field_name} has not been loaded for {url!r}. "
+            f"Eligible sources: {source_list}. Call "
+            f"await media.load_fields({field_name!r}) or "
+            f"await media.load_sources({source_list})."
+        )
+        if self.source_errors:
+            failures = ", ".join(
+                f"{source}={type(error).__name__}: {error}"
+                for source, error in self.source_errors.items()
+            )
+            message += f" Previous source failures: {failures}."
+
+        super().__init__(message)
+
+
+class LoaderConfigurationError(BaseScraperError):
+    """Raised when a media class declares a source without a usable loader."""
+
+
+class LoaderContractError(BaseScraperError):
+    """Raised when a source loader returns incomplete or unexpected field data."""
+
+    def __init__(self, model_name: str, source: str, url: str, details: str) -> None:
+        self.model_name = model_name
+        self.source = source
+        self.url = url
+        self.details = details
+        super().__init__(
+            f"Loader {model_name}.{source!s} violated its result contract for "
+            f"{url!r}: {details}"
+        )
+
+
+class MediaLoadError(BaseScraperError):
+    """Wraps an exception raised while one ``BaseMedia`` source was loading."""
+
+    def __init__(self, model_name: str, source: str, url: str, original_error: Exception) -> None:
+        self.model_name = model_name
+        self.source = source
         self.url = url
         self.original_error = original_error
-        super().__init__(f"Failed to fetch page at {url}: {original_error}")
+        super().__init__(
+            f"Failed to load source {source!r} for {model_name} at {url}: "
+            f"{original_error}"
+        )
+
+
+class MediaLoadErrors(BaseScraperError):
+    """Contains all source failures from one multi-source loading request."""
+
+    def __init__(self, errors: tuple[BaseException, ...]) -> None:
+        self.errors = errors
+        summary = "; ".join(f"{type(error).__name__}: {error}" for error in errors)
+        super().__init__(f"Multiple media sources failed: {summary}")
+
+
+class ScrapeOperationError(BaseScraperError):
+    """Base class for a terminal page or item error from ``Helper``."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        url: str,
+        original_error: Exception,
+        attempt: int,
+        page_index: int,
+        item_index: int | None,
+    ) -> None:
+        self.url = url
+        self.original_error = original_error
+        self.attempt = attempt
+        self.page_index = page_index
+        self.item_index = item_index
+        super().__init__(message)
+
+
+class PageFetchError(ScrapeOperationError):
+    """A page could not be fetched or its extractor output was invalid."""
+
+    def __init__(self, url: str, original_error: Exception, attempt: int, page_index: int) -> None:
+        super().__init__(
+            f"Failed to process page {page_index} at {url} on attempt {attempt}: "
+            f"{original_error}",
+            url=url,
+            original_error=original_error,
+            attempt=attempt,
+            page_index=page_index,
+            item_index=None,
+        )
+
+
+class ItemFetchError(ScrapeOperationError):
+    """An extracted item could not be constructed or loaded."""
+
+    def __init__(
+        self,
+        url: str,
+        original_error: Exception,
+        attempt: int,
+        page_index: int,
+        item_index: int,
+    ) -> None:
+        super().__init__(
+            f"Failed to process item {page_index}:{item_index} at {url} on "
+            f"attempt {attempt}: {original_error}",
+            url=url,
+            original_error=original_error,
+            attempt=attempt,
+            page_index=page_index,
+            item_index=item_index,
+        )
+
+
+class ErrorHandlerError(BaseScraperError):
+    """Raised when a user-provided Helper error handler itself fails."""
+
+    def __init__(self, stage: str, url: str, original_error: Exception) -> None:
+        self.stage = stage
+        self.url = url
+        self.original_error = original_error
+        super().__init__(f"The {stage} error handler failed for {url}: {original_error}")
 
 
 class ChallengeRegexError(BaseScraperError):
@@ -154,11 +311,6 @@ class ChallengeRegexError(BaseScraperError):
 
 class ChallengeMathError(BaseScraperError):
     ...
-
-
-class CallbackError(BaseScraperError):
-    def __init__(self, msg: str):
-        self.msg = msg
 
 
 class AccessDeniedError(BaseScraperError):
@@ -180,15 +332,3 @@ class StateLoadError(BaseScraperError):
 
 class MaxRetriesExceeded(BaseScraperError):
     pass
-
-
-class DataNotLoadedError(Exception):
-    def __init__(self, msg: str):
-        super().__init__(msg)
-        self.msg = msg
-
-
-class NoPageLeft(Exception):
-    def __init__(self, msg: str):
-        super().__init__(msg)
-        self.msg = msg

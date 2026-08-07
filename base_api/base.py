@@ -10,14 +10,20 @@ import inspect
 import logging
 import traceback
 import threading
+from collections import deque
+from collections.abc import AsyncIterator, Iterable, Mapping, Sequence
+from enum import StrEnum
 from functools import lru_cache
 from urllib.parse import urljoin
-from dataclasses import dataclass
+from dataclasses import MISSING, dataclass, field, fields
 from curl_cffi import CurlOpt # Used for DNS over HTTPS
 from curl_cffi.requests.errors import RequestsError
 from curl_cffi.requests import AsyncSession, Response
 from tenacity import AsyncRetrying, stop_after_attempt, wait_exponential_jitter, retry_if_exception_type, RetryError
-from typing import Union, Callable, Tuple, AsyncGenerator, cast, List, Dict, Any, Awaitable, TYPE_CHECKING
+from typing import (
+    Union, Callable, Tuple, AsyncGenerator, ClassVar, Generic, TypeVar,
+    cast, List, Dict, Any, Awaitable, Self, TYPE_CHECKING,
+)
 
 
 # 1. Standardize on relative imports
@@ -112,71 +118,852 @@ class Cache:
             self.cache_dictionary.pop(entry)
 
 
-@dataclass(slots=True, kw_only=True)
+_MEDIA_SOURCES_KEY = "eaf_base_api.load_sources"
+
+
+class _UnloadedValue:
+    """Private marker that distinguishes an unresolved field from a real ``None``."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "<UNLOADED>"
+
+    def __copy__(self) -> _UnloadedValue:
+        return self
+
+    def __deepcopy__(self, _memo: dict[int, Any]) -> _UnloadedValue:
+        return self
+
+    def __reduce__(self) -> tuple[Callable[[], _UnloadedValue], tuple[()]]:
+        return (_unloaded_value, ())
+
+
+_UNLOADED = _UnloadedValue()
+
+
+def _unloaded_value() -> _UnloadedValue:
+    """Restore the process-wide sentinel while unpickling or deep-copying."""
+    return _UNLOADED
+
+
+def media_field(
+    *sources: str,
+    default: Any = MISSING,
+    default_factory: Callable[[], Any] | Any = MISSING,
+    repr: bool = False,
+    compare: bool = False,
+    metadata: Mapping[str, Any] | None = None,
+) -> Any:
+    """
+    Declare a dataclass field that can be populated by one or more media loaders.
+
+    Source order is significant: the first source has the highest precedence when
+    several successfully loaded sources contain the same field.  If neither a
+    ``default`` nor a ``default_factory`` is supplied, the field starts with an
+    internal *unloaded* sentinel.  Consequently, a loader can return ``None`` and
+    direct attribute access will correctly treat that value as loaded.
+
+    ``repr`` and ``compare`` default to false because generated dataclass methods
+    should not accidentally access an unresolved field.  Use ``BaseMedia.to_dict``
+    when serialising a partially loaded model.
+
+    Example::
+
+        title: str | None = media_field("api", "html")
+        stream_url: str | None = media_field("html")
+    """
+    if not sources:
+        raise ValueError("media_field() requires at least one loader source")
+
+    normalized_sources: list[str] = []
+    for source in sources:
+        if not isinstance(source, str) or not source or not source.isidentifier():
+            raise ValueError(
+                "media loader sources must be non-empty Python identifiers; "
+                f"received {source!r}"
+            )
+        if source in normalized_sources:
+            raise ValueError(f"media field source {source!r} was declared twice")
+        normalized_sources.append(source)
+
+    if default is not MISSING and default_factory is not MISSING:
+        raise ValueError("media_field() cannot receive both default and default_factory")
+
+    field_metadata = dict(metadata or {})
+    if _MEDIA_SOURCES_KEY in field_metadata:
+        raise ValueError(f"metadata key {_MEDIA_SOURCES_KEY!r} is reserved")
+    field_metadata[_MEDIA_SOURCES_KEY] = tuple(normalized_sources)
+
+    field_arguments: dict[str, Any] = {
+        "repr": repr,
+        "compare": compare,
+        "metadata": field_metadata,
+    }
+    if default_factory is not MISSING:
+        field_arguments["default_factory"] = default_factory
+    elif default is not MISSING:
+        field_arguments["default"] = default
+    else:
+        field_arguments["default"] = _UNLOADED
+
+    return field(**field_arguments)
+
+
+class LoadState(StrEnum):
+    """Observable lifecycle of one named ``BaseMedia`` source."""
+
+    NOT_LOADED = "not_loaded"
+    LOADING = "loading"
+    LOADED = "loaded"
+    FAILED = "failed"
+
+
+@dataclass(frozen=True, slots=True)
+class _MediaSchema:
+    """Cached, validated view of a media dataclass's loadable fields."""
+
+    field_names: frozenset[str]
+    field_sources: dict[str, tuple[str, ...]]
+    source_fields: dict[str, frozenset[str]]
+    source_order: tuple[str, ...]
+
+
+_MEDIA_SCHEMA_CACHE: dict[type[Any], _MediaSchema] = {}
+
+
+def _media_schema(model_type: type[Any]) -> _MediaSchema:
+    """Build source/field indexes once per concrete dataclass type."""
+    cached = _MEDIA_SCHEMA_CACHE.get(model_type)
+    if cached is not None:
+        return cached
+
+    dataclass_fields = tuple(fields(model_type))
+    field_sources: dict[str, tuple[str, ...]] = {}
+    source_fields_mutable: dict[str, set[str]] = {}
+    source_order: list[str] = []
+
+    for dataclass_field in dataclass_fields:
+        sources = dataclass_field.metadata.get(_MEDIA_SOURCES_KEY)
+        if not sources:
+            continue
+
+        field_sources[dataclass_field.name] = tuple(sources)
+        for source in sources:
+            source_fields_mutable.setdefault(source, set()).add(dataclass_field.name)
+            if source not in source_order:
+                source_order.append(source)
+
+    schema = _MediaSchema(
+        field_names=frozenset(item.name for item in dataclass_fields),
+        field_sources=field_sources,
+        source_fields={
+            source: frozenset(field_names)
+            for source, field_names in source_fields_mutable.items()
+        },
+        source_order=tuple(source_order),
+    )
+    _MEDIA_SCHEMA_CACHE[model_type] = schema
+    return schema
+
+
+@dataclass(slots=True, kw_only=True, repr=False)
 class BaseMedia:
+    """
+    Base class for dataclass models whose fields are loaded from remote sources.
+
+    Subclasses declare loadable attributes with :func:`media_field` and map each
+    source name to an async method through ``loader_methods``.  A loader returns a
+    mapping; it never mutates the model itself.  ``BaseMedia`` validates the full
+    mapping and commits it atomically, so a failed parser cannot leave half-loaded
+    model state behind.
+
+    Different callers requesting the same source share one task. Cancelling a
+    waiter cancels that shared operation so network work never escapes its caller;
+    every waiter then observes cancellation and the source becomes retryable.
+    Loading different sources may happen concurrently, but field precedence stays
+    deterministic because it follows the order declared by ``media_field``.
+    """
+
     url: str
     core: object
 
-    # Internal flag to track if HTML has been fetched
-    _api_loaded: bool = False
-    _html_loaded: bool = False
-    _anything_else_loaded: bool = False
+    loader_methods: ClassVar[Mapping[str, str]] = {}
 
-    def __getattribute__(self, name: str):
-        val = object.__getattribute__(self, name)
+    _load_lock: asyncio.Lock = field(
+        default_factory=asyncio.Lock, init=False, repr=False, compare=False
+    )
+    _source_states: dict[str, LoadState] = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
+    _source_results: dict[str, dict[str, Any]] = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
+    _source_errors: dict[str, BaseException] = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
+    _source_tasks: dict[str, asyncio.Task[None]] = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
 
-        if val is not None or name.startswith("_"):
-            return val
+    def __getattribute__(self, name: str) -> Any:
+        """
+        Reject only the private unloaded sentinel, never a legitimate ``None``.
 
-        try:
-            api_done = object.__getattribute__(self, "_api_loaded")
-            html_done = object.__getattribute__(self, "_html_loaded")
-            anything_else_done = object.__getattribute__(self, "_anything_else_loaded")
+        Attribute access remains synchronous and therefore cannot initiate network
+        I/O.  The exception tells callers exactly which field and sources to pass
+        to ``load_fields`` or ``load_sources``.
+        """
+        value = object.__getattribute__(self, name)
+        if value is not _UNLOADED:
+            return value
 
-        except AttributeError:
-            # This just prevents an error during the dataclass __init__ phase
-            return val
+        model_type = type(self)
+        schema = _media_schema(model_type)
+        sources = schema.field_sources.get(name, ())
+        url = object.__getattribute__(self, "url")
+        all_source_errors = object.__getattribute__(self, "_source_errors")
+        relevant_errors = {
+            source: all_source_errors[source]
+            for source in sources
+            if source in all_source_errors
+        }
+        raise DataNotLoadedError(
+            model_type.__name__, name, url, sources, relevant_errors
+        )
 
-        if not api_done or not html_done or not anything_else_done:
-            missing = []
-            if not api_done: missing.append("api=True")
-            if not html_done: missing.append("html=True")
-            if not anything_else_done: missing.append("anything_else=True")
+    def __repr__(self) -> str:
+        """Represent identity and load state without touching unresolved fields."""
+        loaded = ", ".join(sorted(self.loaded_sources)) or "none"
+        return f"{type(self).__name__}(url={self.url!r}, loaded_sources={loaded})"
 
-            raise DataNotLoadedError(f"""
-Attribute: '{name}' is missing. Try fetching more data:
-'await {self.__class__.__name__.lower()}.load({', '.join(missing)}"""
+    @property
+    def loaded_sources(self) -> frozenset[str]:
+        """Return an immutable snapshot of sources that loaded successfully."""
+        states = object.__getattribute__(self, "_source_states")
+        return frozenset(
+            source for source, state in states.items() if state is LoadState.LOADED
+        )
+
+    @property
+    def source_errors(self) -> Mapping[str, BaseException]:
+        """Return a copy of the most recent failure for each source."""
+        return dict(object.__getattribute__(self, "_source_errors"))
+
+    def source_state(self, source: str) -> LoadState:
+        """Inspect one declared source without starting a load."""
+        schema = _media_schema(type(self))
+        if source not in schema.source_fields:
+            raise LoaderConfigurationError(
+                f"{type(self).__name__} has no media fields assigned to source {source!r}"
             )
+        return object.__getattribute__(self, "_source_states").get(
+            source, LoadState.NOT_LOADED
+        )
 
-        return val
+    def is_field_loaded(self, field_name: str) -> bool:
+        """Return whether a field contains a real value, including real ``None``."""
+        self._validate_field_name(field_name)
+        return object.__getattribute__(self, field_name) is not _UNLOADED
 
-    async def load(self, api: bool = True, html: bool = False, anything: bool = False) -> BaseMedia:
-        if (api and self._api_loaded) and (not html or self._html_loaded) and (not anything or self._anything_else_loaded):
+    def unloaded_fields(self) -> frozenset[str]:
+        """Return all declared media fields that still contain the sentinel."""
+        schema = _media_schema(type(self))
+        return frozenset(
+            field_name
+            for field_name in schema.field_sources
+            if object.__getattribute__(self, field_name) is _UNLOADED
+        )
+
+    def to_dict(
+        self,
+        *,
+        include_unloaded: bool = False,
+        include_core: bool = False,
+    ) -> dict[str, Any]:
+        """
+        Serialise public dataclass fields without triggering lazy-field errors.
+
+        Unresolved fields are omitted by default.  When ``include_unloaded`` is
+        true they are represented as ``None``; this keeps the private sentinel out
+        of application data.  ``core`` is excluded by default because clients and
+        sessions are normally not serialisable.
+        """
+        result: dict[str, Any] = {}
+        for dataclass_field in fields(type(self)):
+            name = dataclass_field.name
+            if name.startswith("_") or (name == "core" and not include_core):
+                continue
+            value = object.__getattribute__(self, name)
+            if value is _UNLOADED:
+                if include_unloaded:
+                    result[name] = None
+                continue
+            result[name] = value
+        return result
+
+    async def load_sources(
+        self,
+        *sources: str,
+        retry_failed: bool = True,
+    ) -> Self:
+        """
+        Load named sources concurrently and return this model.
+
+        Successful sources remain committed if a sibling source fails.  One
+        failure is raised directly; several failures are wrapped in
+        ``MediaLoadErrors`` rather than an ``ExceptionGroup``.
+        """
+        normalized_sources = tuple(dict.fromkeys(sources))
+        if not normalized_sources:
             return self
 
-        await self._perform_load(api=api, html=html, anything_else=anything)
-        if api: self._api_loaded = True
-        if html: self._html_loaded = True
-        if anything: self._anything_else_loaded = True
+        schema = _media_schema(type(self))
+        for source in normalized_sources:
+            if source not in schema.source_fields:
+                raise LoaderConfigurationError(
+                    f"{type(self).__name__} has no media fields assigned to "
+                    f"source {source!r}"
+                )
+            self._loader_for_source(source)
+
+        results = await asyncio.gather(
+            *(
+                self._ensure_source(source, retry_failed=retry_failed)
+                for source in normalized_sources
+            ),
+            return_exceptions=True,
+        )
+        failures: list[BaseException] = []
+        for result in results:
+            if isinstance(result, asyncio.CancelledError):
+                raise result
+            if isinstance(result, BaseException):
+                failures.append(result)
+
+        if len(failures) == 1:
+            raise failures[0]
+        if failures:
+            raise MediaLoadErrors(tuple(failures))
         return self
 
-    async def _perform_load(self, api: bool, html: bool, anything_else: bool):
-        raise NotImplementedError("Subclasses must define _perform_load()")
+    async def load_fields(
+        self,
+        *field_names: str,
+        retry_failed: bool = True,
+    ) -> Self:
+        """
+        Load the smallest useful set of sources for the requested fields.
+
+        The source selection is a deterministic greedy cover.  For example, if
+        ``html`` can populate both requested fields while ``api`` can populate
+        only one, only ``html`` is loaded.  Ties follow the precedence order in
+        the field declarations.
+        """
+        requested = tuple(dict.fromkeys(field_names))
+        if not requested:
+            return self
+
+        schema = _media_schema(type(self))
+        pending: set[str] = set()
+        for field_name in requested:
+            self._validate_field_name(field_name)
+            if object.__getattribute__(self, field_name) is not _UNLOADED:
+                continue
+            if field_name not in schema.field_sources:
+                raise FieldNotLoadableError(type(self).__name__, field_name)
+            pending.add(field_name)
+
+        selected_sources: list[str] = []
+        while pending:
+            best_source: str | None = None
+            best_coverage: set[str] = set()
+            best_preference_cost: int | None = None
+            for source in schema.source_order:
+                coverage = pending.intersection(schema.source_fields[source])
+                preference_cost = sum(
+                    schema.field_sources[field_name].index(source)
+                    for field_name in coverage
+                )
+                if (
+                    len(coverage) > len(best_coverage)
+                    or (
+                        len(coverage) == len(best_coverage)
+                        and coverage
+                        and (
+                            best_preference_cost is None
+                            or preference_cost < best_preference_cost
+                        )
+                    )
+                ):
+                    best_source = source
+                    best_coverage = coverage
+                    best_preference_cost = preference_cost
+
+            if best_source is None:
+                # Schema construction guarantees this cannot happen unless model
+                # metadata was modified at runtime after it had been cached.
+                unresolved = sorted(pending)
+                raise LoaderConfigurationError(
+                    f"No loader source can resolve fields {unresolved!r} on "
+                    f"{type(self).__name__}"
+                )
+            selected_sources.append(best_source)
+            pending.difference_update(best_coverage)
+
+        return await self.load_sources(
+            *selected_sources, retry_failed=retry_failed
+        )
+
+    async def get_field(self, field_name: str, *, retry_failed: bool = True) -> Any:
+        """Load one field if necessary and return its value."""
+        self._validate_field_name(field_name)
+        if object.__getattribute__(self, field_name) is _UNLOADED:
+            await self.load_fields(field_name, retry_failed=retry_failed)
+        return object.__getattribute__(self, field_name)
+
+    def _validate_field_name(self, field_name: str) -> None:
+        schema = _media_schema(type(self))
+        if field_name not in schema.field_names:
+            raise UnknownMediaFieldError(type(self).__name__, field_name)
+
+    def _loader_for_source(self, source: str) -> Callable[[], Awaitable[Mapping[str, Any]]]:
+        method_name = type(self).loader_methods.get(source)
+        if method_name is None:
+            raise LoaderConfigurationError(
+                f"{type(self).__name__}.loader_methods does not map source {source!r}"
+            )
+        try:
+            loader = object.__getattribute__(self, method_name)
+        except AttributeError as error:
+            raise LoaderConfigurationError(
+                f"{type(self).__name__}.loader_methods maps {source!r} to missing "
+                f"method {method_name!r}"
+            ) from error
+        if not callable(loader):
+            raise LoaderConfigurationError(
+                f"{type(self).__name__}.{method_name} is not callable"
+            )
+        return cast(Callable[[], Awaitable[Mapping[str, Any]]], loader)
+
+    async def _ensure_source(self, source: str, *, retry_failed: bool) -> None:
+        """Return after one shared source task succeeds, or re-raise its error."""
+        lock = object.__getattribute__(self, "_load_lock")
+        async with lock:
+            states = object.__getattribute__(self, "_source_states")
+            tasks = object.__getattribute__(self, "_source_tasks")
+            errors = object.__getattribute__(self, "_source_errors")
+            state = states.get(source, LoadState.NOT_LOADED)
+
+            if state is LoadState.LOADED:
+                return
+            if state is LoadState.FAILED and not retry_failed:
+                raise errors[source]
+
+            task = tasks.get(source)
+            if task is None:
+                states[source] = LoadState.LOADING
+                task = asyncio.create_task(
+                    self._execute_source_loader(source),
+                    name=f"{type(self).__name__}:{source}:{self.url}",
+                )
+                tasks[source] = task
+
+        # Direct awaiting intentionally propagates cancellation into the shared
+        # source task. This keeps source I/O inside the lifetime of its callers.
+        await task
+
+    async def _execute_source_loader(self, source: str) -> None:
+        """Execute, validate, and atomically commit one source loader."""
+        model_name = type(self).__name__
+        try:
+            loader = self._loader_for_source(source)
+            awaitable = loader()
+            if not inspect.isawaitable(awaitable):
+                raise LoaderContractError(
+                    model_name,
+                    source,
+                    self.url,
+                    "the configured loader must be async and return an awaitable",
+                )
+            raw_result = await awaitable
+            result = self._validate_loader_result(source, raw_result)
+
+            lock = object.__getattribute__(self, "_load_lock")
+            async with lock:
+                object.__getattribute__(self, "_source_results")[source] = result
+                object.__getattribute__(self, "_source_states")[source] = LoadState.LOADED
+                object.__getattribute__(self, "_source_errors").pop(source, None)
+                self._apply_source_precedence(source)
+                object.__getattribute__(self, "_source_tasks").pop(source, None)
+
+        except asyncio.CancelledError:
+            lock = object.__getattribute__(self, "_load_lock")
+            async with lock:
+                object.__getattribute__(self, "_source_states")[source] = LoadState.NOT_LOADED
+                object.__getattribute__(self, "_source_tasks").pop(source, None)
+            raise
+        except Exception as error:
+            recorded_error: BaseException
+            if isinstance(error, (LoaderContractError, LoaderConfigurationError)):
+                recorded_error = error
+            else:
+                recorded_error = MediaLoadError(
+                    model_name, source, self.url, error
+                )
+
+            lock = object.__getattribute__(self, "_load_lock")
+            async with lock:
+                object.__getattribute__(self, "_source_states")[source] = LoadState.FAILED
+                object.__getattribute__(self, "_source_errors")[source] = recorded_error
+                object.__getattribute__(self, "_source_tasks").pop(source, None)
+
+            if recorded_error is error:
+                raise
+            raise recorded_error from error
+
+    def _validate_loader_result(
+        self, source: str, raw_result: Any
+    ) -> dict[str, Any]:
+        """Enforce the all-fields, no-surprises loader mapping contract."""
+        model_name = type(self).__name__
+        if not isinstance(raw_result, Mapping):
+            raise LoaderContractError(
+                model_name,
+                source,
+                self.url,
+                f"expected a mapping, received {type(raw_result).__name__}",
+            )
+
+        result = dict(raw_result)
+        if not all(isinstance(name, str) for name in result):
+            raise LoaderContractError(
+                model_name, source, self.url, "all result keys must be strings"
+            )
+        if any(value is _UNLOADED for value in result.values()):
+            raise LoaderContractError(
+                model_name,
+                source,
+                self.url,
+                "a loader may not return BaseMedia's private unloaded sentinel",
+            )
+
+        expected_fields = _media_schema(type(self)).source_fields[source]
+        actual_fields = set(result)
+        missing = sorted(expected_fields.difference(actual_fields))
+        unexpected = sorted(actual_fields.difference(expected_fields))
+        if missing or unexpected:
+            details: list[str] = []
+            if missing:
+                details.append(f"missing fields {missing!r}; return None when absent")
+            if unexpected:
+                details.append(f"unexpected fields {unexpected!r}")
+            raise LoaderContractError(
+                model_name, source, self.url, "; ".join(details)
+            )
+        return result
+
+    def _apply_source_precedence(self, completed_source: str) -> None:
+        """
+        Recompute affected fields from loaded source snapshots.
+
+        This method is called while ``_load_lock`` is held.  Looking through each
+        field's sources in declaration order makes the final value independent of
+        network completion order.
+        """
+        schema = _media_schema(type(self))
+        states = object.__getattribute__(self, "_source_states")
+        results = object.__getattribute__(self, "_source_results")
+        for field_name in schema.source_fields[completed_source]:
+            for candidate_source in schema.field_sources[field_name]:
+                if states.get(candidate_source) is LoadState.LOADED:
+                    object.__setattr__(
+                        self,
+                        field_name,
+                        results[candidate_source][field_name],
+                    )
+                    break
 
 
-class Helper:
+class ResultOrder(StrEnum):
+    """Controls when ``Helper`` exposes completed item results."""
+
+    COMPLETION = "completion"
+    ORIGINAL = "original"
+
+
+class ErrorMode(StrEnum):
+    """Terminal action after retries are exhausted."""
+
+    RAISE = "raise"
+    YIELD = "yield"
+    SKIP = "skip"
+
+
+class ErrorAction(StrEnum):
+    """Decision optionally returned by a user-provided error handler."""
+
+    RETRY = "retry"
+    RAISE = "raise"
+    YIELD = "yield"
+    SKIP = "skip"
+
+
+class ScrapeStage(StrEnum):
+    """Identifies whether a yielded failure belongs to a page or an item."""
+
+    PAGE = "page"
+    ITEM = "item"
+
+
+@dataclass(frozen=True, slots=True)
+class RetryPolicy:
     """
-    The Helper class basically provides the blue-print for all my APIs. It fetches the content
-    of multiple pages e.g., videos, gifs, photos and retrieves the data asynchronously.
-    The underlying class that is passed to the Helper is then responsible for the actual
-    parsing logic.
+    Bounded exponential retry configuration for one Helper stage.
 
-    This allows me to re-use the code and I don't have to do the same work 20x
+    ``max_attempts`` includes the first call.  The default performs one attempt,
+    which avoids duplicating retries already performed by ``BaseCore.fetch``.
+    ``jitter`` adds a uniformly random number of seconds to each retry delay.
     """
+
+    max_attempts: int = 1
+    base_delay: float = 0.0
+    multiplier: float = 2.0
+    max_delay: float = 30.0
+    jitter: float = 0.0
+    retry_for: tuple[type[Exception], ...] = (Exception,)
+
+    def __post_init__(self) -> None:
+        if self.max_attempts < 1:
+            raise ValueError("RetryPolicy.max_attempts must be at least 1")
+        if self.base_delay < 0 or self.max_delay < 0 or self.jitter < 0:
+            raise ValueError("RetryPolicy delays and jitter cannot be negative")
+        if self.multiplier < 1:
+            raise ValueError("RetryPolicy.multiplier must be at least 1")
+        if not self.retry_for or not all(
+            isinstance(item, type) and issubclass(item, Exception)
+            for item in self.retry_for
+        ):
+            raise TypeError("RetryPolicy.retry_for must contain Exception classes")
+
+    def permits(self, error: Exception) -> bool:
+        """Return whether this exception type is eligible for automatic retry."""
+        return isinstance(error, self.retry_for)
+
+    def delay_after(self, attempt: int) -> float:
+        """Return the delay after the numbered failed attempt."""
+        exponential = self.base_delay * (self.multiplier ** max(attempt - 1, 0))
+        return min(exponential, self.max_delay) + random.uniform(0.0, self.jitter)
+
+
+@dataclass(frozen=True, slots=True)
+class ScrapeErrorContext:
+    """Complete context passed to a page or item error handler."""
+
+    stage: ScrapeStage
+    url: str
+    error: Exception
+    attempt: int
+    max_attempts: int
+    page_index: int
+    item_index: int | None
+
+
+type ErrorHandler = Callable[
+    [ScrapeErrorContext], ErrorAction | Awaitable[ErrorAction]
+]
+
+
+MediaT = TypeVar("MediaT", bound=BaseMedia)
+OperationT = TypeVar("OperationT")
+
+
+@dataclass(frozen=True, slots=True)
+class ScrapeResult(Generic[MediaT]):
+    """
+    Immutable result yielded for an item success or a configured stage failure.
+
+    A successful result has ``item`` and no ``error``.  A yielded failure has an
+    ``error`` and no ``item``.  Page successes are internal and are not yielded.
+    """
+
+    stage: ScrapeStage
+    url: str
+    page_index: int
+    item_index: int | None
+    attempts: int
+    item: MediaT | None = None
+    error: ScrapeOperationError | None = None
+
+    def __post_init__(self) -> None:
+        if (self.item is None) == (self.error is None):
+            raise ValueError("ScrapeResult must contain exactly one of item or error")
+        if self.stage is ScrapeStage.PAGE and self.item is not None:
+            raise ValueError("a page-stage ScrapeResult cannot contain an item")
+
+    @property
+    def succeeded(self) -> bool:
+        """Return true only for a successfully constructed and loaded item."""
+        return self.error is None
+
+    def unwrap(self) -> MediaT:
+        """Return the item or raise the typed terminal scrape error."""
+        if self.error is not None:
+            raise self.error
+        return cast(MediaT, self.item)
+
+
+class ScrapeStream(Generic[MediaT]):
+    """
+    Async iterator/context manager owning a Helper scheduler.
+
+    Exhausting the iterator cleans it up naturally.  When a caller may ``break``
+    early, use ``async with`` so ``__aexit__`` immediately cancels outstanding page
+    and item tasks instead of waiting for async-generator garbage collection.
+    """
+
+    def __init__(self, generator: AsyncGenerator[ScrapeResult[MediaT], None]) -> None:
+        self._generator = generator
+        self._closed = False
+
+    def __aiter__(self) -> ScrapeStream[MediaT]:
+        return self
+
+    async def __anext__(self) -> ScrapeResult[MediaT]:
+        if self._closed:
+            raise StopAsyncIteration
+        try:
+            return await self._generator.__anext__()
+        except StopAsyncIteration:
+            self._closed = True
+            raise
+
+    async def __aenter__(self) -> ScrapeStream[MediaT]:
+        return self
+
+    async def __aexit__(self, *_: object) -> None:
+        await self.aclose()
+
+    async def aclose(self) -> None:
+        """Cancel scheduler work and close the underlying async generator once."""
+        if self._closed:
+            return
+        self._closed = True
+        await self._generator.aclose()
+
+
+@dataclass(frozen=True, slots=True)
+class _PageJob:
+    index: int
+    url: str
+
+
+@dataclass(frozen=True, slots=True)
+class _ItemJob:
+    page_index: int
+    item_index: int
+    url: str
+    data: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class _AttemptOutcome(Generic[OperationT]):
+    value: OperationT | None
+    error: ScrapeOperationError | None
+    action: ErrorAction | None
+    attempts: int
+
+
+@dataclass(frozen=True, slots=True)
+class _PageOutcome(Generic[MediaT]):
+    job: _PageJob
+    items: tuple[_ItemJob, ...]
+    result: ScrapeResult[MediaT] | None
+
+
+@dataclass(frozen=True, slots=True)
+class _ItemOutcome(Generic[MediaT]):
+    job: _ItemJob
+    result: ScrapeResult[MediaT] | None
+
+
+class _OrderedResultBuffer(Generic[MediaT]):
+    """Isolate original-order bookkeeping from the concurrency scheduler."""
+
+    def __init__(self, page_count: int) -> None:
+        self._page_count = page_count
+        self._page_sizes: dict[int, int] = {}
+        self._page_results: dict[int, ScrapeResult[MediaT] | None] = {}
+        self._item_results: dict[
+            tuple[int, int], ScrapeResult[MediaT] | None
+        ] = {}
+        self._next_page = 0
+        self._next_item = 0
+        self._page_result_emitted = False
+
+    def add_page(self, outcome: _PageOutcome[MediaT]) -> None:
+        self._page_sizes[outcome.job.index] = len(outcome.items)
+        self._page_results[outcome.job.index] = outcome.result
+
+    def add_item(self, outcome: _ItemOutcome[MediaT]) -> None:
+        self._item_results[(outcome.job.page_index, outcome.job.item_index)] = (
+            outcome.result
+        )
+
+    def drain(self) -> list[ScrapeResult[MediaT]]:
+        """Return every now-contiguous result in page/extractor order."""
+        ready: list[ScrapeResult[MediaT]] = []
+        while self._next_page < self._page_count:
+            if self._next_page not in self._page_sizes:
+                break
+
+            if not self._page_result_emitted:
+                page_result = self._page_results.pop(self._next_page)
+                self._page_result_emitted = True
+                if page_result is not None:
+                    ready.append(page_result)
+
+            page_size = self._page_sizes[self._next_page]
+            blocked = False
+            while self._next_item < page_size:
+                key = (self._next_page, self._next_item)
+                if key not in self._item_results:
+                    blocked = True
+                    break
+                item_result = self._item_results.pop(key)
+                self._next_item += 1
+                if item_result is not None:
+                    ready.append(item_result)
+
+            if blocked:
+                break
+
+            self._page_sizes.pop(self._next_page)
+            self._next_page += 1
+            self._next_item = 0
+            self._page_result_emitted = False
+        return ready
+
+
+class Helper(Generic[MediaT]):
+    """
+    Concurrent two-stage scraper using bounded, dynamically managed task sets.
+
+    Page tasks fetch and extract item dictionaries.  Item tasks construct a
+    ``BaseMedia`` subclass and optionally load selected fields or sources.  There
+    are no permanent workers, queues, sentinels, queue joins, or ``TaskGroup``.
+    Completion is the explicit condition that page input, pending items, and both
+    task sets are empty.
+
+    ``ResultOrder.COMPLETION`` is the default and yields items as soon as their
+    tasks finish. ``ResultOrder.ORIGINAL`` buffers only completed outcomes needed
+    to restore target-page order and extractor order.
+    """
+
     def __init__(
         self,
         core: BaseCore,
-        constructor: Any,
+        constructor: Callable[..., MediaT],
         *,
         logger: logging.Logger | None = None,
         log_name: str = "helper.iterator",
@@ -185,281 +972,457 @@ class Helper:
         http_ip: str | None = None,
         http_port: int | str | None = None,
     ) -> None:
-        """
-        Initializes the Scraping Helper.
-
-        Args:
-            core: The engine responsible for network requests (must have a .fetch(url) method).
-            constructor: Creates data with the fetched content
-            logger: An optional pre-configured logger instance.
-            log_name: Name for the logger if one needs to be created.
-            log_file: Optional file path to log output to.
-            log_level: Logging severity level (e.g., logging.INFO)
-            http_ip: Optional IP address for remote logging.
-            http_port: Optional port for remote logging.
-        """
-        super().__init__()
         self.core = core
         self.constructor = constructor
+        self.logger = logger or configure_app_logging(
+            log_name,
+            log_file=log_file,
+            level=log_level,
+            http_ip=http_ip,
+            http_port=http_port,
+        )
 
-        if logger is not None:
-            self.logger = logger
-        else:
-            # Create a dedicated, re-usable logger; safe to call multiple times thanks to setup_logger
-            self.logger = configure_app_logging(
-                log_name,
-                log_file=log_file,
-                level=log_level,
-                http_ip=http_ip,
-                http_port=http_port,
-            )
-
-    async def iterator(
-            self,
-            target_page_urls: List[str], # List of page URLs to search for videos on
-            video_link_extractor: Callable[..., Any] | None = None, # The extractor function that gets the video urls from a page
-            max_page_concurrency: int = 5, # How many pages to scrape at the same time
-            max_video_concurrency: int = 20, # How many videos to scrape at the same time
-            page_request_method: str = "GET", # The method for requesting the page
-            fetch_html: bool = True, # Whether to also load html content for the object directly here
-            fetch_api: bool = True, # Whether to also load data from an api endpoint
-            fetch_anything_else: bool = False, # Maybe some other stuff that can be used idk yet
-            ignore_errors: bool = True, # Whether errors should be ignored (untested lol)
-            on_video_error: Callable[[str, Exception, int], Awaitable[bool]] | None = None, # Custom function that handles retrying
-            on_page_error: Callable[[str, Exception, int], Awaitable[bool]] | None = None, # .._..
-            keep_original_order: bool = False # Whether to keep the original order of videos as they appeared on the page
-
-    ) -> AsyncGenerator[Any, None]:
+    def iterator(
+        self,
+        target_page_urls: Sequence[str],
+        item_extractor: Callable[[Any], Iterable[Mapping[str, Any]]],
+        *,
+        max_page_concurrency: int = 5,
+        max_item_concurrency: int = 20,
+        max_pending_items: int | None = None,
+        page_request_method: str = "GET",
+        item_url_key: str = "url",
+        extract_in_thread: bool = True,
+        load_fields: Iterable[str] = (),
+        load_sources: Iterable[str] = (),
+        order: ResultOrder | str = ResultOrder.COMPLETION,
+        page_error_mode: ErrorMode | str = ErrorMode.YIELD,
+        item_error_mode: ErrorMode | str = ErrorMode.YIELD,
+        page_retry: RetryPolicy | None = None,
+        item_retry: RetryPolicy | None = None,
+        page_error_handler: ErrorHandler | None = None,
+        item_error_handler: ErrorHandler | None = None,
+    ) -> ScrapeStream[MediaT]:
         """
-        The main scraping engine that orchestrates concurrent page and video processing.
+        Create a lazily started scrape stream.
+
+        Extractors are synchronous callables returning an iterable of mappings.
+        By default the complete extractor iteration runs in a worker thread so
+        HTML parsing cannot block the event loop. Every mapping must contain a
+        non-empty string under ``item_url_key`` and must be accepted as keyword
+        arguments by ``constructor`` in addition to ``core``.
+
+        ``load_sources`` runs before ``load_fields`` for each new instance. Both
+        are optional; with neither configured, Helper only constructs models.
+        Expected failures follow each stage's bounded retry policy and terminal
+        error mode. Handler decisions can override the terminal mode but cannot
+        exceed ``RetryPolicy.max_attempts``.
         """
-        logger = self.logger
-        video_queue = asyncio.Queue()  # The page worker will give his video URLs into this queue (consumer / producer pattern)
-        page_queue = asyncio.Queue()  # Stores the page URLs in a queue to apply retry logic later
-        results_queue = asyncio.Queue()  # This is the queue that stores the actual videos
-        page_videos_count: dict[int, int] = {} # This stores information about the order
-        _DONE = object()
+        urls = tuple(target_page_urls)
+        if any(not isinstance(url, str) or not url for url in urls):
+            raise ValueError("target_page_urls must contain non-empty strings")
+        if not callable(item_extractor):
+            raise TypeError("item_extractor must be callable")
+        if max_page_concurrency < 1 or max_item_concurrency < 1:
+            raise ValueError("page and item concurrency must both be at least 1")
+        if max_pending_items is None:
+            max_pending_items = max_item_concurrency * 4
+        if max_pending_items < 1:
+            raise ValueError("max_pending_items must be at least 1")
+        if not isinstance(item_url_key, str) or not item_url_key:
+            raise ValueError("item_url_key must be a non-empty string")
 
-        for index, url in enumerate(target_page_urls):
-            page_queue.put_nowait((index, url, 1))
+        normalized_order = ResultOrder(order)
+        normalized_page_mode = ErrorMode(page_error_mode)
+        normalized_item_mode = ErrorMode(item_error_mode)
+        normalized_fields = tuple(dict.fromkeys(load_fields))
+        normalized_sources = tuple(dict.fromkeys(load_sources))
 
-        async def fetch_page(url: str) -> str:
-            """
-            Fetches the HTML content of a page (URL) using a strict number of maximum concurrent tasks as defined
-            by the semaphore and 'max_page_concurrency' variable.
+        generator = self._iterate(
+            urls=urls,
+            item_extractor=item_extractor,
+            max_page_concurrency=max_page_concurrency,
+            max_item_concurrency=max_item_concurrency,
+            max_pending_items=max_pending_items,
+            page_request_method=page_request_method,
+            item_url_key=item_url_key,
+            extract_in_thread=extract_in_thread,
+            load_fields=normalized_fields,
+            load_sources=normalized_sources,
+            order=normalized_order,
+            page_error_mode=normalized_page_mode,
+            item_error_mode=normalized_item_mode,
+            page_retry=page_retry or RetryPolicy(),
+            item_retry=item_retry or RetryPolicy(),
+            page_error_handler=page_error_handler,
+            item_error_handler=item_error_handler,
+        )
+        return ScrapeStream(generator)
 
-            Returns the HTML Content
-            """
-            logger.debug(f"Fetching Page: {url}")
-            return await self.core.fetch(url, method=page_request_method)
+    async def _iterate(
+        self,
+        *,
+        urls: tuple[str, ...],
+        item_extractor: Callable[[Any], Iterable[Mapping[str, Any]]],
+        max_page_concurrency: int,
+        max_item_concurrency: int,
+        max_pending_items: int,
+        page_request_method: str,
+        item_url_key: str,
+        extract_in_thread: bool,
+        load_fields: tuple[str, ...],
+        load_sources: tuple[str, ...],
+        order: ResultOrder,
+        page_error_mode: ErrorMode,
+        item_error_mode: ErrorMode,
+        page_retry: RetryPolicy,
+        item_retry: RetryPolicy,
+        page_error_handler: ErrorHandler | None,
+        item_error_handler: ErrorHandler | None,
+    ) -> AsyncGenerator[ScrapeResult[MediaT], None]:
+        page_cursor = 0
+        pending_items: deque[_ItemJob] = deque()
+        page_tasks: dict[asyncio.Task[_PageOutcome[MediaT]], _PageJob] = {}
+        item_tasks: dict[asyncio.Task[_ItemOutcome[MediaT]], _ItemJob] = {}
+        ordered = _OrderedResultBuffer[MediaT](len(urls))
 
-        async def page_worker():
-            while True:
-                try:
-                    page_index, page_url, attempt_count = await page_queue.get()
+        try:
+            while (
+                page_cursor < len(urls)
+                or page_tasks
+                or pending_items
+                or item_tasks
+            ):
+                # A bounded backlog provides backpressure: when item processing is
+                # slower than page extraction, no additional pages are started.
+                while (
+                    page_cursor < len(urls)
+                    and len(page_tasks) < max_page_concurrency
+                    and len(pending_items) < max_pending_items
+                ):
+                    page_job = _PageJob(page_cursor, urls[page_cursor])
+                    page_task = asyncio.create_task(
+                        self._process_page(
+                            page_job,
+                            item_extractor=item_extractor,
+                            request_method=page_request_method,
+                            item_url_key=item_url_key,
+                            extract_in_thread=extract_in_thread,
+                            retry_policy=page_retry,
+                            error_mode=page_error_mode,
+                            error_handler=page_error_handler,
+                        ),
+                        name=f"scrape-page-{page_job.index}",
+                    )
+                    page_tasks[page_task] = page_job
+                    page_cursor += 1
 
-                except asyncio.CancelledError:
-                    return  # Exits the loop
+                while pending_items and len(item_tasks) < max_item_concurrency:
+                    item_job = pending_items.popleft()
+                    item_task = asyncio.create_task(
+                        self._process_item(
+                            item_job,
+                            load_fields=load_fields,
+                            load_sources=load_sources,
+                            retry_policy=item_retry,
+                            error_mode=item_error_mode,
+                            error_handler=item_error_handler,
+                        ),
+                        name=(
+                            f"scrape-item-{item_job.page_index}-"
+                            f"{item_job.item_index}"
+                        ),
+                    )
+                    item_tasks[item_task] = item_job
 
-                task_cleared = False
+                active_tasks: set[asyncio.Task[Any]] = set(page_tasks)
+                active_tasks.update(item_tasks)
+                if not active_tasks:
+                    # The loop condition says work remains, so reaching this branch
+                    # would indicate a scheduler invariant bug rather than a remote
+                    # scrape failure.
+                    raise RuntimeError("Helper scheduler has pending work but no active tasks")
 
-                try:
-                    self.logger.debug(f"Fetching Page HTML: {page_url}")
-                    html_content = await fetch_page(page_url)
+                done, _ = await asyncio.wait(
+                    active_tasks, return_when=asyncio.FIRST_COMPLETED
+                )
+                ready_results: list[ScrapeResult[MediaT]] = []
 
-                    if isinstance(html_content, Response):
-                        if html_content.status_code == 404:
-                            raise NoPageLeft("No pages left, exiting...")
+                for generic_task in done:
+                    if generic_task in page_tasks:
+                        page_task = cast(
+                            asyncio.Task[_PageOutcome[MediaT]], generic_task
+                        )
+                        page_tasks.pop(page_task)
+                        page_outcome = page_task.result()
 
-                    extracted_videos = await asyncio.to_thread(video_link_extractor, html_content)
-                    page_videos_count[page_index] = len(extracted_videos)
-                    if len(extracted_videos) == 0:
-                        raise NoPageLeft("No videos extracted, assuming end of pagination...")
-                    # When we pass the HTML content to the extractor so that bs4 can extract it, it will take a minimum time
-                    # of like 20ms. This would block our event loop and prevent new network requests, so this optimizes the
-                    # speed by offloading it to another thread
+                        if order is ResultOrder.ORIGINAL:
+                            ordered.add_page(page_outcome)
+                        elif page_outcome.result is not None:
+                            ready_results.append(page_outcome.result)
 
-                except NoPageLeft:
-                    if not task_cleared:
-                        page_videos_count[page_index] = 0
-                        # Prune the page queue to avoid useless requests for remaining pages
-                        while not page_queue.empty():
-                            try:
-                                pruned_item = page_queue.get_nowait()
-                                page_videos_count[pruned_item[0]] = 0
-                                page_queue.task_done()
-                            except asyncio.QueueEmpty:
-                                break
-                except Exception as e:
-                    self.logger.error(f"Failed to fetch page: {e}", exc_info=True)
+                        pending_items.extend(page_outcome.items)
+                    else:
+                        item_task = cast(
+                            asyncio.Task[_ItemOutcome[MediaT]], generic_task
+                        )
+                        item_tasks.pop(item_task)
+                        item_outcome = item_task.result()
 
-                    if on_page_error is not None or ignore_errors:
-                        try:
-                            if on_page_error is not None:
-                                should_retry = await on_page_error(page_url, e, attempt_count)
+                        if order is ResultOrder.ORIGINAL:
+                            ordered.add_item(item_outcome)
+                        elif item_outcome.result is not None:
+                            ready_results.append(item_outcome.result)
 
-                                if should_retry:
-                                    self.logger.info(f"Re-Queuing {page_url}!")
-                                    await page_queue.put((page_index, page_url, attempt_count + 1))
-                                    page_queue.task_done()
-                                    task_cleared = True
-                                    continue
+                if order is ResultOrder.ORIGINAL:
+                    ready_results.extend(ordered.drain())
 
-                        except Exception as callback_error:
-                            self.logger.error(f"Error inside the provided callback: {callback_error}", exc_info=True)
-                            raise CallbackError("""
-    Warning: Your callback did not return True, because of that the failed video will NOT be appended to the queue
-    and it will be skipped processing!""") from callback_error
+                for result in ready_results:
+                    yield result
+        finally:
+            # This is the single owner of all scheduler tasks. It runs on normal
+            # exhaustion, typed failure, caller cancellation, or ScrapeStream.close.
+            remaining_tasks: list[asyncio.Task[Any]] = [*page_tasks, *item_tasks]
+            for task in remaining_tasks:
+                task.cancel()
+            if remaining_tasks:
+                await asyncio.gather(*remaining_tasks, return_exceptions=True)
 
-                    if not task_cleared:
-                        page_videos_count[page_index] = 0
+    async def _process_page(
+        self,
+        job: _PageJob,
+        *,
+        item_extractor: Callable[[Any], Iterable[Mapping[str, Any]]],
+        request_method: str,
+        item_url_key: str,
+        extract_in_thread: bool,
+        retry_policy: RetryPolicy,
+        error_mode: ErrorMode,
+        error_handler: ErrorHandler | None,
+    ) -> _PageOutcome[MediaT]:
+        async def operation() -> tuple[_ItemJob, ...]:
+            self.logger.debug("Fetching page %s: %s", job.index, job.url)
+            content = await self.core.fetch(job.url, method=request_method)
 
-                if page_index in page_videos_count and page_videos_count[page_index] > 0:
-                    for video_idx, video_data in enumerate(extracted_videos):
-                        await video_queue.put((page_index, video_idx, video_data, 1))
+            def extract_all() -> tuple[Mapping[str, Any], ...]:
+                extracted = item_extractor(content)
+                if inspect.isawaitable(extracted):
+                    raise TypeError(
+                        "item_extractor must be synchronous; Helper can move it "
+                        "to a worker thread"
+                    )
+                return tuple(extracted)
 
-                if not task_cleared:
-                    page_queue.task_done()
+            if extract_in_thread:
+                extracted_items = await asyncio.to_thread(extract_all)
+            else:
+                extracted_items = extract_all()
 
-        async def video_worker():
-            while True:
-                try:
-                    page_index, video_index, video_data, attempt_count = await video_queue.get()  # Pulls the Video URL from the queue
+            jobs: list[_ItemJob] = []
+            for item_index, raw_item in enumerate(extracted_items):
+                if not isinstance(raw_item, Mapping):
+                    raise TypeError(
+                        "item_extractor entries must be mappings; received "
+                        f"{type(raw_item).__name__} at index {item_index}"
+                    )
+                data = dict(raw_item)
+                item_url = data.get(item_url_key)
+                if not isinstance(item_url, str) or not item_url:
+                    raise ValueError(
+                        f"extractor item {item_index} must contain a non-empty "
+                        f"string under key {item_url_key!r}"
+                    )
+                jobs.append(_ItemJob(job.index, item_index, item_url, data))
+            return tuple(jobs)
 
-                except asyncio.CancelledError:
-                    return  # Exit the loop if we already canceled remaining parts
-                url = video_data.get("url")
-                result = ScrapeResult(url)
-                task_cleared = False
+        attempt = await self._run_operation(
+            operation,
+            stage=ScrapeStage.PAGE,
+            url=job.url,
+            page_index=job.index,
+            item_index=None,
+            retry_policy=retry_policy,
+            error_mode=error_mode,
+            error_handler=error_handler,
+            error_factory=lambda error, number: PageFetchError(
+                job.url, error, number, job.index
+            ),
+        )
+        if attempt.error is None:
+            return _PageOutcome(job, cast(tuple[_ItemJob, ...], attempt.value), None)
 
-                try:
-                    instance = self.constructor(core=self.core, **video_data)
-
-                    if fetch_html or fetch_api or fetch_anything_else:
-                        await instance.load(api=fetch_api, html=fetch_html, anything=fetch_anything_else)
-
-
-                    result.video = instance
-                    result.is_success = True
-                    # In this case the video was successfully fetched
-
-                    await results_queue.put((page_index, video_index, result))
-
-                except Exception as e:
-                    logger.error(f"Failed to scrape Video URL: {e}", exc_info=True)
-                    if on_video_error is not None or ignore_errors:
-                        try:
-                            if on_video_error is not None:
-                                should_retry = await on_video_error(url, e, attempt_count)
-
-                                if should_retry:
-                                    self.logger.info(f"Re-Queuing {url}!")
-                                    await video_queue.put((page_index, video_index, video_data, attempt_count + 1))
-                                    video_queue.task_done()
-                                    task_cleared = True
-                                    continue
-
-                        except Exception as callback_error:
-                            self.logger.error(f"Error inside the provided callback: {callback_error}", exc_info=True)
-                            raise CallbackError("""
-    Warning: Your callback did not return True, because of that the failed video will NOT be appended to the queue
-    and it will be skipped processing!""") from callback_error
-
-                    result.error = e
-                    await results_queue.put((page_index, video_index, result))
-
-                finally:
-                    if not task_cleared:
-                        video_queue.task_done()
-
-        async def create_page_queue():
-            for index, url in enumerate(target_page_urls):
-                await page_queue.put((index, url, 1))
-
-        async def worker_supervisor():
-            try:
-                await page_queue.join()
-                await video_queue.join()
-            finally:
-                await results_queue.put(None)
-
-        async with asyncio.TaskGroup() as tg:
-            page_tasks = [
-                tg.create_task(page_worker(), name=f"page-worker-{index}")
-                for index in range(max_page_concurrency)
-            ]
-            video_workers = [
-                tg.create_task(video_worker(), name=f"video-worker-{index}")
-                for index in range(max_video_concurrency)
-            ]
-            supervisor = tg.create_task(
-                worker_supervisor(),
-                name="scrape-supervisor",
+        result: ScrapeResult[MediaT] | None = None
+        if attempt.action is ErrorAction.YIELD:
+            result = ScrapeResult(
+                stage=ScrapeStage.PAGE,
+                url=job.url,
+                page_index=job.index,
+                item_index=None,
+                attempts=attempt.attempts,
+                error=attempt.error,
             )
+        return _PageOutcome(job, (), result)
 
-            expected_page = 0
-            expected_video = 0
-            buffer: dict[tuple[int, int], ScrapeResult] = {}
+    async def _process_item(
+        self,
+        job: _ItemJob,
+        *,
+        load_fields: tuple[str, ...],
+        load_sources: tuple[str, ...],
+        retry_policy: RetryPolicy,
+        error_mode: ErrorMode,
+        error_handler: ErrorHandler | None,
+    ) -> _ItemOutcome[MediaT]:
+        async def operation() -> MediaT:
+            instance = self.constructor(core=self.core, **job.data)
+            if not isinstance(instance, BaseMedia):
+                raise TypeError(
+                    "Helper constructors must return a BaseMedia instance; "
+                    f"received {type(instance).__name__}"
+                )
+            if load_sources:
+                await instance.load_sources(*load_sources)
+            if load_fields:
+                await instance.load_fields(*load_fields)
+            return instance
 
+        attempt = await self._run_operation(
+            operation,
+            stage=ScrapeStage.ITEM,
+            url=job.url,
+            page_index=job.page_index,
+            item_index=job.item_index,
+            retry_policy=retry_policy,
+            error_mode=error_mode,
+            error_handler=error_handler,
+            error_factory=lambda error, number: ItemFetchError(
+                job.url,
+                error,
+                number,
+                job.page_index,
+                job.item_index,
+            ),
+        )
+        if attempt.error is None:
+            success_result = ScrapeResult(
+                stage=ScrapeStage.ITEM,
+                url=job.url,
+                page_index=job.page_index,
+                item_index=job.item_index,
+                attempts=attempt.attempts,
+                item=cast(MediaT, attempt.value),
+            )
+            return _ItemOutcome(job, success_result)
+
+        failure_result: ScrapeResult[MediaT] | None = None
+        if attempt.action is ErrorAction.YIELD:
+            failure_result = ScrapeResult(
+                stage=ScrapeStage.ITEM,
+                url=job.url,
+                page_index=job.page_index,
+                item_index=job.item_index,
+                attempts=attempt.attempts,
+                error=attempt.error,
+            )
+        return _ItemOutcome(job, failure_result)
+
+    async def _run_operation(
+        self,
+        operation: Callable[[], Awaitable[OperationT]],
+        *,
+        stage: ScrapeStage,
+        url: str,
+        page_index: int,
+        item_index: int | None,
+        retry_policy: RetryPolicy,
+        error_mode: ErrorMode,
+        error_handler: ErrorHandler | None,
+        error_factory: Callable[[Exception, int], ScrapeOperationError],
+    ) -> _AttemptOutcome[OperationT]:
+        """Run one bounded retry loop and convert its terminal disposition."""
+        for attempt in range(1, retry_policy.max_attempts + 1):
             try:
-                while True:
-                    result_item = await results_queue.get()
+                value = await operation()
+                return _AttemptOutcome(value, None, None, attempt)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                context = ScrapeErrorContext(
+                    stage=stage,
+                    url=url,
+                    error=error,
+                    attempt=attempt,
+                    max_attempts=retry_policy.max_attempts,
+                    page_index=page_index,
+                    item_index=item_index,
+                )
+                action = await self._error_action(
+                    context,
+                    retry_policy=retry_policy,
+                    error_mode=error_mode,
+                    error_handler=error_handler,
+                )
 
-                    if result_item is _DONE:
-                        if keep_original_order:
-                            while True:
-                                while (expected_page in page_videos_count and expected_video >= page_videos_count[expected_page]
-                                ):
-                                    expected_page += 1
-                                    expected_video = 0
+                if action is ErrorAction.RETRY and attempt < retry_policy.max_attempts:
+                    delay = retry_policy.delay_after(attempt)
+                    self.logger.warning(
+                        "Retrying %s %s after attempt %s/%s in %.3fs: %s",
+                        stage.value,
+                        url,
+                        attempt,
+                        retry_policy.max_attempts,
+                        delay,
+                        error,
+                    )
+                    if delay:
+                        await asyncio.sleep(delay)
+                    continue
 
-                                key = (expected_page, expected_video)
-                                if key not in buffer:
-                                    break
+                # A handler cannot create an unbounded retry loop. RETRY on the
+                # final permitted attempt falls back to the configured mode.
+                if action is ErrorAction.RETRY:
+                    action = ErrorAction(error_mode.value)
 
-                                yield buffer.pop(key)
-                                expected_video += 1
+                wrapped_error = error_factory(error, attempt)
+                if action is ErrorAction.RAISE:
+                    raise wrapped_error from error
+                return _AttemptOutcome(None, wrapped_error, action, attempt)
 
-                        break
+        raise RuntimeError("retry loop exhausted without returning an outcome")
 
-                    page_idx, video_idx, result_obj = result_item
+    async def _error_action(
+        self,
+        context: ScrapeErrorContext,
+        *,
+        retry_policy: RetryPolicy,
+        error_mode: ErrorMode,
+        error_handler: ErrorHandler | None,
+    ) -> ErrorAction:
+        """Resolve automatic policy or validate a custom handler decision."""
+        if error_handler is None:
+            if (
+                context.attempt < retry_policy.max_attempts
+                and retry_policy.permits(context.error)
+            ):
+                return ErrorAction.RETRY
+            return ErrorAction(error_mode.value)
 
-                    if not keep_original_order:
-                        yield result_obj
-                        continue
-
-                    buffer[(page_idx, video_idx)] = result_obj
-
-                    while True:
-                        while (expected_page in page_videos_count and expected_video >= page_videos_count[expected_page]
-                        ):
-                            expected_page += 1
-                            expected_video = 0
-
-                        key = (expected_page, expected_video)
-                        if key not in buffer:
-                            break
-
-                        yield buffer.pop(key)
-                        expected_video += 1
-
-            finally:
-                # Covers normal completion, consumer break, cancellation and aclose().
-                supervisor.cancel()
-
-                for task in page_tasks:
-                    task.cancel()
-
-                for task in video_workers:
-                    task.cancel()
-
-
-class ScrapeResult:
-    def __init__(self, url: str):
-        self.url = url
-        self.video: Any = None
-        self.error: Exception | None = None
-        self.is_success: bool = False
+        try:
+            decision = error_handler(context)
+            if inspect.isawaitable(decision):
+                decision = await decision
+            if not isinstance(decision, ErrorAction):
+                raise TypeError(
+                    "error handlers must return an ErrorAction value, received "
+                    f"{decision!r}"
+                )
+            return decision
+        except asyncio.CancelledError:
+            raise
+        except Exception as handler_error:
+            raise ErrorHandlerError(
+                context.stage.value, context.url, handler_error
+            ) from handler_error
 
 
 class BaseCore:

@@ -1,8 +1,68 @@
-__all__ = ["BaseCore", "Callback", "config", "errors",  "Cache", "DownloadConfigRAW", "DownloadConfigHLS",
-           "Helper", "on_error_hint", "ScrapeResult", "BaseMedia"]
+__all__ = [
+    "BaseCore",
+    "BaseMedia",
+    "Cache",
+    "Callback",
+    "DownloadConfigHLS",
+    "DownloadConfigRAW",
+    "DataNotLoadedError",
+    "ErrorAction",
+    "ErrorHandler",
+    "ErrorHandlerError",
+    "ErrorMode",
+    "FieldNotLoadableError",
+    "Helper",
+    "ItemFetchError",
+    "LoadState",
+    "LoaderConfigurationError",
+    "LoaderContractError",
+    "MediaLoadError",
+    "MediaLoadErrors",
+    "PageFetchError",
+    "ResultOrder",
+    "RetryPolicy",
+    "ScrapeErrorContext",
+    "ScrapeOperationError",
+    "ScrapeResult",
+    "ScrapeStage",
+    "ScrapeStream",
+    "config",
+    "errors",
+    "media_field",
+    "UnknownMediaFieldError",
+]
 
 
 from base_api.modules import errors
 from base_api.modules.progress_bars import Callback
-from base_api.base import BaseCore, Cache, Helper, ScrapeResult, BaseMedia
-from base_api.modules.config import config, DownloadConfigHLS, DownloadConfigRAW, on_error_hint
+from base_api.modules.errors import (
+    DataNotLoadedError,
+    ErrorHandlerError,
+    FieldNotLoadableError,
+    ItemFetchError,
+    LoaderConfigurationError,
+    LoaderContractError,
+    MediaLoadError,
+    MediaLoadErrors,
+    PageFetchError,
+    ScrapeOperationError,
+    UnknownMediaFieldError,
+)
+from base_api.base import (
+    BaseCore,
+    BaseMedia,
+    Cache,
+    ErrorAction,
+    ErrorHandler,
+    ErrorMode,
+    Helper,
+    LoadState,
+    ResultOrder,
+    RetryPolicy,
+    ScrapeErrorContext,
+    ScrapeResult,
+    ScrapeStage,
+    ScrapeStream,
+    media_field,
+)
+from base_api.modules.config import config, DownloadConfigHLS, DownloadConfigRAW

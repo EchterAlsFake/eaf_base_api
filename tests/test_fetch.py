@@ -1,8 +1,6 @@
 import pytest
-import asyncio
 from base_api.base import BaseCore
 from base_api.modules.config import RuntimeConfig
-from base_api.modules.errors import NetworkingError
 
 import pytest_asyncio
 
