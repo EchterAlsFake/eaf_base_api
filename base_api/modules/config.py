@@ -43,6 +43,9 @@ class RuntimeConfig:
         self.interface: str | None = None # IP Address of the network interface you want to bind to
 
 
+config = RuntimeConfig()
+
+
 @dataclass
 class BaseConfigDownload:
     quality: possible_qualities | possible_qualities_int
@@ -50,6 +53,7 @@ class BaseConfigDownload:
     callback: callback_hint = None
     no_title: bool = False
     stop_event: asyncio.Event | None = None
+
 
 @dataclass
 class DownloadConfigHLS(BaseConfigDownload):
@@ -74,25 +78,54 @@ class DownloadConfigRAW(BaseConfigDownload):
     max_retries: int = 5
 
 
+@dataclass
 class IteratorConfig:
-    max_page_concurrency: int = 5 # How many pages to scrape at max concurrency
-    max_item_concurrency: int = 20 # How many items to scrape at max concurrency
-    max_pending_items: int | None = None  # Defines the max pending limit which is needed to limit memory usage
-    extract_in_thread: bool = True # Whether to offload the extraction to asyncio.to_thread(). Useful for heavy selectolax parsing, useless for simple JSON parsing
+    max_page_concurrency: int | None = None
+    max_item_concurrency: int | None = None
+    max_pending_items: int | None = None
+
+    extract_in_thread: bool = True
     order: ResultOrder | str = ResultOrder.COMPLETION
-    page_error_mode: ErrorMode | str = ErrorMode.YIELD # How to handle page errors
-    item_error_mode: ErrorMode | str = ErrorMode.YIELD # How to handle item errors
+    page_error_mode: ErrorMode | str = ErrorMode.YIELD
+    item_error_mode: ErrorMode | str = ErrorMode.YIELD
     page_retry: RetryPolicy | None = None
     item_retry: RetryPolicy | None = None
-    page_error_handler: ErrorHandler | None = None # Custom function for handling retrying (pages)
-    item_error_handler: ErrorHandler | None = None  # Custom function for handling retrying (items)
+    page_error_handler: ErrorHandler | None = None
+    item_error_handler: ErrorHandler | None = None
 
-    load_specific_fields: Iterable[str] = () # Loads the actual fields from the available and fetched sources
-    load_specific_sources: Iterable[str] = () # Runs before load_fields(), defines which source to load e.g., from html or from an API endpoint
+    load_specific_fields: Iterable[str] = ()
+    load_specific_sources: Iterable[str] = ()
 
+    _page_request_method: str = "GET"
+    _item_url_key: str = "url"
 
-    _page_request_method: str = "GET"  # Some pages require POST requests (depends per API)
-    _item_url_key: str = "url" # The actual Video / Short whatever URL returned in the dictionary by the item extractor
-
-# Singleton instance needed for my Porn Fetch project
-config = RuntimeConfig()
+    def resolve(self, runtime_config: RuntimeConfig) -> "IteratorConfig":
+        """
+        Creates a resolved copy of IteratorConfig where any unassigned (None)
+        concurrency values are pulled live from runtime_config.
+        """
+        return IteratorConfig(
+            max_page_concurrency=(
+                self.max_page_concurrency
+                if self.max_page_concurrency is not None
+                else runtime_config.pages_concurrency
+            ),
+            max_item_concurrency=(
+                self.max_item_concurrency
+                if self.max_item_concurrency is not None
+                else runtime_config.videos_concurrency
+            ),
+            max_pending_items=self.max_pending_items,
+            extract_in_thread=self.extract_in_thread,
+            order=self.order,
+            page_error_mode=self.page_error_mode,
+            item_error_mode=self.item_error_mode,
+            page_retry=self.page_retry,
+            item_retry=self.item_retry,
+            page_error_handler=self.page_error_handler,
+            item_error_handler=self.item_error_handler,
+            load_specific_fields=self.load_specific_fields,
+            load_specific_sources=self.load_specific_sources,
+            _page_request_method=self._page_request_method,
+            _item_url_key=self._item_url_key,
+        )
