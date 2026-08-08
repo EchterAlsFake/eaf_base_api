@@ -1048,6 +1048,8 @@ class Helper(Generic[MediaT]):
         exceed ``RetryPolicy.max_attempts``.
         """
         urls = tuple(target_page_urls)
+        iterator_config = iterator_config.resolve(self.core.configuration)
+
         max_page_concurrency = iterator_config.max_page_concurrency
         max_item_concurrency = iterator_config.max_item_concurrency
         max_pending_items = iterator_config.max_pending_items
