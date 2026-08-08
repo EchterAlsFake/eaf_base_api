@@ -232,8 +232,8 @@ def _unloaded_value() -> _UnloadedValue:
 
 
 def media_field(
-    *sources: str,
-    default: Any = MISSING,
+    *sources: str, # Tuple that defines the sources in which the field can appear e.g., (html, api)
+    default: Any = MISSING, # The default state for the field is missing cuz yeah it hasn't been loaded yet
     default_factory: Callable[[], Any] | Any = MISSING,
     repr: bool = False,
     compare: bool = False,
@@ -260,14 +260,14 @@ def media_field(
     if not sources:
         raise ValueError("media_field() requires at least one loader source")
 
-    normalized_sources: list[str] = []
+    normalized_sources: list[str] = [] # Converts it into a list
     for source in sources:
-        if not isinstance(source, str) or not source or not source.isidentifier():
+        if not isinstance(source, str) or not source or not source.isidentifier(): # just checks if source is a valid string
             raise ValueError(
                 "media loader sources must be non-empty Python identifiers; "
                 f"received {source!r}"
             )
-        if source in normalized_sources:
+        if source in normalized_sources: # You shouldn't provide ("html", "html") because why?
             raise ValueError(f"media field source {source!r} was declared twice")
         normalized_sources.append(source)
 
@@ -275,80 +275,106 @@ def media_field(
         raise ValueError("media_field() cannot receive both default and default_factory")
 
     field_metadata = dict(metadata or {})
-    if _MEDIA_SOURCES_KEY in field_metadata:
+    if _MEDIA_SOURCES_KEY in field_metadata: # You can't put the key for the field metadata as a field metadata because this interferes with the logic here, this should never happen though
         raise ValueError(f"metadata key {_MEDIA_SOURCES_KEY!r} is reserved")
-    field_metadata[_MEDIA_SOURCES_KEY] = tuple(normalized_sources)
+    field_metadata[_MEDIA_SOURCES_KEY] = tuple(normalized_sources) # Creates the field metadata with the source key + tuple of normalized sources e.g., (html, api)
 
     field_arguments: dict[str, Any] = {
         "repr": repr,
         "compare": compare,
         "metadata": field_metadata,
     }
+
+    # Repr and compare (__repr__ / __eq__) are False by default because if the element is not yet loaded
+    # and you try to log it, this would cause an error
+    # metadata holds the prepared dictionary of field / sources along with the media source key
+
     if default_factory is not MISSING:
         field_arguments["default_factory"] = default_factory
+        # If we just give [] or {} as a default value in an object this will raise an issue cuz Python
+        # for security reasons doesn't allow this because the memory would be shared between the different dataclass
+        # instances. That's why we give a list, dict function which then creates the actual [] or {} when the dataclass
+        # is created (yeah I know this seems weird, but needed)
     elif default is not MISSING:
         field_arguments["default"] = default
+        # If a default value was provided the field will automatically get this value and it won't be tried to load
     else:
         field_arguments["default"] = _UNLOADED
+        # We pick _UNLOADED here because the problem is that Python defaults to "None" for stuff that is
+        # really not Available or is just Empty. The problem is, that I can't distinguish then if something
+        # just isn't available because the HTML didn't expose it for example or if it's just empty.
+        # With _UNLOADED we can definitely know for sure that the element is NOT yet available and NEEDS to be loaded
 
-    return field(**field_arguments)
+    return field(**field_arguments) # Creates the dataclass with the keyword values
 
 
 class LoadState(StrEnum):
     """Observable lifecycle of one named ``BaseMedia`` source."""
-
-    NOT_LOADED = "not_loaded"
-    LOADING = "loading"
-    LOADED = "loaded"
-    FAILED = "failed"
+    NOT_LOADED = "not_loaded" # (html or api or whatever was not yet loaded(
+    LOADING = "loading" # It is currently loading e.g., being fetched
+    LOADED = "loaded" # It finished loading (this is good), don't need to fetch it again :)
+    FAILED = "failed" # It failed loading :(
 
 
 @dataclass(frozen=True, slots=True)
 class _MediaSchema:
     """Cached, validated view of a media dataclass's loadable fields."""
-
-    field_names: frozenset[str]
-    field_sources: dict[str, tuple[str, ...]]
-    source_fields: dict[str, frozenset[str]]
-    source_order: tuple[str, ...]
+    field_names: frozenset[str] # Set of field names e.g., ('title', 'description')
+    field_sources: dict[str, tuple[str, ...]] # Source map e.g.,: {'title': ('api', 'html')
+    source_fields: dict[str, frozenset[str]] # like field_sources but in reverse
+    source_order: tuple[str, ...] # Source order, usually ('api', 'html') cuz API is faster to load
 
 
 _MEDIA_SCHEMA_CACHE: dict[type[Any], _MediaSchema] = {}
+# Preserves a Cache of MediaScheme, because looking this up each time without would take time, this makes it faster
 
 
 def _media_schema(model_type: type[Any]) -> _MediaSchema:
     """Build source/field indexes once per concrete dataclass type."""
     cached = _MEDIA_SCHEMA_CACHE.get(model_type)
     if cached is not None:
-        return cached
+        return cached # Loads from cache
 
-    dataclass_fields = tuple(fields(model_type))
-    field_sources: dict[str, tuple[str, ...]] = {}
-    source_fields_mutable: dict[str, set[str]] = {}
-    source_order: list[str] = []
+    # Model Type is needed to tell the base layout of the class.
+    # If we do this per instance this would run as often as the instance appears which is unnecessary
+    # Because why would I need to build the media scheme 5000 times when I can just do it once, tell the future
+    # references which type it is and fetch it from cache, because guess what I won't randomly change
+    # the scheme mid runtime xD
+    dataclass_fields = tuple(fields(model_type)) # Variable annotations + metadata
+    field_sources: dict[str, tuple[str, ...]] = {} # Creates a mutable dict out of the field sources
+    source_fields_mutable: dict[str, set[str]] = {} # Creates a mutable dictionary out of the source fields
+    source_order: list[str] = [] # See above
+    # The fields need to be mutable here, because each new defined object in my classes need to be added
+    # to the dictionary. So this is only temporary and down below this is going back to a frozenset
 
     for dataclass_field in dataclass_fields:
+        # Get the tuple in the _MEDIA_SOURCES_KEY
         sources = dataclass_field.metadata.get(_MEDIA_SOURCES_KEY)
+        # sources = e.g., ("api", "html")
         if not sources:
-            continue
+            continue # Regular dataclass fields are ignored e.g., 'url' and 'core' for most classes
 
         field_sources[dataclass_field.name] = tuple(sources)
+        # Add e.g, title to field_sources, becomes {"title": ("api", "html")}
         for source in sources:
+            # .setdefault("api", set()) Does e.g., 'api' exist in this dictionary. If not
+            # Create it and return an empty set and add the dataclass field name
+            # So it becomes {"api": {"title"}}
             source_fields_mutable.setdefault(source, set()).add(dataclass_field.name)
             if source not in source_order:
                 source_order.append(source)
 
     schema = _MediaSchema(
-        field_names=frozenset(item.name for item in dataclass_fields),
-        field_sources=field_sources,
+        field_names=frozenset(item.name for item in dataclass_fields), # {"title", "duration", "raw_html"
+        field_sources=field_sources, # {"title": ("api", "html")
         source_fields={
-            source: frozenset(field_names)
+            source: frozenset(field_names) # "api": frozenset({"title", "duration"})
             for source, field_names in source_fields_mutable.items()
         },
-        source_order=tuple(source_order),
+        source_order=tuple(source_order), # ("api", "html")
     )
-    _MEDIA_SCHEMA_CACHE[model_type] = schema
-    return schema
+    _MEDIA_SCHEMA_CACHE[model_type] = schema # Loads it into the cache
+    return schema # Return the final scheme
 
 
 @dataclass(slots=True, kw_only=True, repr=False)
@@ -402,18 +428,33 @@ class BaseMedia:
         if value is not _UNLOADED:
             return value
 
+        # Because we override the __getattribute__ method, we need to call object.__getattribute__.
+        # If I'd use self.<something> we would get a recursion error as the function would call itself infinitely
+
         model_type = type(self)
+        """
+        Explanation why model_type exists:
+        So, basically when we build the schema (down below) this takes some time. However, this function actually
+        caches the fully resolved dataclass. So if we are going over a thousand Video objects usually we would need
+        to reconstruct the thousand video objects, well, a thousand times.
+        
+        By giving the model_type with self, we can tell the cache: Yo, this is a Video object. See if you have
+        already processed this and if yes it will use this instead of processing it each time again.
+        Might only save a few milliseconds but I ain't Ubisoft XDDD
+        """
         schema = _media_schema(model_type)
-        sources = schema.field_sources.get(name, ())
-        url = object.__getattribute__(self, "url")
+        sources = schema.field_sources.get(name, ()) # E.g., ("api", "html") for name=title (PornHub API as an example)
+        url = object.__getattribute__(self, "url") # The actual URL to fetch e.g., https://example.com/video/id?=
         all_source_errors = object.__getattribute__(self, "_source_errors")
         relevant_errors = {
             source: all_source_errors[source]
             for source in sources
             if source in all_source_errors
-        }
+        } # Basically just checks which sources had an error e.g., if html failed fetching this will return html
         raise DataNotLoadedError(
             model_type.__name__, name, url, sources, relevant_errors
+            # Raises a custom exception that tells you which attribute failed with its associated source and the error
+            # that happened along with the actual URL (so that I can replicate it when you report it)
         )
 
     def __repr__(self) -> str:
@@ -427,7 +468,7 @@ class BaseMedia:
         states = object.__getattribute__(self, "_source_states")
         return frozenset(
             source for source, state in states.items() if state is LoadState.LOADED
-        )
+        ) # Returns the sources that have been successfully fetched
 
     @property
     def source_errors(self) -> Mapping[str, BaseException]:
@@ -443,12 +484,13 @@ class BaseMedia:
             )
         return object.__getattribute__(self, "_source_states").get(
             source, LoadState.NOT_LOADED
-        )
+        ) # Basically tells you the state of the source
 
     def is_field_loaded(self, field_name: str) -> bool:
         """Return whether a field contains a real value, including real ``None``."""
         self._validate_field_name(field_name)
         return object.__getattribute__(self, field_name) is not _UNLOADED
+        # Basically checks if a field has been loaded
 
     def unloaded_fields(self) -> frozenset[str]:
         """Return all declared media fields that still contain the sentinel."""
@@ -457,7 +499,7 @@ class BaseMedia:
             field_name
             for field_name in schema.field_sources
             if object.__getattribute__(self, field_name) is _UNLOADED
-        )
+        ) # Returns a set with all fields that have not yet been loaded
 
     def to_dict(
         self,
@@ -938,16 +980,16 @@ class ScrapeStream(Generic[MediaT]):
 
 @dataclass(frozen=True, slots=True)
 class _PageJob:
-    index: int
-    url: str
+    index: int # The Index of the Page
+    url: str # The URL of the Page
 
 
 @dataclass(frozen=True, slots=True)
 class _ItemJob:
-    page_index: int
-    item_index: int
-    url: str
-    data: dict[str, Any]
+    page_index: int # The Index of the Page (where the item was fetched from)
+    item_index: int # The Item Index (needed to keep total order)
+    url: str # The URL of the Item e.g., Video, Short URL
+    data: dict[str, Any] # The actual item data defined by the extractor. Given into the constructor class
 
 
 @dataclass(frozen=True, slots=True)
@@ -960,15 +1002,15 @@ class _AttemptOutcome(Generic[OperationT]):
 
 @dataclass(frozen=True, slots=True)
 class _PageOutcome(Generic[MediaT]):
-    job: _PageJob
-    items: tuple[_ItemJob, ...]
-    result: ScrapeResult[MediaT] | None
+    job: _PageJob # Contains the Page Job class
+    items: tuple[_ItemJob, ...] # Contains the Items, so the Videos, Shorts whatever (as ItemJob class)
+    result: ScrapeResult[MediaT] | None # The actual Scrape Result
 
 
 @dataclass(frozen=True, slots=True)
 class _ItemOutcome(Generic[MediaT]):
-    job: _ItemJob
-    result: ScrapeResult[MediaT] | None
+    job: _ItemJob # The Item Job class
+    result: ScrapeResult[MediaT] | None # The Scrape Result
 
 
 class _OrderedResultBuffer(Generic[MediaT]):
@@ -1056,8 +1098,8 @@ class Helper(Generic[MediaT]):
         http_ip: str | None = None,
         http_port: int | str | None = None,
     ) -> None:
-        self.core = core
-        self.constructor = constructor
+        self.core = core # The Networking Backend
+        self.constructor = constructor # The class that takes the data as input (dataclass) defined by each API
         self.logger = logger or configure_app_logging(
             log_name,
             log_file=log_file,
@@ -1068,24 +1110,24 @@ class Helper(Generic[MediaT]):
 
     def iterator(
         self,
-        target_page_urls: Sequence[str],
-        item_extractor: Callable[[Any], Iterable[Mapping[str, Any]]],
+        target_page_urls: Sequence[str], # This is just a list of target URLs to scrape from
+        item_extractor: Callable[[Any], Iterable[Mapping[str, Any]]], # The extractor that uses selectolax to parse data from the page
         *,
-        max_page_concurrency: int = 5,
-        max_item_concurrency: int = 20,
-        max_pending_items: int | None = None,
-        page_request_method: str = "GET",
-        item_url_key: str = "url",
-        extract_in_thread: bool = True,
-        load_fields: Iterable[str] = (),
-        load_sources: Iterable[str] = (),
+        max_page_concurrency: int = 5, # How many pages to scrape at max concurrency
+        max_item_concurrency: int = 20, # How many items to scrape at max concurrency
+        max_pending_items: int | None = None, # Defines the max pending limit which is needed to limit memory usage
+        page_request_method: str = "GET", # Some pages require POST requests (depends per API)
+        item_url_key: str = "url", # The actual Video / Short whatever URL returned in the dictionary by the item extractor
+        extract_in_thread: bool = True, # Whether to offload the extraction to asyncio.to_thread(). Useful for heavy selectolax parsing, useless for simple JSON parsing
+        load_fields: Iterable[str] = (), # Loads the actual fields from the available and fetched sources
+        load_sources: Iterable[str] = (), # Runs before load_fields(), defines which source to load e.g., from html or from an API endpoint
         order: ResultOrder | str = ResultOrder.COMPLETION,
-        page_error_mode: ErrorMode | str = ErrorMode.YIELD,
-        item_error_mode: ErrorMode | str = ErrorMode.YIELD,
+        page_error_mode: ErrorMode | str = ErrorMode.YIELD, # How to handle page errors
+        item_error_mode: ErrorMode | str = ErrorMode.YIELD, # How to handle item errors
         page_retry: RetryPolicy | None = None,
         item_retry: RetryPolicy | None = None,
-        page_error_handler: ErrorHandler | None = None,
-        item_error_handler: ErrorHandler | None = None,
+        page_error_handler: ErrorHandler | None = None, # Custom function for handling retrying (pages)
+        item_error_handler: ErrorHandler | None = None, # Custom function for handling retrying (items)
     ) -> ScrapeStream[MediaT]:
         """
         Create a lazily started scrape stream.
@@ -1103,6 +1145,8 @@ class Helper(Generic[MediaT]):
         exceed ``RetryPolicy.max_attempts``.
         """
         urls = tuple(target_page_urls)
+
+        # Validation of inputs
         if any(not isinstance(url, str) or not url for url in urls):
             raise ValueError("target_page_urls must contain non-empty strings")
         if not callable(item_extractor):
@@ -1172,19 +1216,19 @@ class Helper(Generic[MediaT]):
 
         try:
             while (
-                page_cursor < len(urls)
-                or page_tasks
-                or pending_items
-                or item_tasks
+                page_cursor < len(urls) # As long as not all URLs have been processed
+                or page_tasks # As long as page tasks still exist
+                or pending_items # As long as pending items still exist (not yet fired up as a task)
+                or item_tasks # As long as item tasks still exit
             ):
                 # A bounded backlog provides backpressure: when item processing is
                 # slower than page extraction, no additional pages are started.
                 while (
-                    page_cursor < len(urls)
-                    and len(page_tasks) < max_page_concurrency
-                    and len(pending_items) < max_pending_items
+                    page_cursor < len(urls) # As long as not all URLs have been processed
+                    and len(page_tasks) < max_page_concurrency # As long as the page task count is smaller than the total page concurrency
+                    and len(pending_items) < max_pending_items # __.__
                 ):
-                    page_job = _PageJob(page_cursor, urls[page_cursor])
+                    page_job = _PageJob(page_cursor, urls[page_cursor]) # Creates a job for fetching a page
                     page_task = asyncio.create_task(
                         self._process_page(
                             page_job,
