@@ -2,7 +2,7 @@ import asyncio
 
 from dataclasses import dataclass
 from typing import Dict, Any, Callable, Literal, Iterable
-from base_api import ResultOrder, ErrorMode, RetryPolicy, ErrorHandler
+from base_api.modules.type_hints import ResultOrder, ErrorMode, RetryPolicy, ErrorHandler
 
 type callback_hint = Callable[[int, int], None] | None
 type possible_qualities = Literal["hd", "sd", "144p", "240p", "360p", "480p", "540p", "720p", "1080p", "1440p", "2160p",
