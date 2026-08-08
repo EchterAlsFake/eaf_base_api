@@ -1,10 +1,7 @@
 import asyncio
 
 from dataclasses import dataclass
-from typing import Dict, Any, Callable, Literal
-
-from mypy.applytype import Iterable
-
+from typing import Dict, Any, Callable, Literal, Iterable
 from base_api import ResultOrder, ErrorMode, RetryPolicy, ErrorHandler
 
 type callback_hint = Callable[[int, int], None] | None
