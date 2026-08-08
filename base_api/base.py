@@ -12,7 +12,7 @@ import logging
 import traceback
 import threading
 from collections import deque
-from collections.abc import AsyncIterator, Iterable, Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from enum import StrEnum
 from functools import lru_cache
 from urllib.parse import urljoin
@@ -39,7 +39,7 @@ from base_api.modules.static_functions import (
     parse_challenge, other_challenge, least_factors,
     collect_variants, pick_by_label
 )
-from base_api.modules.config import config, RuntimeConfig, DownloadConfigHLS, DownloadConfigRAW
+from base_api.modules.config import config, RuntimeConfig, DownloadConfigHLS, DownloadConfigRAW, IteratorConfig
 from base_api.modules.progress_bars import Callback
 from base_api.modules.logger import configure_app_logging
 
@@ -1113,21 +1113,7 @@ class Helper(Generic[MediaT]):
         target_page_urls: Sequence[str], # This is just a list of target URLs to scrape from
         item_extractor: Callable[[Any], Iterable[Mapping[str, Any]]], # The extractor that uses selectolax to parse data from the page
         *,
-        max_page_concurrency: int = 5, # How many pages to scrape at max concurrency
-        max_item_concurrency: int = 20, # How many items to scrape at max concurrency
-        max_pending_items: int | None = None, # Defines the max pending limit which is needed to limit memory usage
-        page_request_method: str = "GET", # Some pages require POST requests (depends per API)
-        item_url_key: str = "url", # The actual Video / Short whatever URL returned in the dictionary by the item extractor
-        extract_in_thread: bool = True, # Whether to offload the extraction to asyncio.to_thread(). Useful for heavy selectolax parsing, useless for simple JSON parsing
-        load_fields: Iterable[str] = (), # Loads the actual fields from the available and fetched sources
-        load_sources: Iterable[str] = (), # Runs before load_fields(), defines which source to load e.g., from html or from an API endpoint
-        order: ResultOrder | str = ResultOrder.COMPLETION,
-        page_error_mode: ErrorMode | str = ErrorMode.YIELD, # How to handle page errors
-        item_error_mode: ErrorMode | str = ErrorMode.YIELD, # How to handle item errors
-        page_retry: RetryPolicy | None = None,
-        item_retry: RetryPolicy | None = None,
-        page_error_handler: ErrorHandler | None = None, # Custom function for handling retrying (pages)
-        item_error_handler: ErrorHandler | None = None, # Custom function for handling retrying (items)
+        iterator_config: IteratorConfig
     ) -> ScrapeStream[MediaT]:
         """
         Create a lazily started scrape stream.
@@ -1145,6 +1131,21 @@ class Helper(Generic[MediaT]):
         exceed ``RetryPolicy.max_attempts``.
         """
         urls = tuple(target_page_urls)
+        max_page_concurrency = iterator_config.max_page_concurrency
+        max_item_concurrency = iterator_config.max_item_concurrency
+        max_pending_items = iterator_config.max_pending_items
+        extract_in_thread = iterator_config.extract_in_thread
+        order = iterator_config.order
+        page_error_mode = iterator_config.page_error_mode
+        item_error_mode = iterator_config.item_error_mode
+        page_retry = iterator_config.page_retry
+        item_retry = iterator_config.item_retry
+        page_error_handler = iterator_config.page_error_handler
+        item_error_handler = iterator_config.page_error_handler
+        load_fields = iterator_config.load_specific_fields
+        load_sources = iterator_config.load_specific_sources
+        page_request_method = iterator_config._page_request_method
+        item_url_key = iterator_config._item_url_key
 
         # Validation of inputs
         if any(not isinstance(url, str) or not url for url in urls):

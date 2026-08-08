@@ -3,6 +3,10 @@ import asyncio
 from dataclasses import dataclass
 from typing import Dict, Any, Callable, Literal
 
+from mypy.applytype import Iterable
+
+from base_api import ResultOrder, ErrorMode, RetryPolicy, ErrorHandler
+
 type callback_hint = Callable[[int, int], None] | None
 type possible_qualities = Literal["hd", "sd", "144p", "240p", "360p", "480p", "540p", "720p", "1080p", "1440p", "2160p",
                                    "best", "worst", "half"]
@@ -69,6 +73,26 @@ class DownloadConfigRAW(BaseConfigDownload):
     chunk_size: int = 1024
     max_retries: int = 5
 
+
+class IteratorConfig:
+    max_page_concurrency: int = 5 # How many pages to scrape at max concurrency
+    max_item_concurrency: int = 20 # How many items to scrape at max concurrency
+    max_pending_items: int | None = None  # Defines the max pending limit which is needed to limit memory usage
+    extract_in_thread: bool = True # Whether to offload the extraction to asyncio.to_thread(). Useful for heavy selectolax parsing, useless for simple JSON parsing
+    order: ResultOrder | str = ResultOrder.COMPLETION
+    page_error_mode: ErrorMode | str = ErrorMode.YIELD # How to handle page errors
+    item_error_mode: ErrorMode | str = ErrorMode.YIELD # How to handle item errors
+    page_retry: RetryPolicy | None = None
+    item_retry: RetryPolicy | None = None
+    page_error_handler: ErrorHandler | None = None # Custom function for handling retrying (pages)
+    item_error_handler: ErrorHandler | None = None  # Custom function for handling retrying (items)
+
+    load_specific_fields: Iterable[str] = () # Loads the actual fields from the available and fetched sources
+    load_specific_sources: Iterable[str] = () # Runs before load_fields(), defines which source to load e.g., from html or from an API endpoint
+
+
+    _page_request_method: str = "GET"  # Some pages require POST requests (depends per API)
+    _item_url_key: str = "url" # The actual Video / Short whatever URL returned in the dictionary by the item extractor
 
 # Singleton instance needed for my Porn Fetch project
 config = RuntimeConfig()
