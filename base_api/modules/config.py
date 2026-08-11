@@ -20,6 +20,7 @@ class RuntimeConfig:
         self.request_attempts: int = 4
         self.request_retry_initial_delay: float = 0.5
         self.request_retry_max_delay: float = 30.0
+        self.request_multiplier: float = 2.0
         self.request_retry_jitter: float = 0.5
         self.request_delay: int = 0
         self.timeout: int = 20
@@ -96,6 +97,14 @@ class IteratorConfig:
     _page_request_method: str = "GET"
     _item_url_key: str = "url"
 
+    _retry_policy = RetryPolicy(
+        max_attempts=runtime_config.request_attempts,
+        base_delay=runtime_config.request_retry_initial_delay,
+        multiplier=runtime_config.request_multiplier,
+        max_delay=runtime_config.request_retry_max_delay,
+        jitter=runtime_config.request_retry_jitter
+    )
+
     def resolve(self, runtime_config: RuntimeConfig) -> "IteratorConfig":
         """
         Creates a resolved copy of IteratorConfig where any unassigned (None)
@@ -117,8 +126,10 @@ class IteratorConfig:
             order=self.order,
             page_error_mode=self.page_error_mode,
             item_error_mode=self.item_error_mode,
-            page_retry=self.page_retry,
-            item_retry=self.item_retry,
+
+
+            page_retry=(self.page_retry if self.page_retry is not None else self._retry_polixy),
+            item_retry=(self.item_retry if self.item_retry is not None else self._retry_policy),
             page_error_handler=self.page_error_handler,
             item_error_handler=self.item_error_handler,
             load_specific_fields=self.load_specific_fields,
