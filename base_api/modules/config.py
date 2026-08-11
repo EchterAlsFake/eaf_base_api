@@ -97,19 +97,21 @@ class IteratorConfig:
     _page_request_method: str = "GET"
     _item_url_key: str = "url"
 
-    _retry_policy = RetryPolicy(
-        max_attempts=runtime_config.request_attempts,
-        base_delay=runtime_config.request_retry_initial_delay,
-        multiplier=runtime_config.request_multiplier,
-        max_delay=runtime_config.request_retry_max_delay,
-        jitter=runtime_config.request_retry_jitter
-    )
 
     def resolve(self, runtime_config: RuntimeConfig) -> "IteratorConfig":
         """
         Creates a resolved copy of IteratorConfig where any unassigned (None)
         concurrency values are pulled live from runtime_config.
         """
+
+        _retry_policy = RetryPolicy(
+            max_attempts=runtime_config.request_attempts,
+            base_delay=runtime_config.request_retry_initial_delay,
+            multiplier=runtime_config.request_multiplier,
+            max_delay=runtime_config.request_retry_max_delay,
+            jitter=runtime_config.request_retry_jitter
+        )
+
         return IteratorConfig(
             max_page_concurrency=(
                 self.max_page_concurrency
