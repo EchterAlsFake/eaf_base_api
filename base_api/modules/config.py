@@ -130,8 +130,8 @@ class IteratorConfig:
             item_error_mode=self.item_error_mode,
 
 
-            page_retry=(self.page_retry if self.page_retry is not None else self._retry_polixy),
-            item_retry=(self.item_retry if self.item_retry is not None else self._retry_policy),
+            page_retry=(self.page_retry if self.page_retry is not None else _retry_policy),
+            item_retry=(self.item_retry if self.item_retry is not None else _retry_policy),
             page_error_handler=self.page_error_handler,
             item_error_handler=self.item_error_handler,
             load_specific_fields=self.load_specific_fields,
