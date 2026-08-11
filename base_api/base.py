@@ -80,6 +80,35 @@ class CachePolicy(StrEnum):
     REFRESH = "refresh"
 
 
+def _contains_http_status(error: BaseException, status_code: int) -> bool:
+    """Return whether an exception or one of its wrappers has an HTTP status."""
+    pending: deque[BaseException] = deque((error,))
+    seen: set[int] = set()
+    while pending:
+        current = pending.popleft()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+
+        if (
+            isinstance(current, HTTPStatusError)
+            and current.status_code == status_code
+        ):
+            return True
+
+        for attribute in ("original_error", "last_error", "__cause__", "__context__"):
+            nested = getattr(current, attribute, None)
+            if isinstance(nested, BaseException):
+                pending.append(nested)
+
+        nested_errors = getattr(current, "errors", ())
+        if isinstance(nested_errors, (tuple, list)):
+            pending.extend(
+                nested for nested in nested_errors if isinstance(nested, BaseException)
+            )
+    return False
+
+
 @dataclass(frozen=True, slots=True)
 class RequestCacheKey:
     """Identity of a cacheable HTTP request without retaining credentials."""
@@ -1395,6 +1424,16 @@ class Helper(Generic[MediaT]):
             except asyncio.CancelledError:
                 raise
             except Exception as error:
+                # Some callers yield or skip terminal failures instead of raising
+                # them. Log while the exception is actively handled so its real
+                # traceback, including the originating source line, is never lost.
+                self.logger.exception(
+                    "Exception while processing %s %s on attempt %s/%s",
+                    stage.value,
+                    url,
+                    attempt,
+                    retry_policy.max_attempts,
+                )
                 context = ScrapeErrorContext(
                     stage=stage,
                     url=url,
@@ -1410,6 +1449,16 @@ class Helper(Generic[MediaT]):
                     error_mode=error_mode,
                     error_handler=error_handler,
                 )
+
+                # BaseCore.request already treats 404 as non-retryable. Keep the
+                # page-level retry loop from undoing that decision, including when
+                # the HTTP error has been wrapped by another library exception.
+                if (
+                    stage is ScrapeStage.PAGE
+                    and action is ErrorAction.RETRY
+                    and _contains_http_status(error, 404)
+                ):
+                    action = ErrorAction(error_mode.value)
 
                 if action is ErrorAction.RETRY and attempt < retry_policy.max_attempts:
                     delay = retry_policy.delay_after(attempt)
@@ -1432,6 +1481,11 @@ class Helper(Generic[MediaT]):
                     action = ErrorAction(error_mode.value)
 
                 wrapped_error = error_factory(error, attempt)
+                # YIELD stores this exception for a later ScrapeResult.unwrap().
+                # Explicitly retain the cause so that raising it later renders the
+                # original traceback rather than only the unwrap() line.
+                wrapped_error.__cause__ = error
+                wrapped_error.__suppress_context__ = True
                 if action is ErrorAction.RAISE:
                     raise wrapped_error from error
                 return _AttemptOutcome(None, wrapped_error, action, attempt)
@@ -1645,6 +1699,10 @@ class BaseCore:
 
         def should_retry(error: BaseException) -> bool:
             if not method_is_retryable:
+                return False
+            # A missing resource is a terminal response. Keep this explicit so a
+            # future broadening of retryable HTTP errors cannot include 404.
+            if _contains_http_status(error, 404):
                 return False
             if isinstance(error, (RequestsError, NetworkRequestError)):
                 return True
