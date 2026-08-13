@@ -14,7 +14,6 @@ import threading
 from collections import deque
 from collections.abc import Iterable, Mapping, Sequence
 from enum import StrEnum
-from functools import lru_cache
 from urllib.parse import urljoin
 from dataclasses import MISSING, dataclass, field, fields
 from curl_cffi import CurlOpt # Used for DNS over HTTPS
@@ -36,11 +35,9 @@ from base_api.modules.type_hints import (
 )
 from base_api.modules.static_functions import (
     load_segment_state, parse_retry_after, log_precondition_failed,
-    write_segment_state, build_segment_state, get_segment_index_width,
-    segment_file_path, is_video_playlist, height_from_variant,
-    pick_by_height, normalize_quality_value,
-    parse_challenge, other_challenge, least_factors,
-    collect_variants, pick_by_label
+    write_segment_state, build_segment_state, segment_file_path,
+    parse_challenge, other_challenge, least_factors, available_qualities,
+    choose_variant, collect_variants, get_segment_index_width
 )
 from base_api.modules.config import config, RuntimeConfig, DownloadConfigHLS, DownloadConfigRAW, IteratorConfig
 from base_api.modules.progress_bars import Callback
@@ -1611,8 +1608,6 @@ class BaseCore:
             verify=verify,
             impersonate=impersonation,
             curl_options=curl_options,
-            http_version=http_version,
-            ja3=js3,
             proxy_auth=p_auth,
             trust_env=trust_env
         )
@@ -2048,89 +2043,158 @@ class BaseCore:
         )
         return cast(bytes, response.content)
 
-
-    @lru_cache(maxsize=250)
-    async def get_m3u8_by_quality(self, m3u8_url: str, quality: Union[str, int]) -> str:
+    async def get_m3u8_by_quality(
+            self,
+            m3u8_url: str,
+            quality: str | int,
+    ) -> str:
         """
         Return the media-playlist URL for the requested quality.
 
-        quality:
-          - 'best' | 'half' | 'worst'
-          - 1080 / '1080' / '1080p' (and similar)
+        Supported preferences:
+            best
+            half
+            worst
+
+        Supported explicit qualities:
+            144
+            240
+            360
+            480
+            540
+            720
+            1080
+            1440
+            2160
+
+        Numeric strings such as "1080" and "1080p" are accepted too.
         """
+
         if m3u8 is None:
-            raise ModuleNotFoundError(f"""
-Using m3u8 is optional depending whether you use HLS videos or static videos. It seems like you are trying to download
-from HLS. Please install m3u8 using: `pip install m3u8`.
+            raise ModuleNotFoundError(
+                "HLS support requires the 'm3u8' package."
+            )
 
-If this does not fix the issue, there's an import error related to your environment. In this case please create
-a new Python file, import only m3u8 and see what error you get. 
-""")
-
-        # Resolve master content
-        assert m3u8 is not None
-
-        if inspect.iscoroutinefunction(m3u8_url) or (callable(m3u8_url) and not isinstance(m3u8_url, str)):
+        # Resolve callable / awaitable sources.
+        if (
+                inspect.iscoroutinefunction(m3u8_url)
+                or (
+                callable(m3u8_url)
+                and not isinstance(m3u8_url, str)
+        )
+        ):
             m3u8_url = m3u8_url()
-        if inspect.iscoroutine(m3u8_url) or inspect.isawaitable(m3u8_url):
+
+        if inspect.isawaitable(m3u8_url):
             m3u8_url = await m3u8_url
+
+        if not isinstance(m3u8_url, str):
+            raise TypeError(
+                "m3u8_url must resolve to a string."
+            )
+
+        # Load master playlist.
+        if m3u8_url.lstrip().startswith("#EXTM3U"):
+            master = m3u8.loads(m3u8_url)
+            base_url = None
+
+            self.logger.debug(
+                "Resolved inline/custom m3u8 master content."
+            )
+
+        else:
+            content = await self.fetch_text(
+                url=m3u8_url
+            )
+
+            master = m3u8.loads(content)
+            base_url = m3u8_url
+
+            self.logger.debug(
+                "Resolved m3u8 master: %s",
+                m3u8_url,
+            )
+
+        if not master.is_variant:
+            raise PlaylistExtractionError(
+                f"Playlist is not a master playlist: {m3u8_url}"
+            )
+
+        variants = collect_variants(master)
+
+        if not variants:
+            raise PlaylistExtractionError(
+                f"No usable video variants found: {m3u8_url}"
+            )
+
+        chosen = choose_variant(variants, quality)
+
+        uri = chosen["uri"]
+
+        # Master was fetched from a URL.
+        if base_url is not None:
+            return urljoin(
+                base_url,
+                uri,
+            )
+
+        # Inline playlist containing an absolute variant URL.
+        if uri.startswith(("http://", "https://")):
+            return uri
+
+        raise PlaylistExtractionError(
+            "Inline HLS master contains relative variant URLs, "
+            "so they cannot be resolved without a base URL."
+        )
+
+    async def list_available_qualities(
+            self,
+            m3u8_url: str,
+    ) -> list[int]:
+        """
+        Inspect an HLS master playlist and return canonical,
+        sorted, unique qualities.
+        """
+
+        if m3u8 is None:
+            raise ModuleNotFoundError(
+                "HLS support requires the 'm3u8' package."
+            )
+
+        if (
+                inspect.iscoroutinefunction(m3u8_url)
+                or (
+                callable(m3u8_url)
+                and not isinstance(m3u8_url, str)
+        )
+        ):
+            m3u8_url = m3u8_url()
+
+        if inspect.isawaitable(m3u8_url):
+            m3u8_url = await m3u8_url
+
+        if not isinstance(m3u8_url, str):
+            raise TypeError(
+                "m3u8_url must resolve to a string."
+            )
 
         if m3u8_url.lstrip().startswith("#EXTM3U"):
             master = m3u8.loads(m3u8_url)
-            self.logger.debug("Resolved inline/custom m3u8 master content.")
-            base_for_join = ""  # URIs should be absolute in inline cases; join will handle if relative
-        else:
-            content = await self.fetch_text(url=m3u8_url)
+
+        elif m3u8_url.startswith(("http://", "https://")):
+            content = await self.fetch_text(
+                url=m3u8_url
+            )
+
             master = m3u8.loads(content)
-            base_for_join = m3u8_url
-            self.logger.debug("Resolved m3u8 master: %s", m3u8_url)
 
-        if not master.is_variant:
-            raise PlaylistExtractionError(f"Playlist is not a master Playlist: {m3u8_url}")
-
-        variants = collect_variants(master)
-        if not variants:
-            raise PlaylistExtractionError(f"No usable variants found in master Playlist: {m3u8_url}, {master}")
-
-        q = normalize_quality_value(quality)
-        if isinstance(q, str):  # 'best'/'half'/'worst'
-            chosen = pick_by_label(variants, q)
-        else:  # numeric height like 1080, 720, etc.
-            chosen = pick_by_height(variants, q)
-
-        full_url = urljoin(base_for_join or m3u8_url, chosen["uri"])
-        return full_url
-
-    async def list_available_qualities(self, m3u8_url: str) -> List[int]:
-        """
-        Inspect the master playlist and return sorted unique heights (e.g., [240, 360, 480, 720, 1080]).
-        """
-        assert m3u8 is not None
-
-        if inspect.iscoroutinefunction(m3u8_url) or (callable(m3u8_url) and not isinstance(m3u8_url, str)):
-            m3u8_url = m3u8_url()
-        if inspect.iscoroutine(m3u8_url) or inspect.isawaitable(m3u8_url):
-            m3u8_url = await m3u8_url
-
-        if not m3u8_url.startswith("https://"):
+        else:
             master = m3u8.loads(m3u8_url)
-        else:
-            content = await self.fetch_text(url=m3u8_url)
-            master = m3u8.loads(content)
 
         if not master.is_variant:
             return []
 
-        heights = {h for h in (height_from_variant(v) for v in master.playlists) if h is not None}
-        if heights:
-            return sorted(heights)
-        # fallback: bandwidth-only (roughly infer tiers)
-        by_bw = sorted(
-            (getattr(v.stream_info, "bandwidth", 0) for v in master.playlists if is_video_playlist(v)),
-            key=int
-        )
-        # Return rank numbers instead of heights if we truly can't infer—kept simple:
-        return [i for i, _ in enumerate(by_bw, start=1)]
+        return available_qualities(collect_variants(master))
 
     async def get_segments(self, m3u8_url_master: str, quality: Union[str, int]) -> List[str]:
         assert m3u8 is not None

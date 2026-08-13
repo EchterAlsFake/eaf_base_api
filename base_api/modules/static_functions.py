@@ -3,11 +3,12 @@ import re
 import math
 import json
 import unicodedata
+from collections.abc import Iterable
 from pathlib import PurePath
 from .type_hints import DownloadState
 from datetime import timezone, datetime
 from curl_cffi.requests import Response
-from typing import Dict, Any, cast, List, Callable, Tuple, Union
+from typing import Dict, Any, cast, List, Callable, Literal, Union
 from email.utils import parsedate_to_datetime
 
 
@@ -68,116 +69,10 @@ def least_factors(n: int) -> int:
     return n
 
 
-def normalize_quality_value(quality: Union[str, int]) -> Union[str, int]:
-    """
-    quality: represents the quality value that should be normalized
-    """
-    if isinstance(quality, int):
-        return quality # If the quality value is already an int, just return it directly
+type QualityPreference = int | Literal["best", "half", "worst"]
 
-    quality = str(quality).lower().strip() # Convert to string, lower and remove white spaces
+QUALITY_LABELS = frozenset({"best", "half", "worst"})
 
-    if quality in {"best", "half", "worst"}:
-        return quality # best, half and worst are also accepted values and will be further resolved in other functions
-
-    m = re.search(r'(\d{3,4})', quality) # Search for int values that fit 144p-2160p values. return as int
-    if m:
-        return int(m.group(1))
-    raise ValueError(f"Invalid quality: {quality}")
-
-
-def choose_quality_from_list(
-        available: List[Union[str, int]],
-        target: Union[str, int],
-        default_fallback: int | str | None = None
-) -> int:
-    """
-    Selects a video quality from a list based on a target integer< or label.
-
-    :param available: List of available qualities (e.g., [240, "360", "1080p"]).
-    :param target: Numeric target (highest ≤ target) or label ("best", "worst", "half").
-    :param default_fallback: Optional integer to return if all parsing fails.
-    :return: The selected quality as an integer.
-    """
-
-    # 1. Edge Case: Empty List
-    if not available:
-        if default_fallback is not None:
-            return default_fallback
-        raise ValueError("The 'available' list cannot be empty.")
-
-    # 2. Data Sanitization: Filter out unparseable values safely
-    valid_ints = set()
-    for x in available:
-        try:
-            # Handle common string formats gracefully (e.g., "1080p" -> 1080)
-            if isinstance(x, str):
-                x = x.lower().rstrip('p')
-            valid_ints.add(int(x))
-        except (ValueError, TypeError):
-            continue  # Skip unparseable garbage rather than crashing
-
-    if not valid_ints:
-        if default_fallback is not None:
-            return default_fallback
-        raise ValueError("No valid numeric qualities found in 'available'.")
-
-    # Sort the sanitized list (e.g., [144, 240, 360, 720, 1080])
-    available_ints = sorted(valid_ints)
-
-    # 3. Edge Case: User passes a numeric string as a target (e.g., "1080")
-    if isinstance(target, str) and target.isdigit():
-        target = int(target)
-
-    # 4. Handle String Targets
-    if isinstance(target, str):
-        target = target.lower()
-        if target == "best":
-            return available_ints[-1]
-        if target == "worst":
-            return available_ints[0]
-        if target == "half":
-            # Middle index. Examples: len=3 (idx 1), len=4 (idx 2, rounds up)
-            return available_ints[len(available_ints) // 2]
-
-        # Fallback for unrecognized string labels
-        if default_fallback is not None:
-            return default_fallback
-        raise ValueError(f"Invalid label: '{target}'. Expected 'best', 'worst', 'half', or a number.")
-
-    # 5. Handle Numeric Targets (highest ≤ target, else closest)
-    if isinstance(target, (int, float)):
-        le = [h for h in available_ints if h <= target]
-        if le:
-            return le[-1]
-
-        # Fallback closest: if target is 144 but only 240+ is available,
-        # all available qualities are > target. The closest is the lowest available.
-        return available_ints[0]
-
-    # Catch-all for entirely wrong target types (e.g., lists, dicts)
-    if default_fallback is not None:
-        return default_fallback
-    raise TypeError("Target must be a string or integer.")
-
-
-def height_from_variant(variant: Any) -> int | None:
-    """Extract height from a variant:
-    1) stream_info.resolution (w, h)
-    2) URI pattern like .../720p/...
-    """
-    if getattr(variant, "stream_info", None) and variant.stream_info.resolution:
-        _, h = variant.stream_info.resolution  # (width, height)
-        return int(h) # -> returns the height of a variant of a m3u8 master playlist
-
-    # Fallback to search with a regex pattern
-    if variant.uri:
-        m = HEIGHT_FROM_URI.search(variant.uri)
-        if m:
-            return int(m.group(1))
-
-    # If nothing is found, though this shouldn't happen
-    return None
 
 def is_video_playlist(variant: Any) -> bool:
     """Filter out I-frames/audio-only playlists."""
@@ -190,74 +85,273 @@ def is_video_playlist(variant: Any) -> bool:
     if codecs:
         # very light heuristic: if no video codec substring, probably audio-only.
         # video: avc1, hvc1, hev1, vp9, av01, dvh
-        assert isinstance(codecs, str)
-        if not any(v in codecs.lower() for v in ("avc1", "hvc1", "hev1", "av01", "vp9", "dvh")):
+        codecs_text = str(codecs).lower()
+        if not any(v in codecs_text for v in ("avc1", "hvc1", "hev1", "av01", "vp9", "dvh")):
             return False
 
     return True
 
-def collect_variants(master: Any) -> List[Dict[str, Any]]:
-    """Normalize playlist variants to a comparable list."""
-    items: List[Dict[str, Any]] = []
-    for v in master.playlists:
-        if not is_video_playlist(v):
-            continue
-
-        h = height_from_variant(v)
-        bw = getattr(v.stream_info, "bandwidth", 0) if getattr(v, "stream_info", None) else 0
-        fr = getattr(v.stream_info, "frame_rate", 0.0) if getattr(v, "stream_info", None) else 0.0
-        items.append({
-            "uri": v.uri,
-            "height": h,                 # may be None
-            "bandwidth": int(bw or 0),
-            "frame_rate": float(fr or 0.0),
-            "resolution": getattr(v.stream_info, "resolution", None) if getattr(v, "stream_info", None) else None,
-            "raw": v
-        })
-    return items
-
-def pick_by_label(variants: List[Dict[str, Any]], label: str) -> Dict[str, Any]:
-    """best / worst / half based on a combined rank by (height, bandwidth)."""
-    # rank by height first, then bandwidth as tiebreaker
-    def key_fn(v: Dict[str, Any]) -> Tuple[int, int]:
-        return v["height"] or 0, v["bandwidth"]
-    ordered = sorted(variants, key=key_fn)
-
-    if not ordered:
-        raise ValueError("No video variants available in master playlist.")
-
-    elif label == "worst":
-        return ordered[0]
-    elif label == "half":
-        return ordered[len(ordered)//2]
-    elif label == "best":
-        return ordered[-1]
-    else:
-        raise ValueError("Invalid quality label.")
-
-
-def pick_by_height(variants: List[Dict[str, Any]], target: int) -> Dict[str, Any]:
-    """Choose the highest height ≤ target; else closest by absolute diff (ties -> higher)."""
-    with_height = [v for v in variants if v["height"] is not None]
-    if with_height:
-        # Prefer height <= target
-        below_eq = [v for v in with_height if v["height"] <= target]
-        if below_eq:
-            # Among same height, prefer higher bandwidth then higher fps
-            best = sorted(below_eq, key=lambda v: (v["height"], v["bandwidth"], v["frame_rate"]))[-1]
-            return best
-
-        # Fallback: closest by absolute diff; ties -> higher height
-        def diff_key(v: Dict[str, Any]) -> Tuple[int, int, int, float]:
-            return abs((v["height"] or 0) - target), -(v["height"] or 0), v["bandwidth"], v["frame_rate"]
-        return sorted(with_height, key=diff_key)[0]
-
-    # If we have no heights at all, fall back to bandwidth ranking
-    return sorted(variants, key=lambda v: v["bandwidth"])[-1]
-
 
 def get_segment_index_width(total: int) -> int:
     return max(6, len(str(max(0, total - 1))))
+
+
+COMMON_QUALITIES = frozenset({
+    144,
+    240,
+    360,
+    480,
+    540,
+    720,
+    1080,
+    1440,
+    2160,
+})
+# Kept as an alias for callers that imported the name during the 4.0 rollout.
+ALLOWED_QUALITIES = COMMON_QUALITIES
+
+
+def validate_quality(value: int) -> int:
+    """Validate a normalized quality without restricting provider-specific tiers."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"Invalid quality type: {type(value).__name__}")
+    if value <= 0:
+        raise ValueError(f"Invalid video quality: {value!r}")
+
+    return value
+
+
+def normalize_quality(value: str | int) -> int:
+    """
+    Convert a quality into a canonical integer.
+
+    Accepted:
+        720
+        "720"
+        "720p"
+
+    Rejected:
+        "best"
+        "half"
+        "worst"
+        "720p60"
+        zero or negative values
+    """
+
+    if isinstance(value, bool):
+        raise TypeError("A boolean is not a valid video quality.")
+
+    if isinstance(value, int):
+        quality = value
+
+    elif isinstance(value, str):
+        value = value.strip().lower()
+
+        match = re.fullmatch(r"(\d+)[pP]?", value)
+
+        if not match:
+            raise ValueError(
+                f"Invalid video quality: {value!r}"
+            )
+
+        quality = int(match.group(1))
+
+    else:
+        raise TypeError(
+            f"Invalid quality type: {type(value).__name__}"
+        )
+
+    return validate_quality(quality)
+
+def normalize_quality_preference(
+    value: str | int,
+) -> QualityPreference:
+
+    if isinstance(value, str):
+        value = value.strip().lower()
+
+        if value in QUALITY_LABELS:
+            return cast(QualityPreference, value)
+
+    return normalize_quality(value)
+
+
+
+def choose_quality_from_list(
+    available: Iterable[str | int],
+    target: str | int,
+    default_fallback: str | int | None = None,
+) -> int:
+    """Choose a quality, falling back to the nearest available numeric tier."""
+
+    available_ints = normalize_qualities(available)
+
+    if not available_ints:
+        if default_fallback is not None:
+            return normalize_quality(default_fallback)
+        raise ValueError(
+            "No valid video qualities are available."
+        )
+
+    try:
+        preference = normalize_quality_preference(target)
+    except (TypeError, ValueError):
+        if default_fallback is not None:
+            return normalize_quality(default_fallback)
+        raise
+
+    if preference == "best":
+        return available_ints[-1]
+
+    if preference == "worst":
+        return available_ints[0]
+
+    if preference == "half":
+        return available_ints[len(available_ints) // 2]
+
+    # Prefer the higher tier when two variants are equally close.
+    return min(
+        available_ints,
+        key=lambda quality: (abs(quality - preference), -quality),
+    )
+
+
+def normalize_qualities(
+    values: Iterable[str | int],
+) -> list[int]:
+    """
+    Return canonical, unique qualities sorted worst -> best.
+    """
+
+    qualities: set[int] = set()
+    for value in values:
+        try:
+            qualities.add(normalize_quality(value))
+        except (TypeError, ValueError):
+            # Provider data can contain labels such as "auto" alongside real
+            # qualities.  They should not make the usable variants disappear.
+            continue
+
+    return sorted(qualities)
+
+
+def quality_from_variant(variant: Any) -> int | None:
+    """Extract a quality tier from a landscape or portrait HLS variant."""
+    stream_info = getattr(variant, "stream_info", None)
+    resolution = getattr(stream_info, "resolution", None)
+    if resolution:
+        try:
+            width, height = resolution
+            # Quality names describe the shorter side: 1920x1080 and
+            # 1080x1920 are both 1080p.
+            return normalize_quality(min(int(width), int(height)))
+        except (TypeError, ValueError):
+            pass
+
+    uri = getattr(variant, "uri", None)
+    if isinstance(uri, str):
+        match = HEIGHT_FROM_URI.search(uri)
+        if match:
+            try:
+                return normalize_quality(match.group(1))
+            except (TypeError, ValueError):
+                pass
+
+    return None
+
+
+def collect_variants(master: Any) -> list[dict[str, Any]]:
+    """Return video variants with normalized, comparable metadata."""
+    variants: list[dict[str, Any]] = []
+    for variant in getattr(master, "playlists", ()):
+        if not is_video_playlist(variant):
+            continue
+
+        stream_info = getattr(variant, "stream_info", None)
+        variants.append({
+            "uri": getattr(variant, "uri", ""),
+            "quality": quality_from_variant(variant),
+            "bandwidth": int(getattr(stream_info, "bandwidth", 0) or 0),
+            "frame_rate": float(getattr(stream_info, "frame_rate", 0.0) or 0.0),
+            "resolution": getattr(stream_info, "resolution", None),
+            "raw": variant,
+        })
+
+    return variants
+
+
+def available_qualities(variants: Iterable[dict[str, Any]]) -> list[int]:
+    """Return sorted, unique integer qualities from normalized variants."""
+    return normalize_qualities(
+        variant["quality"]
+        for variant in variants
+        if variant.get("quality") is not None
+    )
+
+
+def choose_variant(
+    variants: Iterable[dict[str, Any]],
+    target: str | int,
+) -> dict[str, Any]:
+    """Select an HLS variant with quality and bandwidth fallbacks."""
+    candidates = list(variants)
+    if not candidates:
+        raise ValueError("No video variants are available.")
+
+    preference = normalize_quality_preference(target)
+    qualities = available_qualities(candidates)
+    if qualities:
+        selected_quality = choose_quality_from_list(qualities, preference)
+        matching = [
+            variant
+            for variant in candidates
+            if variant.get("quality") == selected_quality
+        ]
+        return max(
+            matching,
+            key=lambda variant: (
+                variant.get("bandwidth", 0),
+                variant.get("frame_rate", 0.0),
+            ),
+        )
+
+    # Some masters expose only bandwidth. Labels can still be ranked, while a
+    # numeric request falls back to the highest-bandwidth usable variant.
+    ordered = sorted(
+        candidates,
+        key=lambda variant: (
+            variant.get("bandwidth", 0),
+            variant.get("frame_rate", 0.0),
+        ),
+    )
+    if preference == "worst":
+        return ordered[0]
+    if preference == "half":
+        return ordered[len(ordered) // 2]
+    return ordered[-1]
+
+
+# Compatibility wrappers for callers of the pre-4.0 helper names.
+def normalize_quality_value(quality: str | int) -> QualityPreference:
+    return normalize_quality_preference(quality)
+
+
+def height_from_variant(variant: Any) -> int | None:
+    return quality_from_variant(variant)
+
+
+def pick_by_label(
+    variants: list[dict[str, Any]],
+    label: str,
+) -> dict[str, Any]:
+    return choose_variant(variants, label)
+
+
+def pick_by_height(
+    variants: list[dict[str, Any]],
+    target: int,
+) -> dict[str, Any]:
+    return choose_variant(variants, target)
 
 
 def segment_file_path(segment_dir, index: int, width: int) -> str:
