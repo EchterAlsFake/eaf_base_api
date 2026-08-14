@@ -99,6 +99,7 @@ def get_segment_index_width(total: int) -> int:
 COMMON_QUALITIES = frozenset({
     144,
     240,
+    250,
     360,
     480,
     540,

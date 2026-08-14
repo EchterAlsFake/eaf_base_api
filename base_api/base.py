@@ -5,7 +5,6 @@ import time
 import hashlib
 import string
 import shutil
-import random
 import asyncio
 import inspect
 import logging
@@ -62,9 +61,6 @@ try:
 except (ModuleNotFoundError, ImportError):
     m3u8 = None  # type: ignore
 
-
-UA_DESKTOP_CHROME = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
-                     "Chrome/122.0.0.0 Safari/537.36")
 
 REGEX_CHALLENGE = re.compile(r'var p=(\d+); var s=(\d+);.*?(\d+):1;', re.DOTALL)
 
@@ -1548,9 +1544,7 @@ class BaseCore:
         self.cache = cache if cache is not None else Cache(self.configuration)
         self.logger = configure_app_logging("BASE API - [BaseCore]", log_file=None, level=logging.ERROR)
         self.default_headers = {
-            "User-Agent": UA_DESKTOP_CHROME,
             "Accept-Language": self.configuration.locale,
-            "Accept-Encoding": "gzip, deflate, br"
         }
 
     async def __aenter__(self) -> Self:
@@ -1611,6 +1605,8 @@ class BaseCore:
             proxy=proxy,
             timeout=self.configuration.timeout,
             verify=verify,
+            ja3=js3,
+            http_version=http_version,
             impersonate=impersonation,
             curl_options=curl_options,
             proxy_auth=p_auth,
