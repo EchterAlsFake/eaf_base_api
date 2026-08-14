@@ -445,46 +445,47 @@ class BaseMedia:
         default_factory=dict, init=False, repr=False, compare=False
     )
 
-    def __getattribute__(self, name: str) -> Any:
-        """
-        Reject only the private unloaded sentinel, never a legitimate ``None``.
+    if not TYPE_CHECKING:
+        def __getattribute__(self, name: str) -> Any:
+            """
+            Reject only the private unloaded sentinel, never a legitimate ``None``.
 
-        Attribute access remains synchronous and therefore cannot initiate network
-        I/O.  The exception tells callers exactly which field and sources to pass
-        to ``load_fields`` or ``load_sources``.
-        """
-        value = object.__getattribute__(self, name)
-        if value is not _UNLOADED:
-            return value
+            Attribute access remains synchronous and therefore cannot initiate network
+            I/O.  The exception tells callers exactly which field and sources to pass
+            to ``load_fields`` or ``load_sources``.
+            """
+            value = object.__getattribute__(self, name)
+            if value is not _UNLOADED:
+                return value
 
-        # Because we override the __getattribute__ method, we need to call object.__getattribute__.
-        # If I'd use self.<something> we would get a recursion error as the function would call itself infinitely
+            # Because we override the __getattribute__ method, we need to call object.__getattribute__.
+            # If I'd use self.<something> we would get a recursion error as the function would call itself infinitely
 
-        model_type = type(self)
-        """
-        Explanation why model_type exists:
-        So, basically when we build the schema (down below) this takes some time. However, this function actually
-        caches the fully resolved dataclass. So if we are going over a thousand Video objects usually we would need
-        to reconstruct the thousand video objects, well, a thousand times.
-        
-        By giving the model_type with self, we can tell the cache: Yo, this is a Video object. See if you have
-        already processed this and if yes it will use this instead of processing it each time again.
-        Might only save a few milliseconds but I ain't Ubisoft XDDD
-        """
-        schema = _media_schema(model_type)
-        sources = schema.field_sources.get(name, ()) # E.g., ("api", "html") for name=title (PornHub API as an example)
-        url = object.__getattribute__(self, "url") # The actual URL to fetch e.g., https://example.com/video/id?=
-        all_source_errors = object.__getattribute__(self, "_source_errors")
-        relevant_errors = {
-            source: all_source_errors[source]
-            for source in sources
-            if source in all_source_errors
-        } # Basically just checks which sources had an error e.g., if html failed fetching this will return html
-        raise DataNotLoadedError(
-            model_type.__name__, name, url, sources, relevant_errors
-            # Raises a custom exception that tells you which attribute failed with its associated source and the error
-            # that happened along with the actual URL (so that I can replicate it when you report it)
-        )
+            model_type = type(self)
+            """
+            Explanation why model_type exists:
+            So, basically when we build the schema (down below) this takes some time. However, this function actually
+            caches the fully resolved dataclass. So if we are going over a thousand Video objects usually we would need
+            to reconstruct the thousand video objects, well, a thousand times.
+            
+            By giving the model_type with self, we can tell the cache: Yo, this is a Video object. See if you have
+            already processed this and if yes it will use this instead of processing it each time again.
+            Might only save a few milliseconds but I ain't Ubisoft XDDD
+            """
+            schema = _media_schema(model_type)
+            sources = schema.field_sources.get(name, ()) # E.g., ("api", "html") for name=title (PornHub API as an example)
+            url = object.__getattribute__(self, "url") # The actual URL to fetch e.g., https://example.com/video/id?=
+            all_source_errors = object.__getattribute__(self, "_source_errors")
+            relevant_errors = {
+                source: all_source_errors[source]
+                for source in sources
+                if source in all_source_errors
+            } # Basically just checks which sources had an error e.g., if html failed fetching this will return html
+            raise DataNotLoadedError(
+                model_type.__name__, name, url, sources, relevant_errors
+                # Raises a custom exception that tells you which attribute failed with its associated source and the error
+                # that happened along with the actual URL (so that I can replicate it when you report it)
+            )
 
     def __repr__(self) -> str:
         """Represent identity and load state without touching unresolved fields."""
