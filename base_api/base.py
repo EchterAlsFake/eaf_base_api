@@ -1089,7 +1089,7 @@ class Helper(Generic[MediaT]):
         page_retry = iterator_config.page_retry
         item_retry = iterator_config.item_retry
         page_error_handler = iterator_config.page_error_handler
-        item_error_handler = iterator_config.page_error_handler
+        item_error_handler = iterator_config.item_error_handler
         load_fields = iterator_config.load_specific_fields
         load_sources = iterator_config.load_specific_sources
         page_request_method = iterator_config._page_request_method
@@ -1576,6 +1576,10 @@ class BaseCore:
                                    http_port=log_port)
 
     def initialize_session(self) -> None:
+        """Initialize the owned HTTP session once for the current lifecycle."""
+        if self.session is not None:
+            return
+
         verify = self.configuration.verify_ssl
 
         curl_options: Dict[CurlOpt, Union[bytes, int]] = {}
@@ -1614,14 +1618,15 @@ class BaseCore:
             http_version=http_version,
             ja3=js3,
             proxy_auth=p_auth,
-            trust_env=trust_env
+            trust_env=trust_env,
+            cookies=self.configuration.cookies,
         )
         # Ensure our defaults are on the session
         assert self.session is not None
         self.session.headers.update(self.default_headers)
 
     async def enforce_delay(self) -> None:
-        """Enforces the specified delay in config.request_delay (only if > 0)."""
+        """Enforce this core's configured delay between requests, when enabled."""
         delay = self.configuration.request_delay
         if delay and delay > 0:
             async with self._delay_lock:
@@ -1714,6 +1719,7 @@ class BaseCore:
         exponential_wait = wait_exponential_jitter(
             initial=self.configuration.request_retry_initial_delay,
             max=self.configuration.request_retry_max_delay,
+            exp_base=self.configuration.request_multiplier,
             jitter=self.configuration.request_retry_jitter,
         )
 
@@ -2264,8 +2270,8 @@ a new Python file, import only m3u8 and see what error you get.
         return await self.threaded_download(
             configuration=configuration,
             pre_resolved_m3u8=m3u8_url,
-            timeout=config.timeout,
-            max_workers=config.max_workers_download
+            timeout=self.configuration.timeout,
+            max_workers=self.configuration.max_workers_download,
         )
 
     async def threaded_download(

@@ -116,15 +116,18 @@ extractor order is available with `ResultOrder.ORIGINAL`.
 
 ```python
 from base_api import Helper, ResultOrder
+from base_api.modules.config import IteratorConfig
 
 helper = Helper(core=core, constructor=Video)
 stream = helper.iterator(
     page_urls,
     extractor_videos,
-    max_page_concurrency=3,
-    max_item_concurrency=20,
-    load_fields=("title", "available_qualities"),
-    order=ResultOrder.COMPLETION,  # The default.
+    iterator_config=IteratorConfig(
+        max_page_concurrency=3,
+        max_item_concurrency=20,
+        load_specific_fields=("title", "available_qualities"),
+        order=ResultOrder.COMPLETION,  # The default.
+    ),
 )
 
 # The context manager guarantees immediate task cleanup if this loop breaks early.
@@ -136,11 +139,11 @@ async with stream:
         video = result.unwrap()
 ```
 
-Use `order=ResultOrder.ORIGINAL` when presentation order matters. Page and item
-failures independently support `ErrorMode.YIELD`, `ErrorMode.SKIP`, or
-`ErrorMode.RAISE`. `RetryPolicy` provides a strict maximum attempt count and
-optional exponential delay; error handlers return an `ErrorAction` and cannot
-create an unbounded retry loop.
+Use `IteratorConfig(order=ResultOrder.ORIGINAL)` when presentation order matters.
+Page and item failures independently support `ErrorMode.YIELD`, `ErrorMode.SKIP`,
+or `ErrorMode.RAISE`. `RetryPolicy` provides a strict maximum attempt count and
+optional exponential delay; the independent page and item handlers return an
+`ErrorAction` and cannot create an unbounded retry loop.
 
 # Can I use this for myself?
 Yes, you can, but I may change stuff here and there from time to time, and it would maybe break your project.

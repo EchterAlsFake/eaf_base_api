@@ -30,7 +30,7 @@ The request/cache configuration names now describe their units and semantics:
 
 TTL and retry timing are configured with `response_cache_ttl`,
 `segment_cache_ttl`, `request_retry_initial_delay`,
-`request_retry_max_delay`, and `request_retry_jitter`.
+`request_retry_max_delay`, `request_multiplier`, and `request_retry_jitter`.
 
 ## 1. Update imports
 
@@ -44,6 +44,8 @@ from base_api import (
     ErrorAction,
     ErrorMode,
     Helper,
+    MediaLoadError,
+    MediaLoadErrors,
     ResultOrder,
     RetryPolicy,
     ScrapeErrorContext,
@@ -51,6 +53,7 @@ from base_api import (
     ScrapeStream,
     media_field,
 )
+from base_api.modules.config import IteratorConfig
 ```
 
 `on_error_hint` was removed. Type handlers as a callable receiving
@@ -222,8 +225,8 @@ async def get_author(self) -> Pornstar:
 This is the intended form of dynamic loading: ordinary attribute access stays
 synchronous and gives a precise `DataNotLoadedError`, while an async method uses
 `load_fields`/`get_field` immediately before it needs remote data. Search API
-packages for both old `.load(` calls and older `.init()` calls; the latter still
-appear in Video's author helper and should become explicit field/source loads.
+packages for both old `.load(` calls and older `.init()` calls, and replace any
+remaining instances with explicit field/source loads.
 
 ## 5. Replace Helper arguments and result access
 
@@ -232,11 +235,11 @@ The principal argument changes are:
 | Removed name | Version 4 replacement |
 |---|---|
 | `video_link_extractor` | `item_extractor` |
-| `max_video_concurrency` | `max_item_concurrency` |
-| `fetch_html`, `fetch_api`, `fetch_anything_else` | `load_sources` or `load_fields` |
-| `keep_original_order` | `order=ResultOrder.ORIGINAL` |
-| `ignore_errors` | `page_error_mode` and `item_error_mode` |
-| boolean retry callbacks | bounded `RetryPolicy` plus an `ErrorAction` handler |
+| `max_video_concurrency` | `IteratorConfig.max_item_concurrency` |
+| `fetch_html`, `fetch_api`, `fetch_anything_else` | `IteratorConfig.load_specific_sources` or `.load_specific_fields` |
+| `keep_original_order` | `IteratorConfig(order=ResultOrder.ORIGINAL)` |
+| `ignore_errors` | `IteratorConfig.page_error_mode` and `.item_error_mode` |
+| boolean retry callbacks | bounded `RetryPolicy` plus an `ErrorAction` handler in `IteratorConfig` |
 
 Completion order is the default:
 
@@ -244,17 +247,19 @@ Completion order is the default:
 stream = helper.iterator(
     target_page_urls=page_urls,
     item_extractor=extractor_videos,
-    max_page_concurrency=pages_concurrency,
-    max_item_concurrency=videos_concurrency,
-    load_sources=("api",),
-    order=ResultOrder.COMPLETION,
+    iterator_config=IteratorConfig(
+        max_page_concurrency=pages_concurrency,
+        max_item_concurrency=videos_concurrency,
+        load_specific_sources=("api",),
+        order=ResultOrder.COMPLETION,
+    ),
 )
 ```
 
 To reproduce page order followed by each extractor's item order:
 
 ```python
-order=ResultOrder.ORIGINAL
+iterator_config=IteratorConfig(order=ResultOrder.ORIGINAL)
 ```
 
 `ScrapeResult.video` and the mutable `is_success` flag no longer exist. Results
@@ -269,7 +274,8 @@ else:
 
 Page errors can now be yielded too, so check `result.stage` when the API exposes
 them. If an API should expose media failures but never page-failure results, use
-`page_error_mode=ErrorMode.RAISE` or `ErrorMode.SKIP`.
+`IteratorConfig(page_error_mode=ErrorMode.RAISE)` or
+`IteratorConfig(page_error_mode=ErrorMode.SKIP)`.
 
 ## 6. Own stream cleanup
 
@@ -278,7 +284,7 @@ break early, because it immediately cancels outstanding page fetches and media
 loads:
 
 ```python
-stream = helper.iterator(...)
+stream = helper.iterator(..., iterator_config=iterator_config)
 async with stream:
     async for result in stream:
         yield result
@@ -288,8 +294,8 @@ Where an API method only builds URLs and has no setup awaits, consider returning
 `ScrapeStream` directly instead of wrapping it in another async generator:
 
 ```python
-def search_videos(...) -> ScrapeStream[Video]:
-    return self.helper.iterator(...)
+def search_videos(iterator_config: IteratorConfig) -> ScrapeStream[Video]:
+    return self.helper.iterator(..., iterator_config=iterator_config)
 ```
 
 The API caller can then deterministically own cleanup:
@@ -310,8 +316,17 @@ Old handlers returned a boolean and could retry forever. New handlers receive al
 context and return an explicit action:
 
 ```python
+def resource_is_gone(error: BaseException) -> bool:
+    if isinstance(error, ResourceGone):
+        return True
+    if isinstance(error, MediaLoadError):
+        return resource_is_gone(error.original_error)
+    if isinstance(error, MediaLoadErrors):
+        return any(resource_is_gone(item) for item in error.errors)
+    return False
+
 async def on_item_error(context: ScrapeErrorContext) -> ErrorAction:
-    if isinstance(context.error, ResourceGone):
+    if resource_is_gone(context.error):
         return ErrorAction.SKIP
     return ErrorAction.RETRY
 ```
@@ -321,20 +336,24 @@ Pair the handler with a hard attempt limit:
 ```python
 stream = helper.iterator(
     ...,
-    item_retry=RetryPolicy(
-        max_attempts=4,
-        base_delay=0.5,
-        multiplier=2.0,
-        max_delay=8.0,
+    iterator_config=IteratorConfig(
+        item_retry=RetryPolicy(
+            max_attempts=4,
+            base_delay=0.5,
+            multiplier=2.0,
+            max_delay=8.0,
+        ),
+        item_error_handler=on_item_error,
+        item_error_mode=ErrorMode.YIELD,
     ),
-    item_error_handler=on_item_error,
-    item_error_mode=ErrorMode.YIELD,
 )
 ```
 
 Returning `RETRY` on the final allowed attempt falls back to `item_error_mode`.
 Handler exceptions are always fatal `ErrorHandlerError` instances; they are not
-mistaken for remote item failures.
+mistaken for remote item failures. `page_error_handler` and
+`item_error_handler` are routed independently, so configure only the stage whose
+policy you intend to override.
 
 ## 8. Empty pages and extractor requirements
 
