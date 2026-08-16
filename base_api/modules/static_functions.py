@@ -4,6 +4,7 @@ import math
 import json
 import unicodedata
 from collections.abc import Iterable
+from dataclasses import asdict
 from pathlib import PurePath
 from .type_hints import DownloadState
 from datetime import timezone, datetime
@@ -361,8 +362,12 @@ def segment_file_path(segment_dir, index: int, width: int) -> str:
 
 def write_segment_state(state_path: str, state: DownloadState) -> None:
     tmp_path = f"{state_path}.tmp"
+    payload = asdict(state)
+    for path_key in ("output_path", "segment_dir"):
+        if isinstance(payload[path_key], PurePath):
+            payload[path_key] = str(payload[path_key])
     with open(tmp_path, "w", encoding="utf-8") as fp:
-        json.dump(state, fp, ensure_ascii=True, indent=2, sort_keys=True)
+        json.dump(payload, fp, ensure_ascii=True, indent=2, sort_keys=True)
     os.replace(tmp_path, state_path)
 
 

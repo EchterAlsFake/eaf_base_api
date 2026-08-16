@@ -2284,7 +2284,7 @@ class BaseCore:
             self.logger.debug("Failed to remove directory %s: %s", path, e)
 
     async def download_segment(self, url: str, timeout: int, stop_event:
-                                threading.Event | None = None) -> tuple[str, bytes, bool]:
+                                asyncio.Event | None = None) -> tuple[str, bytes, bool]:
         """
         Attempt to download a single segment.
         Returns (url, content, success).
@@ -2522,6 +2522,8 @@ class BaseCore:
                 else:
                     self.logger.debug(f"Writing segments to disk. segment_dir={segment_dir} tmp_path={tmp_path}")
 
+                segment_tasks: set[asyncio.Task[Tuple[int, bool, bytes]]] = set()
+                stop_waiter: asyncio.Task[bool] | None = None
                 try:
                     # Use asyncio.gather to fetch segments concurrently instead of ThreadPoolExecutor
 
@@ -2556,77 +2558,109 @@ class BaseCore:
                                     )
                             return idx, False, b""
 
-                    tasks = [fetch_segment_with_semaphore(i, segments[i]) for i in target_indices]
+                    segment_tasks = {
+                        asyncio.create_task(
+                            fetch_segment_with_semaphore(i, segments[i]),
+                            name=f"hls-segment-{i}",
+                        )
+                        for i in target_indices
+                    }
+                    stop_waiter = (
+                        asyncio.create_task(stop_event.wait(), name="hls-stop-waiter")
+                        if stop_event is not None
+                        else None
+                    )
 
-                    # Use asyncio.as_completed to process results as they come in, similar to wait(FIRST_COMPLETED)
-                    for coro in asyncio.as_completed(tasks):
-                        if stop_event is not None and stop_event.is_set():
+                    while segment_tasks:
+                        waiters = set(segment_tasks)
+                        if stop_waiter is not None:
+                            waiters.add(stop_waiter)
+                        done, _ = await asyncio.wait(
+                            waiters,
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+
+                        if stop_waiter is not None and stop_waiter in done:
                             cancelled = True
-                            # The remaining tasks will see the event set and exit quickly
-                            continue
+                            for task in segment_tasks:
+                                task.cancel()
+                            await asyncio.gather(*segment_tasks, return_exceptions=True)
+                            segment_tasks.clear()
+                            self.logger.info("Cancelled all in-flight HLS segment requests.")
+                            break
 
-                        i, success, data = await coro
+                        completed_tasks = done.intersection(segment_tasks)
+                        for task in completed_tasks:
+                            segment_tasks.remove(task)
+                            i, success, data = task.result()
 
-                        if cancelled:
-                            continue
+                            if success and data:
+                                downloaded[i] = True # Successfully got segment, mark it as done
+                                downloaded_count += 1
+                                if segment_dir:
+                                    # Write to a temp path (good for resuming, but not I/O efficient)
+                                    seg_path = segment_file_path(segment_dir, i, width)
+                                    tmp_seg = f"{seg_path}.part"
+                                    # Offload segment file writing to a thread
+                                    def write_part(ts_path: str, t_data: bytes) -> None:
+                                        with open(ts_path, "wb") as f:
+                                            f.write(t_data)
+                                    await asyncio.to_thread(write_part, tmp_seg, data)
+                                    os.replace(tmp_seg, seg_path)
+                                else:
+                                    assert parts is not None
+                                    parts[i] = data # Keep in memory (I/O efficient)
 
-                        if success and data:
-                            downloaded[i] = True # Successfully got segment, mark it as done
-                            downloaded_count += 1
-                            if segment_dir:
-                                # Write to a temp path (good for resuming, but not I/O efficient)
-                                seg_path = segment_file_path(segment_dir, i, width)
-                                tmp_seg = f"{seg_path}.part"
-                                # Offload segment file writing to a thread
-                                def write_part(ts_path: str, t_data: bytes) -> None:
-                                    with open(ts_path, "wb") as f:
-                                        f.write(t_data)
-                                await asyncio.to_thread(write_part, tmp_seg, data)
-                                os.replace(tmp_seg, seg_path)
+                                progressed += 1 # Fetched +1 segment, so we give back callback
+                                if callback:
+                                    callback(progressed, n)
+                                if progressed >= next_progress_log or progressed == n:
+                                    remaining = n - downloaded_count
+                                    self.logger.debug(
+                                        f"Segment progress: processed={progressed}/{n} "
+                                        f"downloaded={downloaded_count} remaining={remaining}"
+                                    )
+                                    next_progress_log += progress_log_step
+
                             else:
-                                assert parts is not None
-                                parts[i] = data # Keep in memory (I/O efficient)
+                                # Handling failure (already retried in fetch_segment_with_semaphore)
+                                progressed += 1
+                                if callback:
+                                    callback(progressed, n)
+                                if progressed >= next_progress_log or progressed == n:
+                                    remaining = n - downloaded_count
+                                    self.logger.debug(
+                                        f"Segment progress: processed={progressed}/{n} "
+                                        f"downloaded={downloaded_count} remaining={remaining}"
+                                    )
+                                    next_progress_log += progress_log_step
 
-                            progressed += 1 # Fetched +1 segment, so we give back callback
-                            if callback:
-                                callback(progressed, n)
-                            if progressed >= next_progress_log or progressed == n:
-                                remaining = n - downloaded_count
-                                self.logger.debug(
-                                    f"Segment progress: processed={progressed}/{n} "
-                                    f"downloaded={downloaded_count} remaining={remaining}"
-                                )
-                                next_progress_log += progress_log_step
-
-                        else:
-                            # Handling failure (already retried in fetch_segment_with_semaphore)
-                            progressed += 1
-                            if callback:
-                                callback(progressed, n)
-                            if progressed >= next_progress_log or progressed == n:
-                                remaining = n - downloaded_count
-                                self.logger.debug(
-                                    f"Segment progress: processed={progressed}/{n} "
-                                    f"downloaded={downloaded_count} remaining={remaining}"
-                                )
-                                next_progress_log += progress_log_step
-
-                        if not segment_dir and parts is not None:
-                            chunks_to_write = []
-                            while next_to_write < n and parts[next_to_write] is not None:
-                                if parts[next_to_write]:
-                                    chunks_to_write.append(parts[next_to_write])
-                                next_to_write += 1
-                            if chunks_to_write:
-                                # Write memory chunks to thread to prevent IO block
-                                def write_chunks(fp: Any, list_of_data: List[bytes]) -> None:
-                                    for c_data in list_of_data:
-                                        fp.write(c_data)
-                                await asyncio.to_thread(write_chunks, cast(Any, out_fp), chunks_to_write)
+                            if not segment_dir and parts is not None:
+                                chunks_to_write = []
+                                while next_to_write < n and parts[next_to_write] is not None:
+                                    if parts[next_to_write]:
+                                        chunks_to_write.append(parts[next_to_write])
+                                    next_to_write += 1
+                                if chunks_to_write:
+                                    # Write memory chunks to thread to prevent IO block
+                                    def write_chunks(fp: Any, list_of_data: List[bytes]) -> None:
+                                        for c_data in list_of_data:
+                                            fp.write(c_data)
+                                    await asyncio.to_thread(write_chunks, cast(Any, out_fp), chunks_to_write)
 
                 finally:
+                    if stop_waiter is not None:
+                        stop_waiter.cancel()
+                        await asyncio.gather(stop_waiter, return_exceptions=True)
+                    if segment_tasks:
+                        for task in segment_tasks:
+                            task.cancel()
+                        await asyncio.gather(*segment_tasks, return_exceptions=True)
                     if out_fp is not None:
                         out_fp.close()
+
+            if stop_event is not None and stop_event.is_set():
+                cancelled = True
 
             missing = [i for i, ok in enumerate(downloaded) if not ok] # Missing segments
             missing_urls = [segments[i] for i in missing] # Missing URLs of segments
