@@ -102,6 +102,47 @@ def _contains_http_status(error: BaseException, status_code: int) -> bool:
     return False
 
 
+def _normalize_packet_timestamps(
+    packet: Any,
+    offsets: dict[int, int],
+    last_dts: dict[int, int],
+    last_durations: dict[int, int],
+) -> int:
+    """Keep remuxed packet timestamps continuous across HLS discontinuities."""
+    if packet.dts is None:
+        return 0
+
+    stream_index = packet.stream.index
+    raw_dts = packet.dts
+    offset = offsets.get(stream_index, 0)
+    normalized_dts = raw_dts + offset
+    previous_dts = last_dts.get(stream_index)
+    correction = 0
+
+    if previous_dts is not None:
+        step = max(1, last_durations.get(stream_index, packet.duration or 1))
+        expected_dts = previous_dts + step
+        try:
+            ten_seconds = max(1, int(10 / float(packet.time_base)))
+        except (TypeError, ValueError, ZeroDivisionError):
+            ten_seconds = step * 240
+
+        discontinuity_threshold = max(step * 10, ten_seconds)
+        delta = normalized_dts - expected_dts
+        if normalized_dts <= previous_dts or abs(delta) > discontinuity_threshold:
+            correction = -delta
+            offset += correction
+            offsets[stream_index] = offset
+            normalized_dts = raw_dts + offset
+
+    packet.dts = normalized_dts
+    if packet.pts is not None:
+        packet.pts += offset
+    last_dts[stream_index] = normalized_dts
+    last_durations[stream_index] = max(1, packet.duration or 1)
+    return correction
+
+
 @dataclass(frozen=True, slots=True)
 class RequestCacheKey:
     """Identity of a cacheable HTTP request without retaining credentials."""
@@ -2798,7 +2839,11 @@ class BaseCore:
             if remux:
                 self.logger.info(f"Remuxing TS to MP4: input={tmp_path} output={path}")
                 # Offload heavy CPU/IO bound task
-                await asyncio.to_thread(self._convert_ts_to_mp4, tmp_path, path, callback_remux, ios_support)
+                try:
+                    await asyncio.to_thread(self._convert_ts_to_mp4, tmp_path, path, callback_remux, ios_support)
+                except Exception:
+                    self._safe_remove(path)
+                    raise
                 # This is important, because not all players can play MPEG-TS AND I want to write
                 # metadata to the files, and this doesn't work without a container.
                 self._safe_remove(tmp_path)
@@ -2928,6 +2973,9 @@ class BaseCore:
             progress_step = max(1, total // 10) if total else 0
             next_progress_log = progress_step if progress_step else 0
             current_progress = 0
+            timestamp_offsets: dict[int, int] = {}
+            last_dts: dict[int, int] = {}
+            last_durations: dict[int, int] = {}
 
             for idx, packet in enumerate(packets):
                 pkt_size = getattr(packet, "size", 0) or 0
@@ -2937,6 +2985,20 @@ class BaseCore:
                     if callback:
                         callback(current_progress, total)
                     continue
+
+                timestamp_correction = _normalize_packet_timestamps(
+                    packet,
+                    timestamp_offsets,
+                    last_dts,
+                    last_durations,
+                )
+                if timestamp_correction:
+                    self.logger.info(
+                        "Normalized HLS timestamp discontinuity: stream=%s correction=%s time_base=%s",
+                        packet.stream.index,
+                        timestamp_correction,
+                        packet.time_base,
+                    )
 
                 if packet.stream == in_video:
                     packet.stream = out_video
