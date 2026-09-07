@@ -1,3 +1,4 @@
+import os
 import asyncio
 
 from dataclasses import dataclass
@@ -39,6 +40,11 @@ class RuntimeConfig:
         self.videos_concurrency: int = 5
         self.pages_concurrency: int = 2
         self.interface: str | None = None # IP Address of the network interface you want to bind to
+        self.ip_resolve: int | None = (
+            int(os.environ["CURL_IPRESOLVE"])
+            if "CURL_IPRESOLVE" in os.environ and os.environ["CURL_IPRESOLVE"].isdigit()
+            else None
+        ) # Optional: 1 = IPv4, 2 = IPv6, None = default dual-stack (IPv4/IPv6)
 
 
 config = RuntimeConfig()
@@ -139,3 +145,51 @@ class IteratorConfig:
             _page_request_method=self._page_request_method,
             _item_url_key=self._item_url_key,
         )
+
+
+def make_iterator_config(
+    load_specific_sources: tuple[str, ...] = ("html",),
+    *,
+    max_item_concurrency: int | None = None,
+    max_page_concurrency: int | None = None,
+    page_request_method: str = "GET",
+    page_error_mode: ErrorMode = ErrorMode.SKIP,
+    item_error_mode: ErrorMode = ErrorMode.SKIP,
+    item_error_handler: ErrorHandler | None = None,
+    page_error_handler: ErrorHandler | None = None,
+    item_retry: RetryPolicy | None = None,
+    page_retry: RetryPolicy | None = None,
+    item_url_key: str = "url",
+    order: ResultOrder = ResultOrder.ORIGINAL,
+    extract_in_thread: bool = True,
+    load_specific_fields: tuple[str, ...] = (),
+) -> IteratorConfig:
+    """Create an IteratorConfig with sensible defaults for scrapers."""
+    return IteratorConfig(
+        max_item_concurrency=max_item_concurrency,
+        max_page_concurrency=max_page_concurrency,
+        load_specific_sources=load_specific_sources,
+        load_specific_fields=load_specific_fields,
+        extract_in_thread=extract_in_thread,
+        order=order,
+        page_error_mode=page_error_mode,
+        item_error_mode=item_error_mode,
+        item_retry=item_retry,
+        page_retry=page_retry,
+        item_error_handler=item_error_handler,
+        page_error_handler=page_error_handler,
+        _page_request_method=page_request_method,
+        _item_url_key=item_url_key,
+    )
+
+
+async def default_on_error(context: Any) -> Any:
+    """Default scrape error handler: skips gone/not found resources and retries others."""
+    from base_api.modules.type_hints import ErrorAction
+    from base_api.modules.errors import is_resource_gone
+
+    error = getattr(context, "error", context)
+    if is_resource_gone(error):
+        return ErrorAction.SKIP
+    return ErrorAction.RETRY
+

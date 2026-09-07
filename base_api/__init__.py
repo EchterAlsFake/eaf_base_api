@@ -15,6 +15,7 @@ __all__ = [
     "FieldNotLoadableError",
     "Helper",
     "ItemFetchError",
+    "IteratorConfig",
     "LoadState",
     "LoaderConfigurationError",
     "LoaderContractError",
@@ -35,6 +36,27 @@ __all__ = [
     "errors",
     "media_field",
     "UnknownMediaFieldError",
+    "make_iterator_config",
+    "default_on_error",
+    "scrape_stream",
+    "stream_results",
+    "is_resource_gone",
+    "contains_resource_gone",
+    "parse_duration",
+    "parse_count",
+    "get_text_safe",
+    "get_attr_safe",
+    "build_m3u8_master",
+    "str_to_bool",
+    "ScraperException",
+    "NotFound",
+    "NetworkError",
+    "BotDetection",
+    "ProxyError",
+    "UnknownNetworkError",
+    "DownloadFailed",
+    "VideoUnavailable",
+    "ResourceGone",
 ]
 
 
@@ -53,6 +75,17 @@ from base_api.modules.errors import (
     RequestRetriesExhausted,
     ScrapeOperationError,
     UnknownMediaFieldError,
+    is_resource_gone,
+    contains_resource_gone,
+    ScraperException,
+    NotFound,
+    NetworkError,
+    BotDetection,
+    ProxyError,
+    UnknownNetworkError,
+    DownloadFailed,
+    VideoUnavailable,
+    ResourceGone,
 )
 from base_api.base import (
     BaseCore,
@@ -74,5 +107,23 @@ from base_api.base import (
     ScrapeStream,
     SegmentCacheKey,
     media_field,
+    scrape_stream,
+    stream_results,
 )
-from base_api.modules.config import config, DownloadConfigHLS, DownloadConfigRAW
+from base_api.modules.config import (
+    config,
+    DownloadConfigHLS,
+    DownloadConfigRAW,
+    IteratorConfig,
+    make_iterator_config,
+    default_on_error,
+)
+from base_api.modules.static_functions import (
+    str_to_bool,
+    parse_duration,
+    parse_count,
+    get_text_safe,
+    get_attr_safe,
+    build_m3u8_master,
+)
+

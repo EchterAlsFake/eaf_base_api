@@ -580,3 +580,205 @@ def strip_title(
 
     # 8. Return default fallback if sanitization leaves an empty string
     return sanitized if sanitized else default_name
+
+
+def get_text_safe(node: Any, selector: str | None = None) -> str | None:
+    """Safely extract and strip text from a Selectolax HTML node or CSS selector."""
+    if node is None:
+        return None
+    target = node.css_first(selector) if selector else node
+    if target is not None and hasattr(target, "text"):
+        text = target.text(strip=True)
+        return text if text else None
+    return None
+
+
+def get_attr_safe(node: Any, selector: str | None, attr: str) -> str | None:
+    """Safely extract an attribute from a Selectolax HTML node or CSS selector."""
+    if node is None:
+        return None
+    target = node.css_first(selector) if selector else node
+    if target is not None and getattr(target, "attributes", None):
+        val = target.attributes.get(attr)
+        return val if val else None
+    return None
+
+
+def parse_duration(value: str | int | float | None) -> int | None:
+    """
+    Parse a duration representation into integer seconds.
+
+    Supports:
+      - Integer / float seconds (e.g. 120, 120.0 -> 120)
+      - Numeric strings (e.g. "120" -> 120)
+      - ISO 8601 duration strings (e.g. "PT1H2M3S" -> 3723, "PT240S" -> 240, "PT5M" -> 300)
+      - Timestamp formats (e.g. "12:34" -> 754, "1:02:03" -> 3723)
+      - Mixed unit strings (e.g. "59m 40s", "1h 20m", "24 min", "45 seconds")
+    """
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return max(0, int(round(value)))
+
+    s = str(value).strip()
+    if not s or s.lower() in ("not available", "none", "unknown"):
+        return None
+
+    # Plain digits
+    if s.isdigit():
+        return int(s)
+
+    # ISO 8601 duration: PT1H2M3S or PT240S
+    if s.upper().startswith("PT"):
+        total = 0.0
+        matched = False
+        for pattern, factor in [
+            (r"(\d+(?:\.\d+)?)\s*H", 3600),
+            (r"(\d+(?:\.\d+)?)\s*M", 60),
+            (r"(\d+(?:\.\d+)?)\s*S", 1),
+        ]:
+            m = re.search(pattern, s.upper())
+            if m:
+                total += float(m.group(1)) * factor
+                matched = True
+        if matched:
+            return int(round(total))
+
+    # "HH:MM:SS" or "MM:SS"
+    if ":" in s:
+        parts = s.split(":")
+        if all(re.fullmatch(r"\d+(?:\.\d+)?", p.strip()) for p in parts):
+            nums = [float(p.strip()) for p in parts]
+            if len(nums) == 2:
+                return int(round(nums[0] * 60 + nums[1]))
+            elif len(nums) == 3:
+                return int(round(nums[0] * 3600 + nums[1] * 60 + nums[2]))
+
+    # Mixed units: e.g. "1h 2m 3s", "59m 40s", "24 min", "45 seconds"
+    unit_multipliers = {
+        "h": 3600, "hr": 3600, "hrs": 3600, "hour": 3600, "hours": 3600,
+        "m": 60, "min": 60, "mins": 60, "minute": 60, "minutes": 60,
+        "s": 1, "sec": 1, "secs": 1, "second": 1, "seconds": 1,
+    }
+    unit_matches = re.findall(r"(\d+(?:\.\d+)?)\s*([a-zA-Z]+)", s)
+    if unit_matches:
+        total = 0.0
+        found_any = False
+        for num_str, unit in unit_matches:
+            unit_lower = unit.lower()
+            if unit_lower in unit_multipliers:
+                total += float(num_str) * unit_multipliers[unit_lower]
+                found_any = True
+        if found_any:
+            return int(round(total))
+
+    return None
+
+
+def parse_count(value: str | int | float | None) -> int | None:
+    """
+    Parse a numeric count string (views, subscribers, ratings) into an integer.
+
+    Supports:
+      - Raw ints / floats (e.g. 1200 -> 1200)
+      - Numeric strings with commas or spaces (e.g. "1,234,567" -> 1234567)
+      - Suffixes: K, M, B (e.g. "1.2M" -> 1200000, "500K" -> 500000, "2.5B" -> 2500000000)
+    """
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+
+    s = str(value).strip().replace(",", "").replace(" ", "")
+    if not s:
+        return None
+
+    # Handle suffix K, M, B
+    multipliers = {"k": 1_000, "m": 1_000_000, "b": 1_000_000_000}
+    last_char = s[-1].lower()
+    if last_char in multipliers:
+        try:
+            return int(float(s[:-1]) * multipliers[last_char])
+        except ValueError:
+            pass
+
+    # Extract leading digits or float
+    m = re.match(r"^[-+]?\d+(?:\.\d+)?", s)
+    if m:
+        try:
+            return int(float(m.group(0)))
+        except ValueError:
+            pass
+
+    return None
+
+
+def build_m3u8_master(media_definitions: list[dict[str, Any]] | str | None) -> str:
+    """
+    Build an HLS master playlist from MindGeek/Aylo media definitions.
+
+    Accepts either a JSON string or a list of dictionaries.
+    Filters HLS streams, calculates dimensions/bandwidths, and returns a valid
+    #EXTM3U playlist string.
+    """
+    if not media_definitions:
+        return "#EXTM3U\n"
+
+    if isinstance(media_definitions, str):
+        try:
+            items = json.loads(media_definitions)
+        except Exception:
+            return "#EXTM3U\n"
+    else:
+        items = media_definitions
+
+    if not isinstance(items, list):
+        return "#EXTM3U\n"
+
+    m3u8_lines = ["#EXTM3U", "#EXT-X-VERSION:3"]
+
+    for stream in items:
+        if not isinstance(stream, dict):
+            continue
+        fmt = stream.get("format", "hls")
+        if fmt != "hls":
+            continue
+
+        url = stream.get("videoUrl", "")
+        if not url:
+            continue
+
+        quality = str(stream.get("quality", "unknown"))
+        width = stream.get("width", 720)
+        height = stream.get("height", 404)
+
+        bandwidth = 4000000
+        if "4000K" in url:
+            bandwidth = 4000000
+        elif "2000K" in url:
+            bandwidth = 2000000
+        elif "1000K" in url:
+            bandwidth = 1000000
+        elif "800K" in url:
+            bandwidth = 800000
+        elif "500K" in url:
+            bandwidth = 500000
+
+        q_digits = "".join(ch for ch in quality if ch.isdigit())
+        if q_digits:
+            stream_height = int(q_digits)
+            stream_width = int(stream_height * (16 / 9))
+        else:
+            stream_height = int(height) if str(height).isdigit() else 404
+            stream_width = int(width) if str(width).isdigit() else 720
+
+        q_name = f"{stream_height}p" if q_digits else f"{quality}p"
+        m3u8_lines.append(
+            f'#EXT-X-STREAM-INF:BANDWIDTH={bandwidth},'
+            f'RESOLUTION={stream_width}x{stream_height},'
+            f'NAME="{q_name}"'
+        )
+        m3u8_lines.append(url)
+
+    return "\n".join(m3u8_lines) + "\n"
+

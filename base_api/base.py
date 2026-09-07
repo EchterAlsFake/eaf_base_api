@@ -38,7 +38,7 @@ from base_api.modules.static_functions import (
     parse_challenge, other_challenge, least_factors, available_qualities,
     choose_variant, collect_variants, get_segment_index_width
 )
-from base_api.modules.config import config, RuntimeConfig, DownloadConfigHLS, DownloadConfigRAW, IteratorConfig
+from base_api.modules.config import config, RuntimeConfig, DownloadConfigHLS, DownloadConfigRAW, IteratorConfig, make_iterator_config
 from base_api.modules.progress_bars import Callback
 from base_api.modules.logger import configure_app_logging
 
@@ -1562,6 +1562,35 @@ class Helper(Generic[MediaT]):
             ) from handler_error
 
 
+async def stream_results(
+    stream: ScrapeStream[MediaT],
+) -> AsyncGenerator[ScrapeResult[MediaT], None]:
+    """Safely exhaust and yield from a ScrapeStream within its async context."""
+    async with stream:
+        async for result in stream:
+            yield result
+
+
+def scrape_stream(
+    *,
+    core: BaseCore,
+    constructor: Any,
+    target_page_urls: list[str],
+    item_extractor: Any,
+    iterator_config: IteratorConfig | None = None,
+) -> AsyncGenerator[ScrapeResult[MediaT], None]:
+    """Construct and stream results from a Helper iterator as an AsyncGenerator."""
+    if iterator_config is None:
+        iterator_config = make_iterator_config()
+
+    stream = Helper(core=core, constructor=constructor).iterator(
+        target_page_urls=target_page_urls,
+        item_extractor=item_extractor,
+        iterator_config=iterator_config,
+    )
+    return stream_results(stream)
+
+
 class BaseCore:
     """
     The base class which has all necessary functions for other API packages
@@ -1611,11 +1640,24 @@ class BaseCore:
     def initialize_session(self) -> None:
         """Initialize the owned HTTP session once for the current lifecycle."""
         if self.session is not None:
-            return
+            current_loop = None
+            try:
+                current_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                pass
+            session_loop = getattr(self.session, "loop", None)
+            if session_loop is not None and current_loop is not None and (session_loop != current_loop or session_loop.is_closed()):
+                self.session = None
+            else:
+                return
 
         verify = self.configuration.verify_ssl
 
         curl_options: Dict[CurlOpt, Union[bytes, int]] = {}
+        ip_resolve = getattr(self.configuration, "ip_resolve", None)
+        if ip_resolve is not None and ip_resolve in (0, 1, 2):
+            curl_options[CurlOpt.IPRESOLVE] = ip_resolve
+
         if self.configuration.dns_over_https:
             curl_options[CurlOpt.DOH_URL] = str(self.configuration.dns_over_https).encode("utf-8")
 
@@ -1682,8 +1724,7 @@ class BaseCore:
         Create request headers from current session headers + optional overrides.
         Overrides win, session headers are the base.
         """
-        if self.session is None:
-            self.initialize_session()
+        self.initialize_session()
         session = self.session
         assert session is not None
         headers: Dict[str, Any] = cast(Dict[str, Any], cast(Any, dict(session.headers)))
@@ -1693,8 +1734,7 @@ class BaseCore:
 
     def _merged_cookies(self, override: Dict[str, str] | None) -> Dict[str, Any]:
         """Same as above, but for cookies"""
-        if self.session is None:
-            self.initialize_session()
+        self.initialize_session()
         session = self.session
         assert session is not None
         cookies: Dict[str, Any] = cast(Dict[str, Any], cast(Any, session.cookies.get_dict()))
@@ -1723,8 +1763,7 @@ class BaseCore:
         idempotent methods. Retrying a non-idempotent method requires an explicit
         opt-in because the server may already have applied the request.
         """
-        if self.session is None:
-            self.initialize_session()
+        self.initialize_session()
         session = self.session
         assert session is not None
 
@@ -2538,7 +2577,7 @@ class BaseCore:
 
             tmp_path = f"{path}.tmp" # Creates a temporary path where we write stuff to
             cancelled = False # This is the cancellation event that stops the download
-            max_seg_retries = 2 # Maximum retries to get segments
+            max_seg_retries = max(4, int(getattr(self.configuration, "request_attempts", 4))) # Maximum retries to get segments
             progress_log_step = max(1, n // 20)
             next_progress_log = ((progressed // progress_log_step) + 1) * progress_log_step
 
@@ -2592,7 +2631,7 @@ class BaseCore:
                                     self.logger.warning(
                                         f"Segment {idx} failed; retrying {attempt + 1}/{max_seg_retries}"
                                     )
-                                    # Optional short backoff delay could go here
+                                    await asyncio.sleep(min(0.5 * (1.5 ** attempt), 3.0))
                                 else:
                                     self.logger.error(
                                         f"Segment {idx} failed after {attempt} retries."
@@ -3100,9 +3139,13 @@ allow_multipart=%s""", url, path, max_retries, read_timeout, bool(stop_event and
             no_compress = {"Accept-Encoding": "identity"}
             try:
                 head_resp = await session.head(url, timeout=timeout, allow_redirects=True, headers=no_compress)
+                if getattr(head_resp, "url", None):
+                    url = str(head_resp.url)
                 if head_resp.status_code == 405:  # Method Not Allowed, fallback to streaming GET
                     head_resp_stream = await session.request("GET", url, timeout=timeout, allow_redirects=True,
                                                              stream=True, headers=no_compress)
+                    if getattr(head_resp_stream, "url", None):
+                        url = str(head_resp_stream.url)
                     file_size = int(head_resp_stream.headers.get("Content-Length", 0))
                     accept_ranges = head_resp_stream.headers.get("Accept-Ranges", "")
                 else:
@@ -3282,12 +3325,12 @@ allow_multipart=%s""", url, path, max_retries, read_timeout, bool(stop_event and
                 return True
             except RequestsError as e:
                 err_str = str(e).lower()
-                if "timeout" in err_str or "read" in err_str:
+                if "timeout" in err_str or "read" in err_str or "reset" in err_str or "recv failure" in err_str or "connection" in err_str:
                     attempt += 1
                     if attempt > max_retries:
                         raise
                     backoff = min(2 ** attempt, 30)
-                    self.logger.warning("Read timeout; retrying %s/%s in %s", attempt, max_retries,  backoff)
+                    self.logger.warning("Download connection interrupted (%s); retrying %s/%s in %s", e, attempt, max_retries, backoff)
                     if stop_event is not None and stop_event.wait(backoff):
                         raise DownloadCancelled("Download cancelled.") from e
                     else:

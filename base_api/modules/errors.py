@@ -344,3 +344,62 @@ class StateLoadError(BaseScraperError):
 
 class MaxRetriesExceeded(BaseScraperError):
     pass
+
+
+# Common scraper errors used across provider APIs
+class ScraperException(Exception):
+    """Base exception for video scraper errors."""
+    def __init__(self, msg: str = "") -> None:
+        super().__init__(msg)
+        self.msg = msg
+
+
+class NotFound(ScraperException):
+    """Raised when a remote video or resource is not found (HTTP 404)."""
+    pass
+
+
+class NetworkError(ScraperException):
+    """Raised when a network operation fails."""
+    pass
+
+
+class BotDetection(ScraperException):
+    """Raised when bot protection (e.g. Cloudflare) is detected."""
+    pass
+
+
+class ProxyError(ScraperException):
+    """Raised when a proxy connection fails."""
+    pass
+
+
+class UnknownNetworkError(ScraperException):
+    """Raised when an unknown network error occurs."""
+    pass
+
+
+class DownloadFailed(ScraperException):
+    """Raised when a video download fails."""
+    pass
+
+
+class VideoUnavailable(ScraperException):
+    """Raised when a video is unavailable or has been removed."""
+    pass
+
+
+def is_resource_gone(error: BaseException) -> bool:
+    """Check if an error or any nested loader error represents a gone or not-found resource."""
+    if isinstance(error, (ResourceGone, NotFound, VideoUnavailable)):
+        return True
+    if isinstance(error, HTTPStatusError) and error.status_code in (404, 410):
+        return True
+    if isinstance(error, MediaLoadError):
+        return is_resource_gone(error.original_error)
+    if isinstance(error, MediaLoadErrors):
+        return any(is_resource_gone(item) for item in error.errors)
+    return False
+
+
+contains_resource_gone = is_resource_gone

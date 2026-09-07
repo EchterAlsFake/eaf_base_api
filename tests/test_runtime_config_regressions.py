@@ -146,3 +146,17 @@ async def test_request_backoff_uses_the_runtime_multiplier(
     await core.request("https://example.test/resource")
 
     assert captured["exp_base"] == 3.5
+
+
+def test_ip_resolve_is_optional(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("CURL_IPRESOLVE", raising=False)
+    config = RuntimeConfig()
+    assert config.ip_resolve is None
+
+    config.ip_resolve = 1
+    assert config.ip_resolve == 1
+
+    monkeypatch.setenv("CURL_IPRESOLVE", "2")
+    config_env = RuntimeConfig()
+    assert config_env.ip_resolve == 2
+
