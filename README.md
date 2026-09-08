@@ -134,7 +134,10 @@ stream = helper.iterator(
 async with stream:
     async for result in stream:
         if not result.succeeded:
-            logger.error("%s failed: %s", result.stage, result.error)
+            logger.error(
+                "%s failed for %s: %s", result.stage, result.url, result.error,
+                exc_info=(type(result.error), result.error, result.error.__traceback__),
+            )
             continue
         video = result.unwrap()
 ```
@@ -144,6 +147,31 @@ Page and item failures independently support `ErrorMode.YIELD`, `ErrorMode.SKIP`
 or `ErrorMode.RAISE`. `RetryPolicy` provides a strict maximum attempt count and
 optional exponential delay; the independent page and item handlers return an
 `ErrorAction` and cannot create an unbounded retry loop.
+
+## Error logging
+
+Configure logging once in the application to capture all provider and base API logs:
+
+```python
+import logging
+from base_api.modules.logger import configure_app_logging
+
+configure_app_logging(log_file="api.log", level=logging.INFO)
+```
+
+Failures include the operation, video/page URL, and original traceback. The default
+formatter also shows the file, line, and function. Media source failures are logged
+even when a caller catches the exception; iterator failures are logged even when
+the configured policy skips or yields them. Provider CLIs configure console logging
+automatically.
+
+Provider request and download exceptions use the shared types in
+`base_api.modules.errors`, preserving the original exception as `__cause__`.
+Pornhub's existing exception classes remain catchable as `PornhubAPIError` and as
+their shared equivalents. `ScraperException` also inherits `BaseScraperError`.
+Download preparation errors now carry the video URL in `DownloadFailed`, and
+explicit cancellation remains `DownloadCancelled` or `asyncio.CancelledError`.
+Existing boolean/download-report results from the base downloader remain supported.
 
 # Can I use this for myself?
 Yes, you can, but I may change stuff here and there from time to time, and it would maybe break your project.

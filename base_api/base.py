@@ -797,6 +797,10 @@ class BaseMedia:
                 object.__getattribute__(self, "_source_tasks").pop(source, None)
             raise
         except Exception as error:
+            logging.getLogger(type(self).__module__).exception(
+                "Failed to load %s.%s for %s: %s",
+                model_name, source, self.url, error,
+            )
             recorded_error: BaseException
             if isinstance(error, (LoaderContractError, LoaderConfigurationError)):
                 recorded_error = error
@@ -1505,6 +1509,7 @@ class Helper(Generic[MediaT]):
                         retry_policy.max_attempts,
                         delay,
                         error,
+                        exc_info=True,
                     )
                     if delay:
                         await asyncio.sleep(delay)
@@ -1557,6 +1562,10 @@ class Helper(Generic[MediaT]):
         except asyncio.CancelledError:
             raise
         except Exception as handler_error:
+            self.logger.exception(
+                "Error handler failed while processing %s %s: %s",
+                context.stage.value, context.url, handler_error,
+            )
             raise ErrorHandlerError(
                 context.stage.value, context.url, handler_error
             ) from handler_error
@@ -1908,7 +1917,7 @@ class BaseCore:
                             return response
 
                         if status in {401, 403}:
-                            raise AccessDeniedError("Request blocked by server!")
+                            raise AccessDeniedError(f"Request blocked (HTTP {status}) for {url}")
 
                         if status == 412:
                             log_precondition_failed(logger=self.logger, attempt=attempt.retry_state.attempt_number, response=response)
@@ -1951,10 +1960,11 @@ class BaseCore:
                             self.logger.error("Timeout for URL %s: %s", url, e, exc_info=True)
                         raise
                     except (BaseScraperError, ResourceGone, ProxySSLError, InvalidProxy, UnknownError):
+                        self.logger.exception("Request failed: %s %s", method, url)
                         raise
 
                     except Exception as e:
-                        self.logger.error("Unexpected error for %s: %s\n%s", url, e, traceback.format_exc())
+                        self.logger.exception("Unexpected request error for %s: %s", url, e)
                         raise UnknownError(f"Unexpected error for URL {url}: {e}") from e
 
         except RetryError as re_err:
@@ -1962,7 +1972,9 @@ class BaseCore:
             if not isinstance(last_error, Exception):
                 last_error = NetworkRequestError("Request retry budget was exhausted")
             self.logger.error(
-                "Request to %s failed after %s attempts.", url, max_attempts
+                "Request to %s failed after %s attempts: %s", url, max_attempts,
+                last_error,
+                exc_info=(type(last_error), last_error, last_error.__traceback__),
             )
             raise RequestRetriesExhausted(url, max_attempts, last_error) from last_error
 
@@ -2006,6 +2018,7 @@ class BaseCore:
                 "Content could not be decoded as %s (%s), decoding latin1 instead!",
                 encoding,
                 url,
+                exc_info=True,
             )
             return raw_content.decode("latin1", errors="replace")
 
@@ -2322,7 +2335,7 @@ class BaseCore:
             try:
                 init_url = urljoin(base_url, segments_map[0].uri)
             except Exception as exc:
-                self.logger.info("Couldn't get init url, this is probably not an issue: %s", exc)
+                self.logger.warning("Failed to resolve initialization segment for %s: %s", base_url, exc, exc_info=True)
                 pass
         if init_url is None:
             init_section = getattr(parsed, "init_section", None)
@@ -2351,7 +2364,7 @@ class BaseCore:
         except FileNotFoundError:
             return
         except Exception as e:
-            self.logger.debug("Failed to remove file %s: %s", path, e)
+            self.logger.debug("Failed to remove file %s: %s", path, e, exc_info=True)
 
     def _safe_rmtree(self, path: str | None) -> None:
         if not path:
@@ -2361,7 +2374,7 @@ class BaseCore:
         except FileNotFoundError:
             return
         except Exception as e:
-            self.logger.debug("Failed to remove directory %s: %s", path, e)
+            self.logger.debug("Failed to remove directory %s: %s", path, e, exc_info=True)
 
     async def download_segment(self, url: str, timeout: int, stop_event:
                                 asyncio.Event | None = None) -> tuple[str, bytes, bool]:
@@ -2377,7 +2390,7 @@ class BaseCore:
             return url, content, True
         except Exception as e:
             # Log and mark failure; the caller will decide whether to retry or abort.
-            self.logger.warning("Segment download failed: %s -> %s", url, e)
+            self.logger.exception("Segment download failed for %s: %s", url, e)
             return url, b"", False
 
     async def download(
@@ -2467,7 +2480,7 @@ class BaseCore:
                     resume_state = load_segment_state(segment_state_path)
                     resume_mode = True
                 except Exception as e: # Shouldn't happen, but if it does, we just do a new download
-                    self.logger.warning(f"Failed to load segment state {segment_state_path}: {e}. Starting fresh.")
+                    self.logger.warning(f"Failed to load segment state {segment_state_path}: {e}. Starting fresh.", exc_info=True)
                     resume_state = None
                     resume_mode = False
 
@@ -2557,7 +2570,7 @@ class BaseCore:
                             downloaded[i] = True
                             existing_segments += 1
                     except Exception as exc:
-                        self.logger.warning(f"Couldn't download segment: {i}, retrying later.  ->: {exc}")
+                        self.logger.warning("Failed to read saved segment %s for %s: %s", i, m3u8_url, exc, exc_info=True)
                         # If something goes wrong, we treat it as not downloaded and re-fetch it later
                         downloaded[i] = False
                 self.logger.info(
@@ -2625,16 +2638,16 @@ class BaseCore:
                                     if is_success and segment_data:
                                         return idx, True, segment_data
                                 except Exception as exception:
-                                    self.logger.error(f"Worker exception for segment {idx}: {exception}", exc_info=True)
+                                    self.logger.exception("Worker failed for segment %s (%s): %s", idx, url, exception)
 
                                 if attempt < max_seg_retries:
                                     self.logger.warning(
-                                        f"Segment {idx} failed; retrying {attempt + 1}/{max_seg_retries}"
+                                        "Segment %s (%s) failed; retrying %s/%s", idx, url, attempt + 1, max_seg_retries
                                     )
                                     await asyncio.sleep(min(0.5 * (1.5 ** attempt), 3.0))
                                 else:
                                     self.logger.error(
-                                        f"Segment {idx} failed after {attempt} retries."
+                                        "Segment %s (%s) failed after %s retries", idx, url, attempt
                                     )
                             return idx, False, b""
 
@@ -2750,7 +2763,8 @@ class BaseCore:
             if missing:
                 sample = missing[:10]
                 self.logger.error(
-                    "Missing segments detected: count=%s sample=%s", len(missing), sample
+                    "Missing segments for %s: count=%s sample=%s urls=%s", m3u8_url, len(missing), sample,
+                    missing_urls[:10],
                 )
 
             report = DownloadReport(
@@ -2802,7 +2816,8 @@ class BaseCore:
 
             if missing:
                 self.logger.error(
-                    f"Download incomplete: {len(missing)} segments missing. Writing state={bool(segment_state_path)}"
+                    "Download incomplete for %s (output=%s): %s segments missing; state=%s",
+                    m3u8_url, path, len(missing), segment_state_path,
                 )
                 self._safe_remove(tmp_path)
                 if segment_state_path:
@@ -2847,7 +2862,8 @@ class BaseCore:
 
                 if missing:
                     self.logger.error(
-                        f"Missing segment file during assemble: index={missing[0]} segment_dir={segment_dir}"
+                        "Missing segment file while assembling %s: index=%s segment_dir=%s source=%s",
+                        path, missing[0], segment_dir, m3u8_url,
                     )
                     self._safe_remove(tmp_path)
                     if segment_state_path:
@@ -2893,7 +2909,7 @@ class BaseCore:
                 try:
                     os.replace(tmp_path, path) # If we don't remux, we just rename it to mp4 and treat it as done :)
                 except Exception as exc: # Shouldn't happen and I also don't know what this does lol
-                    self.logger.warning(f"os.replace failed: {exc}, falling back to manual copy.")
+                    self.logger.warning("Failed to move %s to %s; falling back to copy: %s", tmp_path, path, exc, exc_info=True)
                     def manual_copy() -> None:
                         with open(path, "wb") as final_fp, open(tmp_path, "rb") as in_fp:
                             for chunk in iter(lambda: in_fp.read(1024 * 1024), b""):
@@ -2914,7 +2930,10 @@ class BaseCore:
                 return report
             return True
         except Exception as e:
-            self.logger.exception(f"Unhandled exception in download wrapper: {e}")
+            self.logger.exception(
+                "Download failed for %s (output=%s): %s",
+                pre_resolved_m3u8, configuration.path, e,
+            )
             return False
 
     def _convert_ts_to_mp4(self, input_path: str, output_path: str,
@@ -2926,7 +2945,7 @@ class BaseCore:
             input_size = os.path.getsize(input_path)
             self.logger.debug("Remux input size: %s bytes", input_size)
         except Exception as e:
-            self.logger.debug("Remux input size unavailable: %s", e)
+            self.logger.debug("Remux input size unavailable for %s: %s", input_path, e, exc_info=True)
 
         try:
             from av import open as av_open  # type: ignore[import-not-found]
@@ -2991,7 +3010,7 @@ class BaseCore:
                     try:
                         out_audio.layout = layout
                     except Exception as exc:
-                        self.logger.warning("Exception in getting audio layout (doesn't matter): %s", exc)
+                        self.logger.warning("Failed to set audio layout while remuxing %s to %s: %s", input_path, output_path, exc, exc_info=True)
                         pass
 
                     resampler = AudioResampler(format="fltp", layout=layout, rate=sample_rate)
@@ -3005,7 +3024,7 @@ class BaseCore:
             try:
                 total = os.path.getsize(input_path)
             except Exception as exc:
-                self.logger.warning("Exception while getting path size for demuxing progress??? %s", exc)
+                self.logger.warning("Failed to read input size for remux progress: %s: %s", input_path, exc, exc_info=True)
                 total = 100
 
             self.logger.info("Demuxing packets: total_bytes=%s", total)
@@ -3080,7 +3099,7 @@ class BaseCore:
                                  elapsed)
             except Exception as e:
                 self.logger.info("Remux complete: output=%s elapsed=%s.2fs (size unavailable: %s)", output_path,
-                                 elapsed, e)
+                                 elapsed, e, exc_info=True)
 
         else:
             self.logger.info("Stream seems to be already in MP4! Skipping remux...")
@@ -3152,7 +3171,7 @@ allow_multipart=%s""", url, path, max_retries, read_timeout, bool(stop_event and
                     file_size = int(head_resp.headers.get("Content-Length", 0))
                     accept_ranges = head_resp.headers.get("Accept-Ranges", "")
             except Exception as e:
-                self.logger.warning("Failed to fetch HEAD info for concurrent check: %s.", e)
+                self.logger.warning("HEAD request failed for %s; falling back to streaming: %s", url, e, exc_info=True)
 
         # 2. Execute Fast Multipart Download if supported and allowed
         if allow_multipart and file_size > 0 and accept_ranges == "bytes":
@@ -3221,14 +3240,14 @@ allow_multipart=%s""", url, path, max_retries, read_timeout, bool(stop_event and
 
                     except Exception as exc:
                         if attempt_chunk < max_retries:
-                            self.logger.warning("Chunk %s failed (attempt %s/%s): %s",
-                                                chunk_idx_now, attempt_chunk + 1, max_retries, exc)
+                            self.logger.warning("Chunk %s failed for %s (attempt %s/%s): %s",
+                                                chunk_idx_now, url, attempt_chunk + 1, max_retries, exc, exc_info=True)
                             # Reset progress for this chunk before retry
                             total_downloaded[0] -= chunk_progress[chunk_idx_now]
                             chunk_progress[chunk_idx_now] = 0
                             await asyncio.sleep(1 * attempt_chunk)
                         else:
-                            self.logger.error("Chunk %s permanently failed: %s", chunk_idx_now, exc, exc_info=True)
+                            self.logger.error("Chunk %s permanently failed for %s: %s", chunk_idx_now, url, exc, exc_info=True)
                             return False
                 return False
 
@@ -3330,7 +3349,7 @@ allow_multipart=%s""", url, path, max_retries, read_timeout, bool(stop_event and
                     if attempt > max_retries:
                         raise
                     backoff = min(2 ** attempt, 30)
-                    self.logger.warning("Download connection interrupted (%s); retrying %s/%s in %s", e, attempt, max_retries, backoff)
+                    self.logger.warning("Download connection interrupted for %s (%s); retrying %s/%s in %ss", url, e, attempt, max_retries, backoff, exc_info=True)
                     if stop_event is not None and stop_event.wait(backoff):
                         raise DownloadCancelled("Download cancelled.") from e
                     else:

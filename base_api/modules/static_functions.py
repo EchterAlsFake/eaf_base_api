@@ -474,7 +474,7 @@ def response_body_preview(logger, response: Response, max_bytes: int = 512) -> s
     try:
         text = cast(bytes, cast(Any, raw)).decode(enc, errors="replace")
     except Exception as exc:
-        logger.error(f"There was an error while decoding text from the response body preview: {exc}")
+        logger.error(f"There was an error while decoding text from the response body preview: {exc}", exc_info=True)
         text = cast(bytes, cast(Any, raw)).decode("utf-8", errors="replace")
     return text.replace("\r", "\\r").replace("\n", "\\n")
 
@@ -495,7 +495,7 @@ def parse_retry_after(logger, response: Response) -> float | None:
             # clamp: negative -> 0
             return max(0.0, delta)
         except Exception as exc:
-            logger.warning(f"Couldn't parse retry after in 429 error: {exc}")
+            logger.warning(f"Couldn't parse retry after in 429 error: {exc}", exc_info=True)
             return None
 
 
@@ -516,7 +516,7 @@ def log_precondition_failed(logger, response: Response, attempt: int) -> None:
             k for k in req.headers.keys() if k.lower().startswith("if-")
         ] if req is not None else []
     except Exception as exc:
-        logger.warning(f"Could not get the conditional headers: {exc}")
+        logger.warning(f"Could not get the conditional headers: {exc}", exc_info=True)
         cond_headers = []
 
     cond_note = f" conditional_headers={cond_headers}" if cond_headers else ""
@@ -781,4 +781,3 @@ def build_m3u8_master(media_definitions: list[dict[str, Any]] | str | None) -> s
         m3u8_lines.append(url)
 
     return "\n".join(m3u8_lines) + "\n"
-

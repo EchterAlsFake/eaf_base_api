@@ -347,7 +347,7 @@ class MaxRetriesExceeded(BaseScraperError):
 
 
 # Common scraper errors used across provider APIs
-class ScraperException(Exception):
+class ScraperException(BaseScraperError):
     """Base exception for video scraper errors."""
     def __init__(self, msg: str = "") -> None:
         super().__init__(msg)

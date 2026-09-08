@@ -50,7 +50,7 @@ def configure_app_logging(
     logger = logging.getLogger(logger_name)
     logger.setLevel(level)
 
-    format_ = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    format_ = "%(asctime)s - %(name)s - %(levelname)s - %(filename)s:%(lineno)d %(funcName)s - %(message)s"
     formatter = logging.Formatter(format_)
 
     # Avoid duplicating handlers if this is called twice
