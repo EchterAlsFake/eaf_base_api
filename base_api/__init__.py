@@ -57,6 +57,9 @@ __all__ = [
     "DownloadFailed",
     "VideoUnavailable",
     "ResourceGone",
+    "LoginFailed",
+    "RegionBlocked",
+    "configure_app_logging",
 ]
 
 
@@ -86,7 +89,10 @@ from base_api.modules.errors import (
     DownloadFailed,
     VideoUnavailable,
     ResourceGone,
+    LoginFailed,
+    RegionBlocked,
 )
+from base_api.modules.logger import configure_app_logging
 from base_api.base import (
     BaseCore,
     BaseMedia,
@@ -126,4 +132,3 @@ from base_api.modules.static_functions import (
     get_attr_safe,
     build_m3u8_master,
 )
-

@@ -1,4 +1,4 @@
-# This file contains all custom exceptions for base api. They should be handled by each API individually.
+# Shared exceptions for the base library and provider APIs.
 message_security = """
 Hey, please stop before proceeding and READ this text:
 
@@ -349,9 +349,13 @@ class MaxRetriesExceeded(BaseScraperError):
 # Common scraper errors used across provider APIs
 class ScraperException(BaseScraperError):
     """Base exception for video scraper errors."""
-    def __init__(self, msg: str = "") -> None:
-        super().__init__(msg)
+    def __init__(self, msg: str = "", *, url: str | None = None,
+                 class_name: str | None = None, api: str | None = None) -> None:
         self.msg = msg
+        self.url = url
+        self.class_name = class_name
+        self.api = api
+        super().__init__(msg)
 
 
 class NotFound(ScraperException):
@@ -387,6 +391,14 @@ class DownloadFailed(ScraperException):
 class VideoUnavailable(ScraperException):
     """Raised when a video is unavailable or has been removed."""
     pass
+
+
+class LoginFailed(ScraperException):
+    """Raised when a provider rejects a login."""
+
+
+class RegionBlocked(ScraperException):
+    """Raised when a provider denies access from the caller's region."""
 
 
 def is_resource_gone(error: BaseException) -> bool:

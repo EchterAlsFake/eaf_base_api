@@ -14,7 +14,63 @@ support, and there was a lot of code that I would have rewritten in every API ag
 package. The `BaseCore` class does all the necessary stuff like m3u8 parsing, a great caching system, network request
 fetching with retry attempts and proxy support.
 
-# Documentation (IMPORTANT!) 
+## Consistent errors and logging (4.2)
+
+Configure logging once in your application to capture all 15 provider APIs and
+the base library:
+
+```python
+import logging
+from base_api import configure_app_logging, DownloadFailed
+
+configure_app_logging(level=logging.WARNING, log_file="api-errors.log")
+
+# Inside your async application:
+try:
+    await video.download(configuration)
+except DownloadFailed as error:
+    print(error.api, error.class_name, error.url)
+    # The failure and its full traceback have already been logged.
+```
+
+Logs use Python module names, such as `xvideos_api.api` and `base_api.base`.
+Request, source-loading, and download logs include the qualified class name and
+URL in the message and in `LogRecord.class_name` / `LogRecord.url`. For example:
+
+```text
+ERROR xvideos_api.api [class=xvideos_api.api.Video url=https://example.test/video/123] Download failed: disk full
+Traceback (most recent call last):
+  ...
+OSError: disk full
+```
+
+Network logs identify the actual request URL, including CDN/segment URLs; media
+errors also identify the original video page. Context stays separate for
+concurrent downloads and follows parsing work into worker threads. Creating a
+client/core does not install handlers or override your application's log level.
+Without configuration, Python's fallback logging handler still prints warnings
+and errors to stderr.
+
+Catch common failures from `base_api`: `DownloadFailed`, `NetworkError`,
+`NotFound`, `ProxyError`, `BotDetection`, `VideoUnavailable`, `LoginFailed`, and
+`RegionBlocked`. Existing provider exception imports remain compatible,
+including Pornhub's `PornhubAPIError` hierarchy. Translated exceptions preserve
+the original exception as `__cause__`.
+
+Ordinary download failures now raise `DownloadFailed` instead of returning
+`False`. A stop signal raises `base_api.modules.errors.DownloadCancelled`;
+async task cancellation propagates unchanged. Neither is logged as an error.
+With `DownloadConfigHLS(return_report=True)`, incomplete/cancelled downloads
+still return their explicit `DownloadReport`; unexpected exceptions still raise.
+
+Shared request translation, download error handling, HLS preparation, and output
+configuration live in `base_api.modules.provider`. The identical Tube8 and
+Thumbzilla result-grid extraction lives in `base_api.modules.static_functions`.
+Site-specific parsing, quality selection, and fallback behavior stay in each
+provider. Updated providers require `eaf-base-api>=4.2.0`; update the base library
+alongside them.
+
+# Documentation (IMPORTANT!)
 > [!IMPORTANT]
 > Configuring eaf_base_api is necessary if you use any of my Porn APIs, because they all depend on this project.
 > Please read through the documentation to learn how `PROXIES`, `CACHING` and `LOGGING` etc... work!

@@ -40,7 +40,7 @@ from base_api.modules.static_functions import (
 )
 from base_api.modules.config import config, RuntimeConfig, DownloadConfigHLS, DownloadConfigRAW, IteratorConfig, make_iterator_config
 from base_api.modules.progress_bars import Callback
-from base_api.modules.logger import configure_app_logging
+from base_api.modules.logger import configure_app_logging, get_logger, log_context, ContextLogger
 
 # 2. Handle optional dependencies cleanly
 try:
@@ -504,7 +504,7 @@ class BaseMedia:
             So, basically when we build the schema (down below) this takes some time. However, this function actually
             caches the fully resolved dataclass. So if we are going over a thousand Video objects usually we would need
             to reconstruct the thousand video objects, well, a thousand times.
-            
+
             By giving the model_type with self, we can tell the cache: Yo, this is a Video object. See if you have
             already processed this and if yes it will use this instead of processing it each time again.
             Might only save a few milliseconds but I ain't Ubisoft XDDD
@@ -768,56 +768,57 @@ class BaseMedia:
 
     async def _execute_source_loader(self, source: str) -> None:
         """Execute, validate, and atomically commit one source loader."""
-        model_name = type(self).__name__
-        try:
-            loader = self._loader_for_source(source)
-            awaitable = loader()
-            if not inspect.isawaitable(awaitable):
-                raise LoaderContractError(
-                    model_name,
-                    source,
-                    self.url,
-                    "the configured loader must be async and return an awaitable",
-                )
-            raw_result = await awaitable
-            result = self._validate_loader_result(source, raw_result)
+        with log_context(self, self.url):
+            model_name = type(self).__name__
+            try:
+                loader = self._loader_for_source(source)
+                awaitable = loader()
+                if not inspect.isawaitable(awaitable):
+                    raise LoaderContractError(
+                        model_name,
+                        source,
+                        self.url,
+                        "the configured loader must be async and return an awaitable",
+                    )
+                raw_result = await awaitable
+                result = self._validate_loader_result(source, raw_result)
 
-            lock = object.__getattribute__(self, "_load_lock")
-            async with lock:
-                object.__getattribute__(self, "_source_results")[source] = result
-                object.__getattribute__(self, "_source_states")[source] = LoadState.LOADED
-                object.__getattribute__(self, "_source_errors").pop(source, None)
-                self._apply_source_precedence(source)
-                object.__getattribute__(self, "_source_tasks").pop(source, None)
+                lock = object.__getattribute__(self, "_load_lock")
+                async with lock:
+                    object.__getattribute__(self, "_source_results")[source] = result
+                    object.__getattribute__(self, "_source_states")[source] = LoadState.LOADED
+                    object.__getattribute__(self, "_source_errors").pop(source, None)
+                    self._apply_source_precedence(source)
+                    object.__getattribute__(self, "_source_tasks").pop(source, None)
 
-        except asyncio.CancelledError:
-            lock = object.__getattribute__(self, "_load_lock")
-            async with lock:
-                object.__getattribute__(self, "_source_states")[source] = LoadState.NOT_LOADED
-                object.__getattribute__(self, "_source_tasks").pop(source, None)
-            raise
-        except Exception as error:
-            logging.getLogger(type(self).__module__).exception(
-                "Failed to load %s.%s for %s: %s",
-                model_name, source, self.url, error,
-            )
-            recorded_error: BaseException
-            if isinstance(error, (LoaderContractError, LoaderConfigurationError)):
-                recorded_error = error
-            else:
-                recorded_error = MediaLoadError(
-                    model_name, source, self.url, error
-                )
-
-            lock = object.__getattribute__(self, "_load_lock")
-            async with lock:
-                object.__getattribute__(self, "_source_states")[source] = LoadState.FAILED
-                object.__getattribute__(self, "_source_errors")[source] = recorded_error
-                object.__getattribute__(self, "_source_tasks").pop(source, None)
-
-            if recorded_error is error:
+            except asyncio.CancelledError:
+                lock = object.__getattribute__(self, "_load_lock")
+                async with lock:
+                    object.__getattribute__(self, "_source_states")[source] = LoadState.NOT_LOADED
+                    object.__getattribute__(self, "_source_tasks").pop(source, None)
                 raise
-            raise recorded_error from error
+            except Exception as error:
+                get_logger(type(self).__module__, self).exception(
+                    "Failed to load %s.%s for %s: %s",
+                    model_name, source, self.url, error,
+                )
+                recorded_error: BaseException
+                if isinstance(error, (LoaderContractError, LoaderConfigurationError)):
+                    recorded_error = error
+                else:
+                    recorded_error = MediaLoadError(
+                        model_name, source, self.url, error
+                    )
+
+                lock = object.__getattribute__(self, "_load_lock")
+                async with lock:
+                    object.__getattribute__(self, "_source_states")[source] = LoadState.FAILED
+                    object.__getattribute__(self, "_source_errors")[source] = recorded_error
+                    object.__getattribute__(self, "_source_tasks").pop(source, None)
+
+                if recorded_error is error:
+                    raise
+                raise recorded_error from error
 
     def _validate_loader_result(
         self, source: str, raw_result: Any
@@ -1077,21 +1078,22 @@ class Helper(Generic[MediaT]):
         constructor: Callable[..., MediaT],
         *,
         logger: logging.Logger | None = None,
-        log_name: str = "helper.iterator",
+        log_name: str = "base_api.helper",
         log_file: str | None = None,
-        log_level: int = logging.INFO,
+        log_level: int | None = None,
         http_ip: str | None = None,
         http_port: int | str | None = None,
     ) -> None:
         self.core = core # The Networking Backend
         self.constructor = constructor # The class that takes the data as input (dataclass) defined by each API
-        self.logger = logger or configure_app_logging(
-            log_name,
-            log_file=log_file,
-            level=log_level,
-            http_ip=http_ip,
-            http_port=http_port,
-        )
+        if log_file or http_ip:
+            configure_app_logging(log_name, log_file=log_file, level=log_level if log_level is not None else logging.INFO,
+                                  http_ip=http_ip, http_port=http_port)
+        self.logger = logger or get_logger(log_name, constructor)
+        if not isinstance(self.logger, ContextLogger):
+            self.logger = ContextLogger(self.logger, {})
+        if log_level is not None:
+            self.logger.setLevel(log_level)
 
     def iterator(
         self,
@@ -1456,81 +1458,82 @@ class Helper(Generic[MediaT]):
         error_factory: Callable[[Exception, int], ScrapeOperationError],
     ) -> _AttemptOutcome[OperationT]:
         """Run one bounded retry loop and convert its terminal disposition."""
-        for attempt in range(1, retry_policy.max_attempts + 1):
-            try:
-                value = await operation()
-                return _AttemptOutcome(value, None, None, attempt)
-            except asyncio.CancelledError:
-                raise
-            except Exception as error:
-                # Some callers yield or skip terminal failures instead of raising
-                # them. Log while the exception is actively handled so its real
-                # traceback, including the originating source line, is never lost.
-                self.logger.exception(
-                    "Exception while processing %s %s on attempt %s/%s",
-                    stage.value,
-                    url,
-                    attempt,
-                    retry_policy.max_attempts,
-                )
-                context = ScrapeErrorContext(
-                    stage=stage,
-                    url=url,
-                    error=error,
-                    attempt=attempt,
-                    max_attempts=retry_policy.max_attempts,
-                    page_index=page_index,
-                    item_index=item_index,
-                )
-                action = await self._error_action(
-                    context,
-                    retry_policy=retry_policy,
-                    error_mode=error_mode,
-                    error_handler=error_handler,
-                )
-
-                # BaseCore.request already treats 404 as non-retryable. Keep the
-                # page-level retry loop from undoing that decision, including when
-                # the HTTP error has been wrapped by another library exception.
-                if (
-                    stage is ScrapeStage.PAGE
-                    and action is ErrorAction.RETRY
-                    and _contains_http_status(error, 404)
-                ):
-                    action = ErrorAction(error_mode.value)
-
-                if action is ErrorAction.RETRY and attempt < retry_policy.max_attempts:
-                    delay = retry_policy.delay_after(attempt)
-                    self.logger.warning(
-                        "Retrying %s %s after attempt %s/%s in %.3fs: %s",
+        with log_context(self.constructor, url):
+            for attempt in range(1, retry_policy.max_attempts + 1):
+                try:
+                    value = await operation()
+                    return _AttemptOutcome(value, None, None, attempt)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    # Some callers yield or skip terminal failures instead of raising
+                    # them. Log while the exception is actively handled so its real
+                    # traceback, including the originating source line, is never lost.
+                    self.logger.exception(
+                        "Exception while processing %s %s on attempt %s/%s",
                         stage.value,
                         url,
                         attempt,
                         retry_policy.max_attempts,
-                        delay,
-                        error,
-                        exc_info=True,
                     )
-                    if delay:
-                        await asyncio.sleep(delay)
-                    continue
+                    context = ScrapeErrorContext(
+                        stage=stage,
+                        url=url,
+                        error=error,
+                        attempt=attempt,
+                        max_attempts=retry_policy.max_attempts,
+                        page_index=page_index,
+                        item_index=item_index,
+                    )
+                    action = await self._error_action(
+                        context,
+                        retry_policy=retry_policy,
+                        error_mode=error_mode,
+                        error_handler=error_handler,
+                    )
 
-                # A handler cannot create an unbounded retry loop. RETRY on the
-                # final permitted attempt falls back to the configured mode.
-                if action is ErrorAction.RETRY:
-                    action = ErrorAction(error_mode.value)
+                    # BaseCore.request already treats 404 as non-retryable. Keep the
+                    # page-level retry loop from undoing that decision, including when
+                    # the HTTP error has been wrapped by another library exception.
+                    if (
+                        stage is ScrapeStage.PAGE
+                        and action is ErrorAction.RETRY
+                        and _contains_http_status(error, 404)
+                    ):
+                        action = ErrorAction(error_mode.value)
 
-                wrapped_error = error_factory(error, attempt)
-                # YIELD stores this exception for a later ScrapeResult.unwrap().
-                # Explicitly retain the cause so that raising it later renders the
-                # original traceback rather than only the unwrap() line.
-                wrapped_error.__cause__ = error
-                wrapped_error.__suppress_context__ = True
-                if action is ErrorAction.RAISE:
-                    raise wrapped_error from error
-                return _AttemptOutcome(None, wrapped_error, action, attempt)
+                    if action is ErrorAction.RETRY and attempt < retry_policy.max_attempts:
+                        delay = retry_policy.delay_after(attempt)
+                        self.logger.warning(
+                            "Retrying %s %s after attempt %s/%s in %.3fs: %s",
+                            stage.value,
+                            url,
+                            attempt,
+                            retry_policy.max_attempts,
+                            delay,
+                            error,
+                            exc_info=True,
+                        )
+                        if delay:
+                            await asyncio.sleep(delay)
+                        continue
 
-        raise RuntimeError("retry loop exhausted without returning an outcome")
+                    # A handler cannot create an unbounded retry loop. RETRY on the
+                    # final permitted attempt falls back to the configured mode.
+                    if action is ErrorAction.RETRY:
+                        action = ErrorAction(error_mode.value)
+
+                    wrapped_error = error_factory(error, attempt)
+                    # YIELD stores this exception for a later ScrapeResult.unwrap().
+                    # Explicitly retain the cause so that raising it later renders the
+                    # original traceback rather than only the unwrap() line.
+                    wrapped_error.__cause__ = error
+                    wrapped_error.__suppress_context__ = True
+                    if action is ErrorAction.RAISE:
+                        raise wrapped_error from error
+                    return _AttemptOutcome(None, wrapped_error, action, attempt)
+
+            raise RuntimeError("retry loop exhausted without returning an outcome")
 
     async def _error_action(
         self,
@@ -1621,7 +1624,7 @@ class BaseCore:
         self.session: AsyncSession | None = None
         self.configuration = configuration
         self.cache = cache if cache is not None else Cache(self.configuration)
-        self.logger = configure_app_logging("BASE API - [BaseCore]", log_file=None, level=logging.ERROR)
+        self.logger = get_logger(__name__, self)
         self.default_headers = {
             "Accept-Language": self.configuration.locale,
         }
@@ -1643,8 +1646,9 @@ class BaseCore:
     def enable_logging(self, log_file: str | None = None, level: int = logging.DEBUG, log_ip:
     str | None = None, log_port: int | str | None = None) -> None:
         """Enables logging dynamically for this module."""
-        self.logger = configure_app_logging("BASE API - [BaseCore]", log_file=log_file, level=level, http_ip=log_ip,
-                                   http_port=log_port)
+        configure_app_logging(__name__, log_file=log_file, level=level, http_ip=log_ip,
+                              http_port=log_port)
+        self.logger = get_logger(__name__, self)
 
     def initialize_session(self) -> None:
         """Initialize the owned HTTP session once for the current lifecycle."""
@@ -1772,6 +1776,34 @@ class BaseCore:
         idempotent methods. Retrying a non-idempotent method requires an explicit
         opt-in because the server may already have applied the request.
         """
+        with log_context(url=url):
+            return await self._request(
+                url=url,
+                timeout=timeout,
+                cookies=cookies,
+                allow_redirects=allow_redirects,
+                data=data,
+                method=method,
+                headers=headers,
+                json_data=json_data,
+                params=params,
+                retry_non_idempotent=retry_non_idempotent,
+            )
+
+    async def _request(
+        self,
+        url: str,
+        *,
+        timeout: float | None = None,
+        cookies: Dict[str, str] | None = None,
+        allow_redirects: bool = True,
+        data: Dict[str, Any] | None = None,
+        method: str = "GET",
+        headers: Dict[str, str] | None = None,
+        json_data: Dict[str, Any] | None = None,
+        params: Dict[str, Any] | None = None,
+        retry_non_idempotent: bool = False,
+    ) -> Response:
         self.initialize_session()
         session = self.session
         assert session is not None
@@ -1824,7 +1856,7 @@ class BaseCore:
                         await self.enforce_delay()
                         req_headers = self._merged_headers(headers)
                         req_cookies = self._merged_cookies(cookies)
-                        
+
                         current_time = asyncio.get_running_loop().time()
                         latest_key = self.latest_key
                         if "KEY" not in session.cookies and latest_key is not None:
@@ -2388,9 +2420,11 @@ class BaseCore:
 
             content = await self.fetch_bytes(url, timeout=timeout)
             return url, content, True
+        except DownloadCancelled:
+            raise
         except Exception as e:
             # Log and mark failure; the caller will decide whether to retry or abort.
-            self.logger.exception("Segment download failed for %s: %s", url, e)
+            self.logger.exception("Segment download failed for %s: %s", url, e, extra={"url": url})
             return url, b"", False
 
     async def download(
@@ -2438,6 +2472,21 @@ class BaseCore:
         """
         Threaded HLS segment downloader with optional resume state and stop flag.
         """
+        with log_context(url=pre_resolved_m3u8):
+            return await self._threaded_download(
+                timeout=timeout,
+                max_workers=max_workers,
+                pre_resolved_m3u8=pre_resolved_m3u8,
+                configuration=configuration,
+            )
+
+    async def _threaded_download(
+        self: "BaseCore",
+        timeout: int,
+        max_workers: int,
+        pre_resolved_m3u8: str,
+        configuration: DownloadConfigHLS,
+    ) -> DownloadReport | bool:
         try:
             cleanup_on_stop = configuration.cleanup_on_stop
             keep_segment_dir = configuration.keep_segment_dir
@@ -2637,6 +2686,8 @@ class BaseCore:
                                     _, segment_data, is_success = await self.download_segment(url, timeout, stop_event)
                                     if is_success and segment_data:
                                         return idx, True, segment_data
+                                except DownloadCancelled:
+                                    raise
                                 except Exception as exception:
                                     self.logger.exception("Worker failed for segment %s (%s): %s", idx, url, exception)
 
@@ -2760,7 +2811,7 @@ class BaseCore:
             self.logger.info(
                 "Segment download finished: downloaded=%s/%s missing=%s cancelled=%s",
             downloaded_count, n, len(missing), cancelled)
-            if missing:
+            if missing and not cancelled:
                 sample = missing[:10]
                 self.logger.error(
                     "Missing segments for %s: count=%s sample=%s urls=%s", m3u8_url, len(missing), sample,
@@ -2812,7 +2863,7 @@ class BaseCore:
                         f"Returning cancelled report: downloaded={report.downloaded} missing={len(missing)}"
                     )
                     return report
-                return False
+                raise DownloadCancelled(f"Download cancelled for {m3u8_url}")
 
             if missing:
                 self.logger.error(
@@ -2839,7 +2890,8 @@ class BaseCore:
                         f"Returning failed report: downloaded={report.downloaded} missing={len(report.missing)}"
                     )
                     return report
-                return False
+                raise DownloadFailed(f"Download incomplete for {m3u8_url}: {len(missing)} segments missing",
+                                     url=m3u8_url)
 
             if segment_dir:
                 self.logger.info(
@@ -2889,7 +2941,7 @@ class BaseCore:
                             f"missing={len(report.missing)}"
                         )
                         return report
-                    return False
+                    raise DownloadFailed(f"Missing segment files for {m3u8_url}: {missing}", url=m3u8_url)
 
             if remux:
                 self.logger.info(f"Remuxing TS to MP4: input={tmp_path} output={path}")
@@ -2929,12 +2981,17 @@ class BaseCore:
                 )
                 return report
             return True
+        except DownloadCancelled:
+            raise
         except Exception as e:
             self.logger.exception(
                 "Download failed for %s (output=%s): %s",
                 pre_resolved_m3u8, configuration.path, e,
             )
-            return False
+            if isinstance(e, DownloadFailed):
+                raise
+            raise DownloadFailed(f"HLS download failed for {pre_resolved_m3u8}: {e}",
+                                 url=pre_resolved_m3u8) from e
 
     def _convert_ts_to_mp4(self, input_path: str, output_path: str,
                            callback: Callable[[int, int], None] | None = None, ios_support: bool = False) -> None:
@@ -3108,6 +3165,17 @@ class BaseCore:
             self.logger.info("Remux skipped; file moved. elapsed=%s.2f", elapsed)
 
     async def legacy_download(self, url: str, configuration: DownloadConfigRAW) -> bool:
+        """Download a raw stream, preserving the URL and original failure traceback."""
+        with log_context(url=url):
+            try:
+                return await self._legacy_download(url, configuration)
+            except DownloadCancelled:
+                raise
+            except Exception as error:
+                self.logger.exception("Raw download failed for %s: %s", url, error)
+                raise DownloadFailed(f"Raw download failed for {url}: {error}", url=url) from error
+
+    async def _legacy_download(self, url: str, configuration: DownloadConfigRAW) -> bool:
         """
         Download a file using streaming with stall tolerance and resume.
         Supports fast concurrent range downloading if the server supports it and allow_multipart is True.

@@ -3,6 +3,7 @@ import re
 import math
 import json
 import unicodedata
+from urllib.parse import urljoin
 from collections.abc import Iterable
 from dataclasses import asdict
 from pathlib import PurePath
@@ -781,3 +782,68 @@ def build_m3u8_master(media_definitions: list[dict[str, Any]] | str | None) -> s
         m3u8_lines.append(url)
 
     return "\n".join(m3u8_lines) + "\n"
+
+
+def extract_video_grid(parser, base_url: str, logger) -> list[dict]:
+    """
+    Extracts comprehensive video attributes from HTML search results.
+    Returns a list of dictionaries.
+    """
+    results = []
+
+    # 1. Locate the main container gracefully
+    stuff = parser.css_first("div.searchResults.full-row-thumbs.js_video_row.tm_search_result_videos")
+    if not stuff:
+        stuff = parser.css_first("div.full-row-thumbs")
+    if not stuff:
+        stuff = parser.css_first("ul.videos_grid")
+
+    if not stuff:
+        # Helper logs this extraction failure with the page URL and traceback.
+        raise ValueError("Main video container not found")
+
+    # 2. Locate the video boxes
+    videos = stuff.css("article.video-box.pc.js_video-box.js-pop")
+    if not videos:
+        videos = stuff.css("a.video_link.tm_video_link.js_wrap_trigger_login.js_mpop.js-pop")
+
+    if not videos:
+        logger.warning("Container found, but no video elements were matched inside.")
+        return results
+    # 3. Iterate and Extract
+    for index, video in enumerate(videos, start=1):
+        # Base extraction using data-attributes (most reliable) and falling back to text/children
+        video_data = {
+            "video_id": get_attr_safe(video, None, "data-video-id"),
+            "title": get_attr_safe(video, None, "aria-label") or get_text_safe(video, ".video-title-text span"),
+            "video_url": get_attr_safe(video, "a", "href"),
+            "duration": get_text_safe(video, ".video-duration span"),
+            "author_name": get_attr_safe(video, None, "data-uploader-name") or get_text_safe(video,
+                                                                                               ".author-title-text"),
+            "uploader_url": get_attr_safe(video, ".author-title-text", "href"),
+            "thumbnail": get_attr_safe(video, "img.thumb-image", "data-src") or get_attr_safe(video,
+                                                                                                  "img.thumb-image",
+                                                                                                  "src"),
+            "preview_video_url": get_attr_safe(video, "img.thumb-image", "data-mediabook"),
+        }
+
+        # Extract the list of performers separately
+        performer_nodes = video.css(".channel-performer")
+        performers = [p.text(strip=True) for p in performer_nodes] if performer_nodes else []
+        video_data["performers"] = performers if performers else None
+        # Clean up and validate specific fields
+
+        if video_data["video_url"]:
+            video_data["url"] = urljoin(base_url, video_data["video_url"])
+
+        # 4. Handle Edge Cases & Logging
+        missing_attrs = [key for key, value in video_data.items() if value is None]
+        video_data.pop("video_url")
+        if missing_attrs:
+            # Create a useful identifier for the log (use video_id if it exists, else the loop index)
+            identifier = video_data.get('video_id') or f"Index #{index}"
+            logger.warning("Video %s (%s) is missing attributes: %s", identifier, video_data.get("url"), ', '.join(missing_attrs))
+        if video_data.get("url"):
+            results.append(video_data)
+
+    return results

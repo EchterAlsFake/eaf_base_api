@@ -1,8 +1,48 @@
 import os
 import sys
 import logging
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Union
 from curl_cffi.requests import post
+
+
+# ContextVars keep concurrent media operations separate, including to_thread work.
+_operation = ContextVar("eaf_log_operation", default=(None, None))
+
+
+def class_name(owner: object) -> str:
+    cls = owner if isinstance(owner, type) else type(owner)
+    return f"{cls.__module__}.{cls.__qualname__}"
+
+
+@contextmanager
+def log_context(owner: object | None = None, url: str | None = None):
+    current_class, current_url = _operation.get()
+    token = _operation.set((class_name(owner) if owner is not None else current_class,
+                            url if url is not None else current_url))
+    try:
+        yield
+    finally:
+        _operation.reset(token)
+
+
+class ContextLogger(logging.LoggerAdapter):
+    """Include the API class and URL even with an application's own formatter."""
+
+    def process(self, msg, kwargs):
+        active_class, active_url = _operation.get()
+        context = {"class_name": active_class or self.extra.get("class_name", "-"),
+                   "url": active_url or "-"}
+        context.update(kwargs.get("extra") or {})
+        kwargs["extra"] = context
+        return f"[class={context['class_name']} url={context['url']}] {msg}", kwargs
+
+
+def get_logger(name: str, owner: object | None = None) -> ContextLogger:
+    """Get a library logger without changing handlers or application log levels."""
+    return ContextLogger(logging.getLogger(name),
+                         {"class_name": class_name(owner) if owner is not None else "-"})
 
 def is_android() -> bool:
     return "ANDROID_ROOT" in os.environ and "ANDROID_DATA" in os.environ

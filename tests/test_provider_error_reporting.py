@@ -58,7 +58,7 @@ async def test_request_logs_url_traceback_and_chains_shared_error(provider, capl
     assert record.exc_info[1] is original
     assert "Traceback (most recent call last)" in caplog.text
     assert "specific request failure" in caplog.text
-    assert "get_html_content" in caplog.text
+    assert "fetch_content" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -83,6 +83,129 @@ async def test_not_found_remains_detectable(provider, caplog):
     assert caught.value.__cause__ is original
     assert URL in caplog.text
     assert any(r.exc_info and r.exc_info[1] is original for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_request_identifies_the_provider_class(provider, caplog):
+    original = errors.NetworkRequestError("connection reset")
+    core = SimpleNamespace(fetch_text=AsyncMock(side_effect=original))
+    video = provider.Video(core=core, url=URL)
+    with caplog.at_level(logging.ERROR), pytest.raises(errors.NetworkError) as caught:
+        await provider.get_html_content(core, URL, owner=video)
+    name = f"{provider.__name__}.Video"
+    assert caught.value.class_name == name
+    assert caught.value.api == provider.__package__
+    assert caught.value.url == URL
+    record = next(r for r in caplog.records if r.name == provider.logger.name)
+    assert record.class_name == name
+    assert record.url == URL
+    assert name in record.getMessage()
+
+
+@pytest.mark.asyncio
+async def test_download_identifies_real_provider_class(provider, caplog, monkeypatch):
+    original = ValueError("broken download metadata")
+    monkeypatch.setattr(provider.Video, "load_fields", AsyncMock(side_effect=original))
+    video = provider.Video(core=SimpleNamespace(), url=URL)
+    with caplog.at_level(logging.ERROR), pytest.raises(errors.DownloadFailed) as caught:
+        if provider.__package__ == "eporner_api":
+            await video.download(DownloadConfigRAW(quality="best"), mode="mp4")
+        else:
+            await video.download(DownloadConfigHLS(quality="best"))
+    name = f"{provider.__name__}.Video"
+    assert caught.value.class_name == name
+    assert caught.value.api == provider.__package__
+    assert caught.value.url == URL
+    assert caught.value.__cause__ is original
+    assert any(r.class_name == name and r.url == URL for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_false_download_result_is_not_reported_as_success(provider, caplog):
+    core = SimpleNamespace(download=AsyncMock(return_value=False), legacy_download=AsyncMock(return_value=False))
+    with caplog.at_level(logging.ERROR), pytest.raises(errors.DownloadFailed):
+        await download(provider, core)
+    assert URL in caplog.text
+    assert "Traceback (most recent call last)" in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["hqporner"], indirect=True)
+async def test_hqporner_mobile_fallback_still_works(provider):
+    url = "https://hqporner.com/video/123"
+    core = SimpleNamespace(fetch_text=AsyncMock(side_effect=[
+        errors.HTTPStatusError("missing", 404, url), "mobile page",
+    ]))
+    assert await provider.get_html_content(core, url) == (True, "mobile page")
+    assert core.fetch_text.await_args_list[1].args == ("https://m.hqporner.com/video/123",)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["spankbang"], indirect=True)
+async def test_spankbang_raw_download_without_hls_config(provider):
+    core = SimpleNamespace(legacy_download=AsyncMock(return_value=True))
+    media = SimpleNamespace(core=core, url=URL, title="Example", load_fields=AsyncMock(),
+                            m3u8_base_url=None, direct_download_urls=["https://cdn.test/video.mp4"],
+                            video_qualities=["720p"])
+    config = DownloadConfigRAW(path="out", quality="best")
+    assert await provider.Video.download(media, configuration_raw=config, use_hls=False)
+    assert config.path == "out"
+    assert core.legacy_download.await_args.kwargs["configuration"].path == "out/Example.mp4"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["xfreehd"], indirect=True)
+async def test_xfreehd_download_does_not_mutate_callers_configuration(provider):
+    core = SimpleNamespace(legacy_download=AsyncMock(return_value=True))
+    media = SimpleNamespace(core=core, url=URL, title="Example", load_fields=AsyncMock(),
+                            cdn_urls=["https://cdn.test/video.mp4"])
+    config = DownloadConfigRAW(path="out", quality="best")
+    await provider.Video.download(media, config)
+    await provider.Video.download(media, config)
+    assert config.path == "out"
+    assert all(call.kwargs["configuration"].path == "out/Example.mp4"
+               for call in core.legacy_download.await_args_list)
+
+
+@pytest.mark.parametrize("provider", ["thumbzilla", "tube8"], indirect=True)
+def test_shared_grid_extractor_preserves_video_fields(provider):
+    consts = importlib.import_module(f"{provider.__package__}.modules.consts")
+    html = '''<div class="full-row-thumbs">
+      <article class="video-box pc js_video-box js-pop" data-video-id="123" aria-label="Example">
+        <a href="/video/123">Watch</a><div class="video-duration"><span>12:34</span></div>
+        <img class="thumb-image" data-src="https://cdn.test/thumb.jpg">
+      </article></div>'''
+    [video] = consts.extractor_search(html)
+    assert video["url"] == f"https://www.{provider.__package__.removesuffix('_api')}.com/video/123"
+    assert video["video_id"] == "123"
+    assert video["title"] == "Example"
+    assert video["duration"] == "12:34"
+    assert video["thumbnail"] == "https://cdn.test/thumb.jpg"
+    assert "video_url" not in video
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["eporner"], indirect=True)
+async def test_json_decode_failure_has_request_context(provider, caplog):
+    core = SimpleNamespace(fetch_text=AsyncMock(return_value="broken JSON"))
+    video = provider.Video(core=core, url=URL)
+    with caplog.at_level(logging.ERROR), pytest.raises(ValueError):
+        await provider.get_html_content(core, URL, get_json=True, owner=video)
+    assert "JSONDecodeError" in caplog.text
+    assert any(r.url == URL and r.class_name == "eporner_api.api.Video" for r in caplog.records)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["pornhub"], indirect=True)
+async def test_login_rejection_logs_client_and_endpoint(provider, caplog):
+    client = object.__new__(provider.Client)
+    client.logged = False
+    client.credentials = {"email": None, "password": None}
+    with caplog.at_level(logging.ERROR), pytest.raises(errors.LoginFailed):
+        await client.login()
+    assert "LoginFailed: Email and password are required" in caplog.text
+    assert any(r.class_name == "pornhub_api.api.Client" and r.url.endswith("front/authenticate")
+               for r in caplog.records)
 
 
 async def download(provider, core, *, load_error=None, use_hls=True):
