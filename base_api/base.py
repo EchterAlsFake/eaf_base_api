@@ -1624,6 +1624,7 @@ class BaseCore:
         self.latest_key: str | None = None
         self.latest_key_time: float = 0.0
         self._challenge_generation = 0
+        self._challenge_ready_at = 0.0
         self.last_request_time: float | None = None
         self.total_requests: int = 0  # Tracks how many requests have been made
         self.session: AsyncSession | None = None
@@ -1863,6 +1864,13 @@ class BaseCore:
                         await self.enforce_delay()
                         req_headers = self._merged_headers(headers)
                         async with self.lock:
+                            # Pornhub requires a cooldown after computing KEY.
+                            # All requests share its deadline; late responses do
+                            # not add another sleep. Keeping the deadline also
+                            # preserves the cooldown if its waiter is cancelled.
+                            loop = asyncio.get_running_loop()
+                            while (remaining := self._challenge_ready_at - loop.time()) > 0:
+                                await asyncio.sleep(remaining)
                             current_time = asyncio.get_running_loop().time()
                             latest_key = self.latest_key
                             if "KEY" not in session.cookies and latest_key is not None:
@@ -1931,6 +1939,7 @@ class BaseCore:
 
                                             self.latest_key = cookie_value
                                             self.latest_key_time = asyncio.get_running_loop().time()
+                                            self._challenge_ready_at = self.latest_key_time + 1.5
                                             session.cookies.set("KEY", cookie_value, domain=".pornhub.com", path="/")
                                             self._challenge_generation += 1
                                             self.logger.info("RESOLVED CHALLENGE! Injected cookie: %s", cookie_value)

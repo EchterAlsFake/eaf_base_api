@@ -42,13 +42,13 @@ def core_with_session(request):
 
 @pytest.fixture
 def recorded_sleeps(monkeypatch):
-    """Record retry delays without making a regression take a minute to fail."""
+    """Exercise real challenge cooldowns; skip long network backoff waits."""
     delays = []
     original_sleep = asyncio.sleep
 
     async def sleep(delay):
         delays.append(float(delay))
-        await original_sleep(0)
+        await original_sleep(delay if 0 < delay <= 1.5 else 0)
 
     monkeypatch.setattr(asyncio, "sleep", sleep)
     return delays
@@ -75,6 +75,7 @@ async def test_concurrent_late_challenges_share_one_solution(monkeypatch, record
                 # These old responses arrive AFTER the first solve and replay.
                 await first_retried.wait()
             return challenge(123 + index)
+        assert asyncio.get_running_loop().time() >= core.latest_key_time + 1.5
         assert cookies["KEY"] == "3*5:7:123:1"
         if index == 0:
             first_retried.set()
@@ -94,7 +95,7 @@ async def test_concurrent_late_challenges_share_one_solution(monkeypatch, record
     assert list(calls.values()) == [2] * count
     factor.assert_called_once_with(15)
     assert core.session.cookies.get_dict()["KEY"] == "3*5:7:123:1"
-    assert not any(recorded_sleeps)
+    assert sum(recorded_sleeps) == pytest.approx(1.5, abs=0.1)
 
 
 @pytest.mark.asyncio
@@ -144,7 +145,7 @@ async def test_fresh_challenge_can_be_solved_again(monkeypatch, recorded_sleeps)
 
     assert factor.call_count == 2
     assert request.call_args.kwargs["cookies"]["KEY"] == "3*5:7:456:1"
-    assert not any(recorded_sleeps)
+    assert sum(recorded_sleeps) == pytest.approx(3.0, abs=0.1)
 
 
 @pytest.mark.asyncio
@@ -158,7 +159,7 @@ async def test_persistent_challenge_exhausts_retry_budget(recorded_sleeps):
 
     assert request.await_count == 3
     assert not core.lock.locked()
-    assert not any(recorded_sleeps)
+    assert sum(recorded_sleeps) == pytest.approx(3.0, abs=0.1)
 
 
 @pytest.mark.asyncio
@@ -203,3 +204,40 @@ async def test_malformed_challenge_releases_lock(recorded_sleeps):
     assert request.await_count == 1
     assert not core.lock.locked()
     assert not any(recorded_sleeps)
+
+
+@pytest.mark.asyncio
+async def test_new_requests_observe_cooldown_after_original_waiter_is_cancelled(monkeypatch):
+    cooling_down = asyncio.Event()
+    original_sleep = asyncio.sleep
+
+    async def sleep(delay):
+        if delay > 0:
+            cooling_down.set()
+        await original_sleep(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", sleep)
+    calls = 0
+
+    async def request(**kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return challenge()
+        assert asyncio.get_running_loop().time() >= core.latest_key_time + 1.5
+        return response()
+
+    core = core_with_session(request)
+    first = asyncio.create_task(core.request("https://www.pornhub.com/video/0"))
+    try:
+        await asyncio.wait_for(cooling_down.wait(), timeout=5)
+    finally:
+        first.cancel()
+        await asyncio.gather(first, return_exceptions=True)
+
+    results = await asyncio.wait_for(asyncio.gather(*(
+        core.request(f"https://www.pornhub.com/video/{index}")
+        for index in range(1, 6)
+    )), timeout=3)
+    assert len(results) == 5
+    assert calls == 6
