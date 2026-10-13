@@ -65,6 +65,10 @@ except (ModuleNotFoundError, ImportError):
 REGEX_CHALLENGE = re.compile(r'var p=(\d+); var s=(\d+);.*?(\d+):1;', re.DOTALL)
 
 
+class _ChallengeRetry(NetworkRequestError):
+    """Replay with an updated challenge cookie without network backoff."""
+
+
 class CachePolicy(StrEnum):
     """Control whether a text request reads from or writes to the cache."""
 
@@ -1619,6 +1623,7 @@ class BaseCore:
         self._inflight_text_requests: dict[RequestCacheKey, asyncio.Future[str]] = {}
         self.latest_key: str | None = None
         self.latest_key_time: float = 0.0
+        self._challenge_generation = 0
         self.last_request_time: float | None = None
         self.total_requests: int = 0  # Tracks how many requests have been made
         self.session: AsyncSession | None = None
@@ -1838,6 +1843,8 @@ class BaseCore:
 
         def retry_wait(retry_state: Any) -> float:
             error = retry_state.outcome.exception() if retry_state.outcome else None
+            if isinstance(error, _ChallengeRetry):
+                return 0.0
             if isinstance(error, RateLimitError) and error.retry_after is not None:
                 return max(0.0, error.retry_after)
             return cast(float, exponential_wait(retry_state))
@@ -1855,13 +1862,16 @@ class BaseCore:
                     try:
                         await self.enforce_delay()
                         req_headers = self._merged_headers(headers)
-                        req_cookies = self._merged_cookies(cookies)
-
-                        current_time = asyncio.get_running_loop().time()
-                        latest_key = self.latest_key
-                        if "KEY" not in session.cookies and latest_key is not None:
-                            if current_time - self.latest_key_time < 10:
-                                session.cookies.set("KEY", latest_key, domain=".pornhub.com", path="/")
+                        async with self.lock:
+                            current_time = asyncio.get_running_loop().time()
+                            latest_key = self.latest_key
+                            if "KEY" not in session.cookies and latest_key is not None:
+                                if current_time - self.latest_key_time < 10:
+                                    session.cookies.set("KEY", latest_key, domain=".pornhub.com", path="/")
+                            # Snapshot before sending: a late response may belong
+                            # to the cookie generation preceding another solve.
+                            challenge_generation = self._challenge_generation
+                            req_cookies = self._merged_cookies(cookies)
 
                         self.total_requests += 1
                         response = await cast(Any, session).request(
@@ -1886,15 +1896,13 @@ class BaseCore:
                             resp_text = cast(bytes, response.content).decode(enc, errors="replace")
 
                             if 'onload="go()"' in resp_text:
-                                local_latest = getattr(self, "latest_key", None)
                                 async with self.lock:
-                                    if getattr(self, "latest_key", None) != local_latest:
+                                    if self._challenge_generation != challenge_generation:
                                         self.logger.info("Another task already resolved the challenge! Retrying request with the new cookie.")
                                         if self.latest_key:
                                             session.cookies.set("KEY", self.latest_key, domain=".pornhub.com", path="/")
 
-                                        await asyncio.sleep(1.5)
-                                        raise NetworkRequestError("Retrying request with the new cookie.")
+                                        raise _ChallengeRetry("Retrying request with the new cookie.")
 
                                     self.logger.info("Challenge page detected! Solving...")
                                     get_challenge = re.compile(r'go\(\).*?{(.*?)n=l.*?KEY.*?s\+":(\d+):', re.DOTALL)
@@ -1924,6 +1932,7 @@ class BaseCore:
                                             self.latest_key = cookie_value
                                             self.latest_key_time = asyncio.get_running_loop().time()
                                             session.cookies.set("KEY", cookie_value, domain=".pornhub.com", path="/")
+                                            self._challenge_generation += 1
                                             self.logger.info("RESOLVED CHALLENGE! Injected cookie: %s", cookie_value)
 
                                             try:
@@ -1931,8 +1940,7 @@ class BaseCore:
                                             except (KeyError, Exception):
                                                 pass
 
-                                            await asyncio.sleep(1.5)
-                                            raise NetworkRequestError("Retrying request after solving challenge.")
+                                            raise _ChallengeRetry("Retrying request after solving challenge.")
                                         except (NetworkRequestError, SecurityAbort):
                                             raise
                                         except Exception as challenge_error:
@@ -1940,7 +1948,6 @@ class BaseCore:
 
                                     else:
                                         self.logger.error("Detected challenge page, but the regex failed to extract data.")
-                                        await asyncio.sleep(1.5)
                                         raise ChallengeRegexError("Detected Challenge, but regex couldn't extract, report this!")
 
 
@@ -1979,6 +1986,10 @@ class BaseCore:
                             f"HTTP {status} for {url}", status_code=status, url=url
                         )
 
+                    except _ChallengeRetry:
+                        # Cookie refresh is expected control flow, not a network
+                        # failure. The retry controller still bounds replays.
+                        raise
                     except RequestsError as e:
                         err_str = str(e).lower()
                         self.logger.error("Request error for URL %s: %s", url, e, exc_info=True)
