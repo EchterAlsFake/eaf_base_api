@@ -36,6 +36,7 @@ class DownloadReport:
     segment_state_path: Path | str | None
     start_segment: int
     quality: str | int
+    metadata_written: bool = False
 
     def __getitem__(self, key: str) -> Any:
         return getattr(self, key)

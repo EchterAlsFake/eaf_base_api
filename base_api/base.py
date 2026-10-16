@@ -5,6 +5,8 @@ import time
 import hashlib
 import string
 import shutil
+import subprocess
+from pathlib import Path
 import asyncio
 import inspect
 import logging
@@ -39,27 +41,19 @@ from base_api.modules.static_functions import (
     choose_variant, collect_variants, get_segment_index_width
 )
 from base_api.modules.config import config, RuntimeConfig, DownloadConfigHLS, DownloadConfigRAW, IteratorConfig, make_iterator_config
+from base_api.modules.ffmpeg import find_ffmpeg, remux_ts_to_mp4, write_metadata_tags
 from base_api.modules.progress_bars import Callback
 from base_api.modules.logger import configure_app_logging, get_logger, log_context, ContextLogger
 
 # 2. Handle optional dependencies cleanly
 try:
     import m3u8
-except ImportError:
-    m3u8 = None
-
-# 3. Handle specific runtime imports
-if TYPE_CHECKING:
-    from av.audio.codeccontext import AudioCodecContext
-    import m3u8
-
-# The following imports are optional, because they depend on per API and I want to be as memory efficient as possible
-
-try:
-    import m3u8
     # Needed for all videos that use HLS streaming. Some do not and use mp4 containers / files instead
 except (ModuleNotFoundError, ImportError):
     m3u8 = None  # type: ignore
+
+if TYPE_CHECKING:
+    import m3u8
 
 
 REGEX_CHALLENGE = re.compile(r'var p=(\d+); var s=(\d+);.*?(\d+):1;', re.DOTALL)
@@ -105,46 +99,6 @@ def _contains_http_status(error: BaseException, status_code: int) -> bool:
             )
     return False
 
-
-def _normalize_packet_timestamps(
-    packet: Any,
-    offsets: dict[int, int],
-    last_dts: dict[int, int],
-    last_durations: dict[int, int],
-) -> int:
-    """Keep remuxed packet timestamps continuous across HLS discontinuities."""
-    if packet.dts is None:
-        return 0
-
-    stream_index = packet.stream.index
-    raw_dts = packet.dts
-    offset = offsets.get(stream_index, 0)
-    normalized_dts = raw_dts + offset
-    previous_dts = last_dts.get(stream_index)
-    correction = 0
-
-    if previous_dts is not None:
-        step = max(1, last_durations.get(stream_index, packet.duration or 1))
-        expected_dts = previous_dts + step
-        try:
-            ten_seconds = max(1, int(10 / float(packet.time_base)))
-        except (TypeError, ValueError, ZeroDivisionError):
-            ten_seconds = step * 240
-
-        discontinuity_threshold = max(step * 10, ten_seconds)
-        delta = normalized_dts - expected_dts
-        if normalized_dts <= previous_dts or abs(delta) > discontinuity_threshold:
-            correction = -delta
-            offset += correction
-            offsets[stream_index] = offset
-            normalized_dts = raw_dts + offset
-
-    packet.dts = normalized_dts
-    if packet.pts is not None:
-        packet.pts += offset
-    last_dts[stream_index] = normalized_dts
-    last_durations[stream_index] = max(1, packet.duration or 1)
-    return correction
 
 
 @dataclass(frozen=True, slots=True)
@@ -2967,14 +2921,25 @@ class BaseCore:
                 self.logger.info(f"Remuxing TS to MP4: input={tmp_path} output={path}")
                 # Offload heavy CPU/IO bound task
                 try:
-                    await asyncio.to_thread(self._convert_ts_to_mp4, tmp_path, path, callback_remux, ios_support)
+                    report.metadata_written = bool(
+                        await asyncio.to_thread(
+                            self._convert_ts_to_mp4,
+                            tmp_path,
+                            path,
+                            callback_remux,
+                            ios_support,
+                            configuration.metadata,
+                            configuration.thumbnail,
+                        )
+                    )
+                    configuration.metadata_written = report.metadata_written
                 except Exception:
                     self._safe_remove(path)
                     raise
                 # This is important, because not all players can play MPEG-TS AND I want to write
                 # metadata to the files, and this doesn't work without a container.
                 self._safe_remove(tmp_path)
-                self.logger.info(f"Remux completed: output={path}")
+                self.logger.info(f"Remux completed: output={path} metadata_written={report.metadata_written}")
 
             else:
                 self.logger.debug("Remux disabled; moving temporary file into place.")
@@ -3013,8 +2978,16 @@ class BaseCore:
             raise DownloadFailed(f"HLS download failed for {pre_resolved_m3u8}: {e}",
                                  url=pre_resolved_m3u8) from e
 
-    def _convert_ts_to_mp4(self, input_path: str, output_path: str,
-                           callback: Callable[[int, int], None] | None = None, ios_support: bool = False) -> None:
+    def _convert_ts_to_mp4(
+        self,
+        input_path: str,
+        output_path: str,
+        callback: Callable[[int, int], None] | None = None,
+        ios_support: bool = False,
+        metadata: Any = None,
+        thumbnail: Any = None,
+    ) -> bool:
+        del ios_support  # Kept for signature compatibility; FFmpeg copies AAC/H.264 with +faststart
         start_ts = time.perf_counter()
         self.logger.info("Remux start: input=%s output=%s", input_path, output_path)
 
@@ -3022,167 +2995,59 @@ class BaseCore:
             input_size = os.path.getsize(input_path)
             self.logger.debug("Remux input size: %s bytes", input_size)
         except Exception as e:
+            input_size = 0
             self.logger.debug("Remux input size unavailable for %s: %s", input_path, e, exc_info=True)
 
-        try:
-            from av import open as av_open  # type: ignore[import-not-found]
-            from av.audio.resampler import AudioResampler  # type: ignore[import-not-found]
-            import av.audio.frame  # Used for runtime isinstance check
-        except (ModuleNotFoundError, ImportError) as e:
-            self.logger.error("PyAV import failed for remux: %s", e, exc_info=True)
-            raise ModuleNotFoundError(
-                f"PyAV is required for remuxing. Install with pip install av. Not supported on Termux! {e}") from e
-
-        self.logger.debug("Opening input for remux: %s", input_path)
-        input_ = av_open(input_path)
-        fmt_name = (input_.format.name or "").lower()
-        self.logger.info("Input format detected: %s", fmt_name or '<unknown>')
-
-        if fmt_name == "mpegts":
-            # Fix 1: Suppress the stub mismatch for av.open
-            output = av_open(output_path, mode="w", format="mp4",
-                             options={"movflags": "faststart"})  # type: ignore[arg-type]
-
-            # --- VIDEO ---
-            in_video = input_.streams.video[0]
-            out_video = output.add_stream_from_template(template=in_video)
-            self.logger.debug(
-                "Video stream: codec=%s bit_rate=%s",
-                getattr(in_video.codec_context, 'name', None), getattr(in_video.codec_context, 'bit_rate', None)
+        ffmpeg_bin = find_ffmpeg(getattr(self.configuration, "ffmpeg_path", None))
+        if not ffmpeg_bin:
+            raise FileNotFoundError(
+                "FFmpeg executable not found for remuxing. Install FFmpeg on PATH, set "
+                "PORN_FETCH_FFMPEG_BINARY, or bundle it in third_party/."
             )
 
-            # --- AUDIO ---
-            in_audio = next((s for s in input_.streams if s.type == "audio"), None)
-            out_audio = None
-            transcode_audio = False
-            resampler = None
+        self.logger.info("Using FFmpeg binary for TS to MP4 remux: %s", ffmpeg_bin)
+        metadata_written = False
+        has_meta = metadata is not None or thumbnail is not None
 
-            if in_audio:
-                # Fix 3: Explicitly narrow out None
-                assert in_audio is not None
-
-                # Fix 2: Cast context to AudioCodecContext so IDE knows about sample_rate and layout
-                audio_ctx = cast('AudioCodecContext', in_audio.codec_context)
-
-                copy_ok = {"aac"} if ios_support else {"aac", "alac", "mp3"}
-                codec_name = (audio_ctx.name or "").lower()
-                sample_rate = audio_ctx.sample_rate or 0
-                layout_name = audio_ctx.layout.name if getattr(audio_ctx, "layout", None) else "unknown"
-
-                self.logger.debug(
-                    "Audio stream: codec=%s sample_rate=%s layout=%s", codec_name, sample_rate, layout_name
-                )
-
-                if codec_name in copy_ok:
-                    out_audio = output.add_stream_from_template(template=in_audio)
-                    self.logger.info("Audio codec MP4-compatible; remuxing without transcoding.")
-                else:
-                    transcode_audio = True
-                    sample_rate = audio_ctx.sample_rate or 48000
-                    layout = audio_ctx.layout.name if getattr(audio_ctx, "layout", None) else "stereo"
-
-                    out_audio = output.add_stream("aac", rate=sample_rate)
-                    self.logger.info("Transcoding audio to AAC: sample_rate=%s layout=%s"), sample_rate, layout
-
-                    try:
-                        out_audio.layout = layout
-                    except Exception as exc:
-                        self.logger.warning("Failed to set audio layout while remuxing %s to %s: %s", input_path, output_path, exc, exc_info=True)
-                        pass
-
-                    resampler = AudioResampler(format="fltp", layout=layout, rate=sample_rate)
-            else:
-                self.logger.info("No audio stream detected; remuxing video only.")
-
-            # --- DEMUX ---
-            demux_streams = [in_video] + ([in_audio] if in_audio else [])
-            packets = input_.demux(demux_streams)
-
+        if has_meta:
             try:
-                total = os.path.getsize(input_path)
+                remux_ts_to_mp4(
+                    input_path,
+                    output_path,
+                    ffmpeg_bin=ffmpeg_bin,
+                    metadata=metadata,
+                    thumbnail=thumbnail,
+                )
+                metadata_written = True
             except Exception as exc:
-                self.logger.warning("Failed to read input size for remux progress: %s: %s", input_path, exc, exc_info=True)
-                total = 100
-
-            self.logger.info("Demuxing packets: total_bytes=%s", total)
-            progress_step = max(1, total // 10) if total else 0
-            next_progress_log = progress_step if progress_step else 0
-            current_progress = 0
-            timestamp_offsets: dict[int, int] = {}
-            last_dts: dict[int, int] = {}
-            last_durations: dict[int, int] = {}
-
-            for idx, packet in enumerate(packets):
-                pkt_size = getattr(packet, "size", 0) or 0
-                current_progress += pkt_size
-
-                if packet.dts is None:
-                    if callback:
-                        callback(current_progress, total)
-                    continue
-
-                timestamp_correction = _normalize_packet_timestamps(
-                    packet,
-                    timestamp_offsets,
-                    last_dts,
-                    last_durations,
+                self.logger.warning(
+                    "Single-pass remux with metadata failed (%s); falling back to plain remux.",
+                    exc,
                 )
-                if timestamp_correction:
-                    self.logger.info(
-                        "Normalized HLS timestamp discontinuity: stream=%s correction=%s time_base=%s",
-                        packet.stream.index,
-                        timestamp_correction,
-                        packet.time_base,
-                    )
+                self._safe_remove(output_path)
 
-                if packet.stream == in_video:
-                    packet.stream = out_video
-                    output.mux(packet)
+        if not metadata_written:
+            remux_ts_to_mp4(
+                input_path,
+                output_path,
+                ffmpeg_bin=ffmpeg_bin,
+            )
 
-                elif in_audio and packet.stream == in_audio:
-                    if not transcode_audio:
-                        packet.stream = out_audio
-                        output.mux(packet)
-                    else:
-                        assert out_audio is not None
-                        for frame in packet.decode():
-                            # Fix 4: Ensure the frame is recognized as an AudioFrame
-                            if not isinstance(frame, av.audio.frame.AudioFrame):
-                                continue
-
-                            frames = resampler.resample(frame) if resampler else [frame]
-                            for f in frames:
-                                for enc_pkt in out_audio.encode(f):
-                                    output.mux(enc_pkt)
-
-                if callback:
-                    callback(current_progress, total)
-                if progress_step and current_progress >= next_progress_log:
-                    self.logger.debug("Remux progress: bytes=%s/%s", current_progress, total)
-                    next_progress_log += progress_step
-
-            if transcode_audio and out_audio:
-                self.logger.debug("Flushing AAC encoder.")
-                for enc_pkt in out_audio.encode(None):
-                    output.mux(enc_pkt)
-
-            input_.close()
-            output.close()
-            elapsed = time.perf_counter() - start_ts
-
+        if callback:
             try:
-                out_size = os.path.getsize(output_path)
-                self.logger.info("Remux complete: output=%s size=%s bytes elapsed=%s.2f", output_path, out_size,
-                                 elapsed)
-            except Exception as e:
-                self.logger.info("Remux complete: output=%s elapsed=%s.2fs (size unavailable: %s)", output_path,
-                                 elapsed, e, exc_info=True)
+                total = input_size or os.path.getsize(output_path)
+                callback(total, total)
+            except Exception:
+                pass
 
-        else:
-            self.logger.info("Stream seems to be already in MP4! Skipping remux...")
-            os.rename(input_path, output_path)
-            elapsed = time.perf_counter() - start_ts
-            self.logger.info("Remux skipped; file moved. elapsed=%s.2f", elapsed)
+        elapsed = time.perf_counter() - start_ts
+        self.logger.info(
+            "Remux complete: output=%s metadata_written=%s elapsed=%.2fs",
+            output_path,
+            metadata_written,
+            elapsed,
+        )
+        return metadata_written
 
     async def legacy_download(self, url: str, configuration: DownloadConfigRAW) -> bool:
         """Download a raw stream, preserving the URL and original failure traceback."""

@@ -40,6 +40,7 @@ class RuntimeConfig:
         self.videos_concurrency: int = 5
         self.pages_concurrency: int = 2
         self.interface: str | None = None # IP Address of the network interface you want to bind to
+        self.ffmpeg_path: str | None = None # Optional explicit path to an FFmpeg executable
         self.ip_resolve: int | None = (
             int(os.environ["CURL_IPRESOLVE"])
             if "CURL_IPRESOLVE" in os.environ and os.environ["CURL_IPRESOLVE"].isdigit()
@@ -57,6 +58,9 @@ class BaseConfigDownload:
     callback: callback_hint = None
     no_title: bool = False
     stop_event: asyncio.Event | None = None
+    metadata: Any = None
+    thumbnail: Any = None
+    metadata_written: bool = False
 
 
 @dataclass

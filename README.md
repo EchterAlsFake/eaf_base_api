@@ -70,6 +70,35 @@ Site-specific parsing, quality selection, and fallback behavior stay in each
 provider. Updated providers require `eaf-base-api>=4.2.0`; update the base library
 alongside them.
 
+## FFmpeg remuxing and single-pass metadata tagging (4.3)
+
+HLS TS→MP4 remuxing (`DownloadConfigHLS(remux=True)`) now runs directly via an
+`ffmpeg` binary (discovered on `PATH` or configured via `RuntimeConfig.ffmpeg_path`)
+instead of `PyAV`. You can also pass `metadata` (a provider `Video` object or `dict`)
+and `thumbnail` (`bytes` or path) on `DownloadConfigHLS` so `eaf_base_api` embeds
+MP4 container tags and cover art in the **same single FFmpeg remux pass** without
+rewriting the file a second time:
+
+```python
+from base_api import DownloadConfigHLS, write_metadata_tags
+
+config = DownloadConfigHLS(
+    quality="best",
+    path="./downloads",
+    remux=True,
+    metadata=video,           # Writes title, author, genre, date, description, url, comment
+    thumbnail=cover_bytes,    # Optional JPEG/PNG cover art embedded in the same pass
+    return_report=True,
+)
+report = await video.download(configuration=config)
+print(report.metadata_written)  # True when single-pass metadata/cover tagging succeeded
+```
+
+For direct MP4 downloads (`DownloadConfigRAW`) or existing MP4 files, use
+`write_metadata_tags(path, metadata=video, thumbnail=cover_bytes)` from
+`base_api.modules.ffmpeg` (or `base_api`). If `ffmpeg` is not installed when
+`remux=True`, `eaf_base_api` logs a warning and preserves the raw MPEG-TS stream.
+
 # Documentation (IMPORTANT!)
 > [!IMPORTANT]
 > Configuring eaf_base_api is necessary if you use any of my Porn APIs, because they all depend on this project.

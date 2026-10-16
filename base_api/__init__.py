@@ -55,11 +55,16 @@ __all__ = [
     "ProxyError",
     "UnknownNetworkError",
     "DownloadFailed",
+    "MetadataWriteError",
     "VideoUnavailable",
     "ResourceGone",
     "LoginFailed",
     "RegionBlocked",
     "configure_app_logging",
+    "find_ffmpeg",
+    "has_ffmpeg",
+    "remux_ts_to_mp4",
+    "write_metadata_tags",
 ]
 
 
@@ -87,10 +92,17 @@ from base_api.modules.errors import (
     ProxyError,
     UnknownNetworkError,
     DownloadFailed,
+    MetadataWriteError,
     VideoUnavailable,
     ResourceGone,
     LoginFailed,
     RegionBlocked,
+)
+from base_api.modules.ffmpeg import (
+    find_ffmpeg,
+    has_ffmpeg,
+    remux_ts_to_mp4,
+    write_metadata_tags,
 )
 from base_api.modules.logger import configure_app_logging
 from base_api.base import (

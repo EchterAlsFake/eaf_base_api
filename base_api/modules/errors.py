@@ -388,6 +388,12 @@ class DownloadFailed(ScraperException):
     pass
 
 
+class MetadataWriteError(BaseScraperError):
+    """Raised when writing MP4 metadata tags or cover art fails."""
+    pass
+
+
+
 class VideoUnavailable(ScraperException):
     """Raised when a video is unavailable or has been removed."""
     pass
