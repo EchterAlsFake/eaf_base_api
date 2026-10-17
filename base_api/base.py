@@ -29,6 +29,7 @@ from typing import (
 
 
 # 1. Standardize on relative imports
+from base_api.modules.urls import FetchedText
 from base_api.modules.errors import *
 from base_api.modules.type_hints import (
     DownloadReport, ResultOrder, ErrorMode, ErrorAction, ScrapeStage, 
@@ -421,6 +422,9 @@ class BaseMedia:
 
     url: str
     core: object
+
+    # Transport metadata is separate from lazily loaded fields and the caller's URL.
+    resolved_url: str | None = field(default=None, init=False, repr=False, compare=False)
 
     loader_methods: ClassVar[Mapping[str, str]] = {}
 
@@ -2097,7 +2101,10 @@ class BaseCore:
                 params=params,
                 retry_non_idempotent=retry_non_idempotent,
             )
-            content = self._decode_response(response, url, self.logger)
+            content = FetchedText(
+                self._decode_response(response, url, self.logger),
+                url=getattr(response, "url", None) or url,
+            )
             if key is not None:
                 self.cache.set_response(key, content)
                 assert pending is not None

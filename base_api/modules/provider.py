@@ -7,6 +7,7 @@ from functools import wraps
 
 from base_api.modules import errors
 from base_api.modules.logger import class_name, get_logger, log_context
+from base_api.modules.urls import same_site_url
 
 
 async def fetch_content(core, url: str, *, logger, owner=None, get_json=False,
@@ -20,6 +21,10 @@ async def fetch_content(core, url: str, *, logger, owner=None, get_json=False,
     with log_context(owner, url):
         try:
             content = await core.fetch_text(url)
+            resolved = getattr(content, "url", None)
+            if (isinstance(resolved, str) and owner is not None
+                    and getattr(owner, "url", None) == url and same_site_url(url, resolved)):
+                owner.resolved_url = resolved
             return json.loads(content, strict=False) if get_json else content
         except errors.DownloadCancelled:
             raise

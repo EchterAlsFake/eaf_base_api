@@ -1,4 +1,8 @@
 __all__ = [
+    "append_url_path",
+    "profile_base_url",
+    "replace_url_path",
+    "update_url_query",
     "BaseCore",
     "BaseMedia",
     "Cache",
@@ -69,6 +73,7 @@ __all__ = [
 
 
 from base_api.modules import errors
+from base_api.modules.urls import append_url_path, profile_base_url, replace_url_path, update_url_query
 from base_api.modules.progress_bars import Callback
 from base_api.modules.errors import (
     DataNotLoadedError,
