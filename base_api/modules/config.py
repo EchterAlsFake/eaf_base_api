@@ -84,6 +84,7 @@ class DownloadConfigRAW(BaseConfigDownload):
     read_timeout: float = 120.0
     chunk_size: int = 1024
     max_retries: int = 5
+    resume_state_path: str | None = None
 
 
 @dataclass

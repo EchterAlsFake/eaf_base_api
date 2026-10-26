@@ -1,77 +1,89 @@
-# Downloads: resume and cancel
+# Downloads: pause, resume and cleanup
 
-This guide shows how to stop a download and pick it back up later. It focuses on usage, not internals.
+All downloads use async provider/core methods and an `asyncio.Event` for
+cooperative stopping. Set the event, then await the active download before
+resuming or deleting its files. Use a new unset event for the next invocation.
 
-> **Note:** Since version 2.6, all download methods are `async` and must be called with `await` inside an async context.
-
-## Threaded HLS downloads (m3u8)
-
-Use `BaseCore.download(...)` for HLS streams. Enable resume by providing a state file path:
+## HLS streams
 
 ```python
 import asyncio
-import threading
-from base_api import BaseCore
-from base_api.modules.errors import DownloadCancelled
+from base_api import BaseCore, DownloadConfigHLS
 
-core = BaseCore()
-stop_event = threading.Event()
-
-async def main():
-    try:
-        await core.download(
-            video=video,
-            quality="720",
-            path="video.mp4",
-            segment_state_path="video.segment-state.json",
-            keep_segment_dir=True,
-            stop_event=stop_event,
-        )
-    except DownloadCancelled:
-        print("Cancelled. Run again to resume.")
-
-asyncio.run(main())
+async def main(master_url):
+    stop = asyncio.Event()
+    configuration = DownloadConfigHLS(
+        quality="720", path="video.mp4", m3u8_base_url=master_url,
+        segment_state_path="video.segment-state.json",
+        segment_dir="video.segments", keep_segment_dir=True,
+        cleanup_on_stop=False, return_report=True, remux=True,
+        stop_event=stop,
+    )
+    async with BaseCore() as core:
+        # Another async task or UI callback can call stop.set().
+        report = await core.download(configuration)
+        if report.status == "cancelled":
+            configuration.stop_event = asyncio.Event()
+            report = await core.download(configuration)
 ```
 
-- Cancel: call `stop_event.set()` from your UI or another thread.
-- Resume: call `download(...)` again with the same `segment_state_path` and `path`.
+Reusing the output path, segment directory and state file restores saved
+segments. A cancelled HLS download raises `DownloadCancelled` unless
+`return_report=True`. Successful downloads remove the state file; retained
+segment directories can then be purged by the application.
 
-Notes:
-- If you do not pass `segment_dir`, it defaults to `path + ".segments"`.
-- `keep_segment_dir=True` keeps already-downloaded segments so resume is fast.
-- Cancelled downloads raise `DownloadCancelled` unless you set `return_report=True`.
-- On success, the state file is removed automatically.
-
-## Direct file downloads (legacy_download)
-
-For a single file URL, use `legacy_download(...)`:
+## Direct files (RAW)
 
 ```python
 import asyncio
-import threading
-from base_api import BaseCore
+from base_api import BaseCore, DownloadConfigRAW
 from base_api.modules.errors import DownloadCancelled
 
-core = BaseCore()
-stop_event = threading.Event()
-
-async def main():
-    try:
-        await core.legacy_download(path="video.mp4", url=direct_url, stop_event=stop_event)
-    except DownloadCancelled:
-        print("Cancelled. Run again to resume.")
-
-asyncio.run(main())
+async def main(direct_url):
+    stop = asyncio.Event()
+    configuration = DownloadConfigRAW(
+        quality="720", path="video.mp4", no_title=True, stop_event=stop,
+        # Optional; the default is video.mp4.raw-state.json.
+        resume_state_path="video.raw-state.json",
+    )
+    async with BaseCore() as core:
+        try:
+            # Another async task or UI callback can call stop.set().
+            await core.legacy_download(direct_url, configuration)
+        except DownloadCancelled:
+            configuration.stop_event = asyncio.Event()
+            await core.legacy_download(direct_url, configuration)
 ```
 
-- Resume: if `video.mp4` already exists, the downloader continues from where it left off.
-- Cancel: call `stop_event.set()` (or stop the call). The partial file remains, so running it again resumes.
-- By default, `allow_multipart=True` enables fast concurrent range downloading when the server supports it.
-  Set `allow_multipart=False` to force a single linear stream.
+The RAW downloader now keeps a JSON checkpoint beside the output by default.
+Keep both files when pausing. Provider clients pass the same
+`DownloadConfigRAW` through to this implementation.
 
-If the server does not support ranged downloads, the download falls back to linear streaming automatically.
+- Multipart mode records the byte count written in each range, including partial
+  ranges when stopping. Resume requests only the missing tails, reports existing
+  progress immediately, and supports changing worker count between invocations.
+- Preallocated file size is **never** treated as downloaded progress. A file from
+  an older version without a valid checkpoint is downloaded afresh.
+- Linear mode also persists its byte offset. If the server ignores a resume
+  Range and returns HTTP 200, linear mode restarts safely from zero.
+- Resumed multipart ranges must return HTTP 206 and matching Content-Range
+  offsets/total before data is written. Truncated ranges are retried from their
+  written offset; queued workers check the stop event after acquiring a slot.
+- The checkpoint ties the output to its original source URL, transfer size and
+  available ETag/Last-Modified validators. Incompatible checkpoints are reset.
+  Temporary signed source URLs that change between invocations may therefore
+  require a fresh download.
+- A metadata request failure preserves an existing checkpoint and propagates
+  the error, rather than truncating the user's partial file.
+- Workers close their files and streaming responses before stop returns.
+  Checkpoints are written atomically. Successful downloads remove their
+  checkpoint automatically.
 
-## Using the threaded downloader directly
+For **cleanup on stop**, first set the event and await `DownloadCancelled`, then
+remove the output, its `resume_state_path` (or the default sidecar), and any
+checkpoint `.tmp` file. Removing files while download workers still run can
+leave files recreated by those workers.
 
-If you call `core.threaded(...)` yourself, pass the same `segment_state_path`, `stop_event`, and cleanup options. The
-behavior is identical to `download(...)`.
+`allow_multipart=True` uses concurrent ranges when the server advertises support.
+`allow_multipart=False` uses a linear stream. Resume with the same transfer mode;
+changing mode invalidates the previous checkpoint.
