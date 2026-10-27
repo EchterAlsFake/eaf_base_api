@@ -36,7 +36,8 @@ class ContextLogger(logging.LoggerAdapter):
                    "url": active_url or "-"}
         context.update(kwargs.get("extra") or {})
         kwargs["extra"] = context
-        return f"[class={context['class_name']} url={context['url']}] {msg}", kwargs
+        prefix = f"[class={context['class_name']} url={context['url']}]".replace("%", "%%")
+        return f"{prefix} {msg}", kwargs
 
 
 def get_logger(name: str, owner: object | None = None) -> ContextLogger:

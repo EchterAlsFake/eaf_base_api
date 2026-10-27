@@ -7,6 +7,7 @@ from functools import wraps
 
 from base_api.modules import errors
 from base_api.modules.logger import class_name, get_logger, log_context
+from base_api.modules.static_functions import strip_title
 from base_api.modules.urls import same_site_url
 
 
@@ -90,7 +91,8 @@ def prepare_download_config(configuration, title: str | None):
     # own attributes (path, stream URL, default callback) are changed.
     result = copy.copy(configuration)
     if not result.no_title:
-        result.path = os.path.join(result.path, f"{title}.mp4")
+        clean_title = strip_title(title) if title else "video"
+        result.path = os.path.join(result.path, f"{clean_title}.mp4")
     return result
 
 
