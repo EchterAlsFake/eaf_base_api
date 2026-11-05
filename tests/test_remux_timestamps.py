@@ -42,6 +42,36 @@ def test_find_ffmpeg_respects_explicit_and_env_override(tmp_path: Path) -> None:
         assert find_ffmpeg() == fake_bin.resolve()
 
 
+@pytest.mark.parametrize("operation", ["remux", "metadata"])
+def test_windows_ffmpeg_does_not_inherit_missing_console_input(tmp_path: Path, operation: str) -> None:
+    from base_api.modules import ffmpeg
+
+    binary = tmp_path / "ffmpeg.exe"
+    binary.touch()
+    source = tmp_path / "source.mp4"
+    source.write_bytes(b"original video")
+    output = tmp_path / "remuxed.mp4"
+
+    def run(command, **options):
+        if options.get("stdin") != subprocess.DEVNULL:
+            raise OSError(6, "The handle is invalid")
+        assert options["capture_output"] is True
+        assert options["creationflags"] == 0x08000000
+        assert "-nostdin" in command
+        Path(command[-1]).write_bytes(b"processed video")
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    with patch.object(ffmpeg, "sys", SimpleNamespace(platform="win32")), \
+         patch.object(subprocess, "CREATE_NO_WINDOW", 0x08000000, create=True), \
+         patch.object(subprocess, "run", side_effect=run):
+        if operation == "remux":
+            assert remux_ts_to_mp4(source, output, binary)
+            assert output.read_bytes() == b"processed video"
+        else:
+            assert write_metadata_tags(source, {"title": "Example"}, binary)
+            assert source.read_bytes() == b"processed video"
+
+
 @pytest.mark.skipif(
     not SAMPLE_TS.is_file() or _get_test_ffmpeg() is None,
     reason="Requires sample.ts fixture and FFmpeg executable",

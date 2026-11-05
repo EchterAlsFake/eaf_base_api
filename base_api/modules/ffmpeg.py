@@ -233,6 +233,7 @@ def remux_ts_to_mp4(
     try:
         cmd = [
             str(ffmpeg),
+            "-nostdin",
             "-y",
             "-v", "error",
             "-i", str(in_p),
@@ -263,7 +264,12 @@ def remux_ts_to_mp4(
             str(out_p),
         ])
 
-        proc = subprocess.run(cmd, capture_output=True, text=True)
+        # GUI launches on Windows may have an invalid inherited console input
+        # handle. Supply all streams explicitly and keep FFmpeg windowless.
+        proc = subprocess.run(
+            cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+        )
         if proc.returncode != 0:
             raise RuntimeError(f"FFmpeg stream-copy remux failed: {proc.stderr.strip()}")
 
@@ -304,6 +310,7 @@ def write_metadata_tags(
     try:
         cmd = [
             str(ffmpeg),
+            "-nostdin",
             "-y",
             "-v", "error",
             "-i", str(target_path),
@@ -334,7 +341,10 @@ def write_metadata_tags(
 
         cmd.extend(["-movflags", "+faststart", str(temporary_output)])
 
-        proc = subprocess.run(cmd, capture_output=True, text=True)
+        proc = subprocess.run(
+            cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+        )
         if proc.returncode != 0:
             raise MetadataWriteError(f"FFmpeg tagging failed: {proc.stderr.strip()}")
 
