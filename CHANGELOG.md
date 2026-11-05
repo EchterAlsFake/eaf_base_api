@@ -1,6 +1,6 @@
 # Changelog
 
-## 4.2.6 — Unreleased
+## 4.2.6 — 2026-11-05
 
 - Launch FFmpeg with explicit null standard input and captured output during remuxing and metadata writing. Windows GUI launches no longer depend on an inherited console input handle.
 - Keep FFmpeg subprocesses noninteractive and prevent console windows from appearing on Windows.
