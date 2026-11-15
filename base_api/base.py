@@ -2104,6 +2104,11 @@ class BaseCore:
             content = FetchedText(
                 self._decode_response(response, url, self.logger),
                 url=getattr(response, "url", None) or url,
+                headers={
+                    k.lower(): v
+                    for k, v in getattr(response, "headers", {}).items()
+                    if k.lower().startswith("x-pagination-")
+                },
             )
             if key is not None:
                 self.cache.set_response(key, content)

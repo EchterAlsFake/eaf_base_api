@@ -268,3 +268,30 @@ optimized. If you just use mine, you need to consume less caffeine and brain cel
 # License
 Licensed under The [AGPLv3](https://opensource.org/license/agpl-3-0) license.
 <br>Copyright (C) 2024-2026 Johannes Habel
+
+## Shared pagination (4.3.0)
+
+`paginated_stream` uses the existing `Helper` item pipeline while discovering
+one source page at a time. Providers supply a page URL factory, an extractor,
+and a `PageInfo` callback based on that same response. `pages` accepts a positive
+integer or `"all"`; `start_page` is always a positive one-based index. A finite
+page limit does not establish exhaustion. Explicit source page bounds continue
+through empty intermediate pages.
+
+The returned `PaginatedStream.summary` distinguishes `limit_reached`,
+`exhausted`, `incomplete`, `failed`, and `cancelled`. Page/item errors stay visible:
+`SKIP` becomes `YIELD` during pagination, including custom skip handlers. Default
+errors raise. Error results must be inspected or unwrapped before calling a scan
+successful. Closing a partially consumed stream cancels it and releases its
+iterator. Use `aclosing(stream)` or `async with stream`.
+
+Repeated request URLs and unconfirmed repeated page payloads raise. An explicit
+source `current_page` must match the requested page; this allows sites whose
+confirmed distinct pages happen to contain duplicate cards. Optional
+`deduplicate=True` uses item URLs (or `item_identity`) and records duplicates.
+Ordering and bounded item loading remain controlled by `IteratorConfig`.
+
+`PageInfo.next_is_probe=True` identifies an inferred boundary request. A
+provider's terminal-error callback may accept a 404 there, or for an independently
+validated initial offset; a 404 after an advertised next link remains an error.
+Repeat detection retains one digest per page, rather than all item URLs.

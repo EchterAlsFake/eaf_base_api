@@ -44,8 +44,10 @@ class FetchedText(str):
     """A string that retains response identity through text caches and parsers."""
 
     url: str
+    headers: dict[str, str]
 
-    def __new__(cls, content: str, *, url: str):
+    def __new__(cls, content: str, *, url: str, headers=None):
         value = super().__new__(cls, content)
         value.url = url
+        value.headers = dict(headers or {})
         return value

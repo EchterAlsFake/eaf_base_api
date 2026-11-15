@@ -4,6 +4,7 @@ import copy
 import json
 import os
 from functools import wraps
+from urllib.parse import urlsplit
 
 from base_api.modules import errors
 from base_api.modules.logger import class_name, get_logger, log_context
@@ -23,6 +24,13 @@ async def fetch_content(core, url: str, *, logger, owner=None, get_json=False,
         try:
             content = await core.fetch_text(url)
             resolved = getattr(content, "url", None)
+            if (isinstance(resolved, str) and owner is not None
+                    and getattr(owner, "url", None) == url and same_site_url(url, resolved)):
+                before, after = urlsplit(url), urlsplit(resolved)
+                if before.path not in {"", "/"} and after.path in {"", "/"}:
+                    raise error_types.NotFound("Resource redirected to the site homepage", url=url)
+                if after.path.rstrip("/") in {"/login", "/signin", "/register", "/registerstep1", "/user/login"}:
+                    raise errors.AccessDeniedError("Resource redirected to an account access page")
             if (isinstance(resolved, str) and owner is not None
                     and getattr(owner, "url", None) == url and same_site_url(url, resolved)):
                 owner.resolved_url = resolved

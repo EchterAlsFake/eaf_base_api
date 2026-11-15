@@ -1,3 +1,22 @@
+# 4.3.0
+
+Release 4.3.0
+
+Update pagination handling, validation, and documentation.
+
+Changes since v4.2.6:
+
+```text
+README.md                    | 27 +++++++++++++++++++++++++++
+ base_api/__init__.py         | 11 +++++++++++
+ base_api/base.py             |  5 +++++
+ base_api/modules/provider.py |  8 ++++++++
+ base_api/modules/urls.py     |  4 +++-
+ pyproject.toml               |  2 +-
+ uv.lock                      |  2 +-
+ 7 files changed, 56 insertions(+), 3 deletions(-)
+```
+
 # Changelog
 
 ## 4.2.6 — 2026-11-05
